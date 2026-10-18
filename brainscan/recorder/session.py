@@ -1,0 +1,494 @@
+"""The recording session.
+
+Runs the subject token by token behind the OpenAI-compatible endpoint, records what
+happens inside it, and lines everything up with the conversation and harness events
+on one token tape per run.
+
+The record for tape slot t (context position `pos`) describes token `pos` and the
+model's prediction *of* that token, made at position pos-1:
+  p         final-layer probability the model gave this token
+  ent       entropy (bits) of the distribution the token was read or sampled from
+  top_*     the five most likely alternatives at that point
+  lens_p    logit-lens probability of this token at every layer ("when did it know")
+  lens_top  logit-lens top-1 prediction at every layer
+  norm      residual norm at every layer at this token's own position
+  proj      z-scored projections of this token's residual onto the direction bank
+"""
+
+from __future__ import annotations
+
+import bisect
+import math
+import re
+import threading
+import time
+import uuid
+from dataclasses import dataclass, field
+
+import torch
+from transformers import DynamicCache
+
+from .capture import MODES, PHASES, Intervention, LayerTap, predict
+from .chat import common_prefix, parse_tool_calls, render, to_template_messages
+from .directions import DirectionBank
+from .events import message_events
+
+PREFILL_CHUNK = 512
+
+
+@dataclass
+class GenParams:
+    messages: list[dict]
+    tools: list[dict] | None = None
+    temperature: float = 0.7
+    top_p: float = 1.0
+    max_tokens: int = 1024
+    stop: list[str] = field(default_factory=list)
+    seed: int | None = None
+    run_hint: str | None = None
+    label: str | None = None
+
+
+@dataclass
+class GenResult:
+    run_id: str
+    req: int
+    text: str
+    content: str | None
+    tool_calls: list[dict]
+    finish_reason: str
+    prompt_tokens: int
+    completion_tokens: int
+    cached_tokens: int
+
+
+@dataclass
+class RunState:
+    id: str
+    meta: dict
+    tape: list[dict] = field(default_factory=list)
+    events: list[dict] = field(default_factory=list)
+    messages: list[dict] = field(default_factory=list)
+    seen_msgs: int = 0
+    last_prompt: list[int] = field(default_factory=list)
+    last_msg_count: int = 0
+    pos2tape: dict[int, int] = field(default_factory=dict)
+
+
+LENS_FLOOR = -6.0  # log10 p below this shows as 0 in the scanner
+
+
+def _lens_byte(p: float) -> int:
+    return max(0, min(255, round((math.log10(max(p, 1e-12)) - LENS_FLOOR) / -LENS_FLOOR * 255)))
+
+
+def compact(r: dict) -> dict:
+    """The per-token payload streamed to the scanner UI. Lens values are log10 p from
+    1e-6 to 1, quantized to 0-255, so small probabilities keep their resolution."""
+    return {"t": r["t"], "pos": r["pos"], "req": r["req"], "tx": r["text"], "r": r["role"], "ph": r["ph"],
+            "p": r["p"], "e": r["ent"],
+            "lens": None if r["lens_p"] is None else [_lens_byte(x) for x in r["lens_p"]],
+            "pj": r["proj"]}
+
+
+def sample(logits: torch.Tensor, temperature: float, top_p: float, generator: torch.Generator) -> int:
+    if temperature <= 0:
+        return int(logits.argmax())
+    probs = torch.softmax(logits / temperature, -1)
+    if top_p < 1.0:
+        sorted_p, order = probs.sort(descending=True)
+        sorted_p[(sorted_p.cumsum(-1) - sorted_p) > top_p] = 0
+        return int(order[torch.multinomial(sorted_p / sorted_p.sum(), 1, generator=generator)])
+    return int(torch.multinomial(probs, 1, generator=generator))
+
+
+class Recorder:
+    def __init__(self, subject, store, settings, publish):
+        self.s, self.store, self.settings, self.publish = subject, store, settings, publish
+        self.tap = LayerTap(subject)
+        self.directions = DirectionBank(store.root / "directions", subject, self.tap)
+        self.lock = threading.RLock()        # one forward pass at a time
+        self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
+        self.runs: dict[str, RunState] = {}
+        self._loaded: dict[str, RunState] = {}
+        self.interventions: dict[str, Intervention] = {}
+        self._iv_epoch = 0
+        self._kv = None
+        self._kv_ids: list[int] = []
+        self._kv_epoch = -1
+        self.perf = {"decode_tok_s": None, "prefill_tok_s": None, "busy": False}
+
+    # ---- interventions -------------------------------------------------------------
+
+    def add_intervention(self, direction: str, mode: str, layer: int | None = None, strength: float = 0.0,
+                         value: float = 0.0, phase: str = "all", run: str | None = None,
+                         seed: int | None = None) -> Intervention:
+        if mode not in MODES or phase not in PHASES:
+            raise ValueError(f"mode must be one of {MODES}, phase one of {PHASES}")
+        if direction == "random":
+            vector = torch.randn(self.s.d_model, generator=torch.Generator().manual_seed(seed or 0))
+            direction = f"random(seed={seed or 0})"
+        else:
+            if direction not in self.directions.dirs:
+                raise ValueError(f"unknown direction {direction!r}")
+            d = self.directions.dirs[direction]
+            vector, layer = d.unit, d.layer if layer is None else layer
+        if layer is None or not 0 <= int(layer) < self.s.n_layers:
+            raise ValueError(f"layer must be in 0..{self.s.n_layers - 1}")
+        vector = (vector / vector.norm()).to(self.s.device, torch.float32)
+        iv = Intervention(int(layer), mode, direction, vector, float(strength), float(value), phase, run)
+        with self.lock:
+            self.interventions[iv.id] = iv
+            self._sync_interventions()
+        return iv
+
+    def set_intervention(self, iid: str, enabled: bool) -> Intervention:
+        with self.lock:
+            self.interventions[iid].enabled = enabled
+            self._sync_interventions()
+            return self.interventions[iid]
+
+    def remove_intervention(self, iid: str) -> None:
+        with self.lock:
+            self.interventions.pop(iid)
+            self._sync_interventions()
+
+    def _sync_interventions(self) -> None:
+        self.tap.interventions = [iv for iv in self.interventions.values() if iv.enabled]
+        self._iv_epoch += 1  # cached keys/values were computed under different edits
+
+    # ---- runs ----------------------------------------------------------------------
+
+    def _new_run(self, rid: str | None, label: str | None) -> RunState:
+        rid = rid or f"{time.strftime('%Y%m%d-%H%M%S')}-{uuid.uuid4().hex[:6]}"
+        if self.store.read_meta(rid) is not None:
+            rid = f"{rid}-{uuid.uuid4().hex[:4]}"
+        meta = {"id": rid, "label": label, "created": time.time(), "updated": time.time(),
+                "model": self.s.info(), "requests": 0, "tokens": 0, "outcome": None,
+                "settings": {"prefill_lens": self.settings.prefill_lens,
+                             "decision_residuals": self.settings.decision_residuals},
+                "interventions": [], "residuals": []}
+        run = RunState(rid, meta)
+        self.runs[rid] = run
+        self.store.write_meta(rid, meta)
+        self.publish({"k": "run", "run": rid, "meta": meta})
+        return run
+
+    def _resolve_run(self, p: GenParams, ids: list[int]) -> RunState:
+        if p.run_hint:
+            rid = re.sub(r"[^A-Za-z0-9._-]+", "-", p.run_hint)[:80]
+            return self.runs.get(rid) or self._new_run(rid, p.label)
+        best, best_len = None, 0
+        for run in self.runs.values():
+            if not run.last_prompt or len(p.messages) <= run.last_msg_count:
+                continue
+            n = common_prefix(run.last_prompt, ids)
+            if n >= 0.9 * len(run.last_prompt) and n > best_len:
+                best, best_len = run, n
+        return best or self._new_run(None, p.label)
+
+    def get_run(self, run_id: str) -> RunState | None:
+        if run_id in self.runs:
+            return self.runs[run_id]
+        if run_id not in self._loaded:
+            meta = self.store.read_meta(run_id)
+            if meta is None:
+                return None
+            if len(self._loaded) >= 8:
+                self._loaded.pop(next(iter(self._loaded)))
+            self._loaded[run_id] = RunState(run_id, meta, tape=self.store.read_tokens(run_id),
+                                            events=self.store.read_jsonl(run_id, "events"),
+                                            messages=self.store.read_jsonl(run_id, "messages"))
+        return self._loaded[run_id]
+
+    def list_runs(self) -> list[dict]:
+        metas = {m["id"]: m for m in self.store.list_runs()}
+        metas.update({rid: run.meta for rid, run in self.runs.items()})
+        return sorted(metas.values(), key=lambda m: m.get("created", 0), reverse=True)
+
+    def _event(self, run: RunState, t: int, etype: str, data: dict, source: str = "recorder") -> dict:
+        ev = {"t": int(t), "type": etype, "data": data, "source": source, "ts": time.time(),
+              "req": run.meta.get("requests", 0)}
+        with self.log_lock:
+            run.events.append(ev)
+            self.store.append_jsonl(run.id, "events", [ev])
+        self.publish({"k": "ev", "run": run.id, "ev": ev})
+        return ev
+
+    def _add_message(self, run: RunState, entry: dict) -> None:
+        with self.log_lock:
+            run.messages.append(entry)
+            self.store.append_jsonl(run.id, "messages", [entry])
+        self.publish({"k": "msg", "run": run.id, "msg": entry})
+
+    def external_event(self, run_id: str | None, etype: str, data: dict, t: int | None = None) -> dict:
+        """Events a harness reports that the transcript can't show (verdicts, file edits)."""
+        if run_id:
+            run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", run_id)[:80]
+            run = self.runs.get(run_id) or self._new_run(run_id, data.get("task"))
+        elif self.runs:
+            run = max(self.runs.values(), key=lambda r: r.meta["updated"])
+        else:
+            raise KeyError("no active run")
+        ev = self._event(run, max(len(run.tape) - 1, 0) if t is None else t, etype, data, source="harness")
+        if etype in ("verdict", "run_meta"):
+            if etype == "verdict":
+                run.meta["outcome"] = data
+            else:
+                run.meta["harness"] = data
+                run.meta["label"] = data.get("task") or run.meta.get("label")
+            self.store.write_meta(run.id, run.meta)
+            self.publish({"k": "run", "run": run.id, "meta": run.meta})
+        return ev
+
+    # ---- generation ----------------------------------------------------------------
+
+    def generate(self, p: GenParams, on_text=None) -> GenResult:
+        with self.lock:
+            self.perf["busy"] = True
+            try:
+                with torch.no_grad():
+                    return self._generate(p, on_text)
+            finally:
+                self.perf["busy"] = False
+
+    def _record(self, run, req, pos, tok, role, msg, phase, pred, k, norm, proj) -> dict:
+        r = {"t": len(run.tape), "req": req, "pos": int(pos), "tok": int(tok), "text": self.s.token_str(int(tok)),
+             "role": role, "msg": int(msg), "ph": phase, "p": None, "ent": None, "top_ids": None, "top_p": None,
+             "lens_p": None, "lens_top": None,
+             "norm": None if norm is None else [round(float(x), 2) for x in norm],
+             "proj": {n: round(float(v), 3) for n, v in proj.items()}}
+        if pred is not None and k is not None:
+            r["p"] = round(float(pred["p"][k]), 5)
+            r["ent"] = round(float(pred["ent"][k]), 4)
+            r["top_ids"] = [int(x) for x in pred["top_ids"][k]]
+            r["top_p"] = [round(float(x), 4) for x in pred["top_p"][k]]
+            if "lens_p" in pred:
+                r["lens_p"] = [round(float(x), 4) for x in pred["lens_p"][k]]
+                r["lens_top"] = [int(x) for x in pred["lens_top"][k]]
+        run.tape.append(r)
+        run.pos2tape[int(pos)] = r["t"]
+        return r
+
+    def _prefill_records(self, run, req, rendered, cs, chunk, resid, logits, pending, skip, new_from) -> list[dict]:
+        rows_r, rows_l, targets, target_pos = [], [], [], []
+        if pending is not None:
+            rows_r.append(pending[0][:, None, :])
+            rows_l.append(pending[1][None])
+            targets.append(chunk[0])
+            target_pos.append(cs)
+        if len(chunk) > 1:
+            rows_r.append(resid[:, :-1, :])
+            rows_l.append(logits[:-1].float())
+            targets += chunk[1:]
+            target_pos += range(cs + 1, cs + len(chunk))
+        pred = None
+        if targets:
+            pred = predict(self.s, torch.cat(rows_r, 1), torch.cat(rows_l),
+                           torch.tensor(targets, device=self.s.device), with_lens=self.settings.prefill_lens)
+        row_of = {pos: i for i, pos in enumerate(target_pos)}
+        norms = resid.float().norm(dim=-1).cpu().numpy()
+        proj = self.directions.project(resid)
+        recs = []
+        for j, tok in enumerate(chunk):
+            pos = cs + j
+            if pos == skip:  # recorded on an earlier request; re-fed only to recover its prediction
+                continue
+            phase = "replay" if rendered.offsets[pos][0] < new_from else "prefill"
+            recs.append(self._record(run, req, pos, tok, rendered.roles[pos], rendered.msg_index[pos], phase,
+                                     pred, row_of.get(pos), norms[:, j], {k: v[j] for k, v in proj.items()}))
+        return recs
+
+    def _generate(self, p: GenParams, on_text) -> GenResult:
+        s = self.s
+        rendered = render(s.tokenizer, p.messages, p.tools)
+        ids = rendered.ids
+        room = self.settings.max_context - len(ids)
+        if room < 16:
+            raise ValueError(f"prompt is {len(ids)} tokens; context limit is {self.settings.max_context}")
+        max_tokens = min(p.max_tokens, room)
+        run = self._resolve_run(p, ids)
+        run.meta["requests"] += 1
+        req = run.meta["requests"]
+        tmsgs = to_template_messages(p.messages)
+        seen = min(run.seen_msgs, len(p.messages))
+        new_from = max((e for st, e in rendered.spans[:seen] if st >= 0), default=0)
+        active = [iv.describe() for iv in self.tap.interventions if iv.run in (None, run.id)]
+
+        # Reuse cached keys/values for the shared prefix. One overlapping token is always
+        # re-fed so the prediction for the first new token is available.
+        lcp = common_prefix(self._kv_ids, ids) if self._kv is not None and self._kv_epoch == self._iv_epoch else 0
+        start = max(min(lcp, len(ids)) - 1, 0)
+        if start == 0:
+            self._kv = DynamicCache()
+        elif self._kv.get_seq_length() > start:
+            self._kv.crop(start - self._kv.get_seq_length())  # transformers 5 crops by a negative count
+        self._kv_epoch = self._iv_epoch
+        self._kv_ids = ids[:start]
+        self.tap.run_id = run.id
+        self.tap.phase = "prefill"
+        self.publish({"k": "req", "run": run.id, "req": req, "prompt_tokens": len(ids), "cached": start,
+                      "interventions": active})
+
+        new_records: list[dict] = []
+        pending = None
+        t0 = time.perf_counter()
+        timing = {"prefill_forward": 0.0, "prefill_readout": 0.0, "decode_forward": 0.0, "decode_readout": 0.0}
+
+        def lap(key: str, since: float) -> float:
+            torch.cuda.synchronize()
+            now = time.perf_counter()
+            timing[key] += now - since
+            return now
+
+        for cs in range(start, len(ids), PREFILL_CHUNK):
+            chunk = ids[cs:cs + PREFILL_CHUNK]
+            tick = time.perf_counter()
+            out = s.model(input_ids=torch.tensor([chunk], device=s.device), past_key_values=self._kv, use_cache=True)
+            tick = lap("prefill_forward", tick)
+            self._kv = out.past_key_values
+            resid = self.tap.stack()
+            logits = out.logits[0]
+            new_records += self._prefill_records(run, req, rendered, cs, chunk, resid, logits, pending,
+                                                 start if start > 0 else -1, new_from)
+            pending = (resid[:, -1, :].clone(), logits[-1].float().clone())
+            del out, resid, logits
+            lap("prefill_readout", tick)
+        self._kv_ids = list(ids)
+        prefill_s = time.perf_counter() - t0
+        for i in range(0, len(new_records), 256):
+            self.publish({"k": "toks", "run": run.id, "items": [compact(r) for r in new_records[i:i + 256]]})
+
+        for i in range(seen, len(p.messages)):
+            first = rendered.first_token_of(i)
+            t = run.pos2tape.get(first) if first is not None else None
+            if t is None:
+                t = new_records[0]["t"] if new_records else max(len(run.tape) - 1, 0)
+            m = tmsgs[i]
+            self._add_message(run, {"i": i, "req": req, "t": t, "role": m["role"], "content": m["content"],
+                                    "name": m.get("name"), "tool_calls": p.messages[i].get("tool_calls")})
+            for etype, data in message_events(m):
+                self._event(run, t, etype, data)
+
+        # Decode, one token at a time, recording each step.
+        self.tap.phase = "gen"
+        pre_gen_t = run.pos2tape.get(len(ids) - 1)
+        decision = {"pre_gen": (pre_gen_t, pending[0].to("cpu", torch.float16))}
+        gen_ids, gen_tapes, text_lens, gen_states = [], [], [], []
+        text, streamed, mode = "", 0, (None if p.tools else "text")
+        generator = torch.Generator(device=s.device)
+        if p.seed is not None:
+            generator.manual_seed(int(p.seed))
+        else:
+            generator.seed()
+        finish, msg_idx = "length", len(p.messages)
+        t1 = time.perf_counter()
+        for _ in range(max_tokens):
+            next_id = sample(pending[1], p.temperature, p.top_p, generator)
+            pos = len(self._kv_ids)
+            is_stop = next_id in s.stop_ids
+            own = out = None
+            tick = time.perf_counter()
+            if not is_stop:
+                out = s.model(input_ids=torch.tensor([[next_id]], device=s.device),
+                              past_key_values=self._kv, use_cache=True)
+                self._kv = out.past_key_values
+                self._kv_ids.append(next_id)
+                own = self.tap.stack()[:, 0, :]
+            tick = lap("decode_forward", tick)
+            pred = predict(s, pending[0][:, None, :], pending[1][None], torch.tensor([next_id], device=s.device))
+            norm = None if own is None else own.float().norm(dim=-1).cpu().numpy()
+            proj = {} if own is None else {k: v[0] for k, v in self.directions.project(own[:, None, :]).items()}
+            rec = self._record(run, req, pos, next_id, "assistant", msg_idx, "gen", pred, 0, norm, proj)
+            new_records.append(rec)
+            self.publish({"k": "toks", "run": run.id, "items": [compact(rec)]})
+            lap("decode_readout", tick)
+            if is_stop:
+                finish = "stop"
+                break
+            gen_states.append((rec["t"], own.to("cpu", torch.float16)))
+            pending = (own.clone(), out.logits[0, -1].float())
+            gen_ids.append(next_id)
+            gen_tapes.append(rec["t"])
+            text = s.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            text_lens.append(len(text))
+            hit = next((x for x in p.stop if x and x in text), None)
+            if hit:
+                text, finish = text[:text.index(hit)], "stop"
+            if on_text is not None:
+                if mode is None and text.strip():
+                    mode = "tool" if text.lstrip()[0] in "{<" else "text"
+                if mode == "text":
+                    safe = text[:-1] if text.endswith("�") else text
+                    if len(safe) > streamed:
+                        on_text(safe[streamed:])
+                        streamed = len(safe)
+            if hit:
+                break
+        decode_s = time.perf_counter() - t1
+
+        content, calls = parse_tool_calls(text) if p.tools else ((text or None), [])
+        if on_text is not None and not calls and len(text) > streamed:
+            on_text(text[streamed:])
+        if calls:
+            finish = "tool_calls"
+        first_t = gen_tapes[0] if gen_tapes else (new_records[-1]["t"] if new_records else 0)
+        for c in calls:
+            at = text.find(c["function"]["name"])
+            k = min(bisect.bisect_left(text_lens, at + 1), len(gen_tapes) - 1) if at >= 0 and gen_tapes else 0
+            self._event(run, gen_tapes[k] if gen_tapes else first_t, "tool_call",
+                        {"name": c["function"]["name"], "arguments": c["function"]["arguments"][:400]})
+        if not calls:
+            self._event(run, first_t, "final_answer", {"chars": len(text), "finish": finish})
+        self._add_message(run, {"i": msg_idx, "req": req, "t": first_t, "role": "assistant", "content": content,
+                                "tool_calls": calls or None, "generated": True, "finish": finish})
+
+        if self.settings.decision_residuals and gen_states:
+            lead = len(text) - len(text.lstrip())
+            picks = {"first": 0, "last": len(gen_states) - 1}
+            if calls:
+                picks["tool_call_start"] = min(bisect.bisect_right(text_lens, lead), len(gen_states) - 1)
+            for label, k in picks.items():
+                decision[label] = gen_states[k]
+            tensors = {f"t{t}": state for t, state in decision.values() if t is not None}
+            marks = {label: t for label, (t, _) in decision.items() if t is not None}
+            if self.store.write_residuals(run.id, req, tensors, {"marks": marks, "model": s.spec,
+                                                                 "shape": [s.n_layers, s.d_model]}):
+                run.meta["residuals"] += sorted(set(marks.values()))
+
+        run.seen_msgs = len(p.messages) + 1
+        run.last_prompt = ids
+        run.last_msg_count = len(p.messages)
+        run.meta.update(tokens=len(run.tape), updated=time.time())
+        if active:
+            run.meta["interventions"].append({"req": req, "active": active})
+        self.store.write_tokens(run.id, req, new_records)
+        self.store.write_meta(run.id, run.meta)
+        n_new = len(ids) - start
+        self.perf.update(prefill_tok_s=round(n_new / prefill_s, 1) if prefill_s > 0 else None,
+                         decode_tok_s=round(len(gen_ids) / decode_s, 1) if decode_s > 0 and gen_ids else None,
+                         seconds={k: round(v, 3) for k, v in timing.items()})
+        print(f"[brainscan] {run.id} req {req}: prefill {n_new} tok, decode {len(gen_ids)} tok, "
+              + ", ".join(f"{k} {v:.2f}s" for k, v in timing.items()), flush=True)
+        self.publish({"k": "done", "run": run.id, "req": req, "finish": finish, "perf": dict(self.perf),
+                      "meta": run.meta})
+        return GenResult(run.id, req, text, content, calls, finish, len(ids), len(gen_ids), start)
+
+    # ---- reads ---------------------------------------------------------------------
+
+    def token_detail(self, run_id: str, t: int) -> dict | None:
+        run = self.get_run(run_id)
+        if run is None or not 0 <= t < len(run.tape):
+            return None
+        r = dict(run.tape[t])
+        r["top"] = [[self.s.token_str(i), p] for i, p in zip(r.get("top_ids") or [], r.get("top_p") or [])]
+        r["lens_top_text"] = [self.s.token_str(i) for i in (r.get("lens_top") or [])]
+        r["has_residual"] = t in set(run.meta.get("residuals", []))
+        r["model_mismatch"] = run.meta.get("model", {}).get("spec") != self.s.spec
+        return r
+
+    def status(self) -> dict:
+        return {"model": self.s.info(), "perf": self.perf,
+                "disk": {"used": self.store.used_bytes(), "budget": self.store.budget},
+                "interventions": [iv.describe() for iv in self.interventions.values()],
+                "directions": self.directions.describe()}
