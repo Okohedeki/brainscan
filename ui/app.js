@@ -96,7 +96,7 @@ function clampScroll() {
 function schedule() { if (!S.raf) S.raf = requestAnimationFrame(draw); }
 
 // ---------------------------------------------------------------- scope drawing
-const GUTTER = 76, PAD_R = 92;
+const GUTTER = 76, PAD_R = 92, MIN_COL = 0.2;  // columns may be sub-pixel when a whole run is fitted
 function layout() {
   const L = S.nLayers, rowH = Math.max(3, Math.min(8, Math.floor(208 / L)));
   const y = {}; let cur = 6;
@@ -402,7 +402,7 @@ function setupScopeInput() {
     const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left;
     if (ev.ctrlKey || ev.metaKey) {
       const anchor = (mx - GUTTER + S.scrollX) / S.colW;
-      S.colW = Math.max(1, Math.min(40, S.colW * (ev.deltaY < 0 ? 1.2 : 1 / 1.2)));
+      S.colW = Math.max(MIN_COL, Math.min(40, S.colW * (ev.deltaY < 0 ? 1.2 : 1 / 1.2)));
       S.scrollX = anchor * S.colW - (mx - GUTTER);
     } else {
       S.scrollX += ev.deltaX || ev.deltaY;
@@ -418,12 +418,15 @@ function setupScopeInput() {
   });
   const zoom = (f) => {
     const center = (S.scrollX + S.plotW / 2) / S.colW;
-    S.colW = Math.max(1, Math.min(40, S.colW * f));
+    S.colW = Math.max(MIN_COL, Math.min(40, S.colW * f));
     S.scrollX = center * S.colW - S.plotW / 2; schedule();
   };
   $("#zoom-in").onclick = () => zoom(1.5);
   $("#zoom-out").onclick = () => zoom(1 / 1.5);
-  $("#fit").onclick = () => { S.colW = Math.max(1, Math.min(40, S.plotW / Math.max(1, S.view.length))); S.scrollX = 0; schedule(); };
+  $("#fit").onclick = () => {
+    S.colW = Math.max(MIN_COL, Math.min(40, S.plotW / Math.max(1, S.view.length)));
+    S.scrollX = 0; S.follow = false; $("#follow").checked = false; schedule();
+  };
   $("#follow").onchange = (ev) => { S.follow = ev.target.checked; schedule(); };
   $("#show-replay").onchange = (ev) => { S.showReplay = ev.target.checked; rebuildView(); schedule(); };
   new ResizeObserver(schedule).observe($("#scope-wrap"));
