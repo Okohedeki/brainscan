@@ -154,7 +154,11 @@ def main() -> None:
     for rep in range(args.repeats):
         for task in tasks:
             seed = None if args.seed is None else args.seed + rep
-            results.append(run_task(task, args.base_url, args.max_steps, args.temperature, seed))
+            try:
+                results.append(run_task(task, args.base_url, args.max_steps, args.temperature, seed))
+            except Exception as exc:  # one broken run shouldn't end a batch
+                print(f"[{task}] run failed: {type(exc).__name__}: {exc}", flush=True)
+                results.append({"task": task, "seed": seed, "error": f"{type(exc).__name__}: {exc}"})
     print(json.dumps(results, indent=2))
 
 

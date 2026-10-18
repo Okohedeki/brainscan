@@ -3,7 +3,8 @@ from pathlib import Path
 
 import pytest
 
-from brainscan.recorder.chat import common_prefix, parse_tool_calls, render, to_template_messages
+from brainscan.recorder.chat import (common_prefix, one_call_per_turn, parse_tool_calls, render,
+                                     to_template_messages)
 from brainscan.recorder.events import message_events, scan_tool_output
 
 
@@ -78,3 +79,35 @@ def test_render_maps_tokens_to_messages():
         assert first is not None and r.roles[first] == role
     tool_text = "".join(tok.decode([t]) for t, m in zip(r.ids, r.msg_index) if m == 3)
     assert "1 failed" in tool_text
+
+
+def test_one_call_per_turn_pairs_calls_with_results():
+    msgs = to_template_messages([
+        {"role": "user", "content": "go"},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": "{}"}},
+            {"id": "b", "type": "function", "function": {"name": "run_tests", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "file text"},
+        {"role": "tool", "tool_call_id": "b", "content": "2 passed"},
+    ])
+    expanded, origin = one_call_per_turn(msgs)
+    assert [m["role"] for m in expanded] == ["user", "assistant", "tool", "assistant", "tool"]
+    assert origin == [0, 1, 2, 1, 3]
+    assert [m.get("tool_calls", [{}])[0].get("id") for m in expanded if m["role"] == "assistant"] == ["a", "b"]
+
+
+@pytest.mark.skipif(not (TOKENIZER / "tokenizer.json").exists(), reason="converted Llama tokenizer not present")
+def test_render_handles_parallel_tool_calls_on_single_call_templates():
+    from transformers import AutoTokenizer
+    tok = AutoTokenizer.from_pretrained(TOKENIZER)
+    messages = [
+        {"role": "user", "content": "Fix it."},
+        {"role": "assistant", "content": None, "tool_calls": [
+            {"id": "a", "type": "function", "function": {"name": "read_file", "arguments": '{"path": "x.py"}'}},
+            {"id": "b", "type": "function", "function": {"name": "run_tests", "arguments": "{}"}}]},
+        {"role": "tool", "tool_call_id": "a", "content": "def x(): pass"},
+        {"role": "tool", "tool_call_id": "b", "content": "1 failed in 0.01s"},
+    ]
+    r = render(tok, messages)
+    assert len(r.spans) == len(messages)
+    assert [r.roles[r.first_token_of(i)] for i in range(4)] == ["user", "assistant", "tool", "tool"]

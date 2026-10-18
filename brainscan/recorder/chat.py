@@ -133,17 +133,60 @@ def _assign(offsets, spans, messages):
     return roles, index
 
 
+def one_call_per_turn(tmsgs: list[dict]) -> tuple[list[dict], list[int]]:
+    """Split assistant turns with several tool calls into call/result pairs.
+
+    Some templates (Llama 3.1) refuse more than one call per assistant message, but
+    models still emit several. Returns the expanded messages and, for each, the index
+    of the original message it came from.
+    """
+    results = {m.get("tool_call_id"): i for i, m in enumerate(tmsgs) if m["role"] == "tool"}
+    out, origin, placed = [], [], set()
+    for i, m in enumerate(tmsgs):
+        calls = m.get("tool_calls") or []
+        if m["role"] == "assistant" and len(calls) > 1:
+            for k, call in enumerate(calls):
+                out.append({**m, "content": m["content"] if k == 0 else "", "tool_calls": [call]})
+                origin.append(i)
+                r = results.get(call.get("id"))
+                if r is not None and r not in placed:
+                    out.append(tmsgs[r])
+                    origin.append(r)
+                    placed.add(r)
+        elif i not in placed:
+            out.append(m)
+            origin.append(i)
+    return out, origin
+
+
 def render(tokenizer, messages: list[dict], tools: list[dict] | None = None,
            add_generation_prompt: bool = True) -> Rendered:
     tmsgs = to_template_messages(messages)
+    origin = list(range(len(tmsgs)))
     kwargs = {"tools": tools} if tools else {}
-    text = tokenizer.apply_chat_template(
-        tmsgs, add_generation_prompt=add_generation_prompt, tokenize=False, **kwargs)
+    try:
+        text = tokenizer.apply_chat_template(
+            tmsgs, add_generation_prompt=add_generation_prompt, tokenize=False, **kwargs)
+    except Exception:
+        if not any(len(m.get("tool_calls") or []) > 1 for m in tmsgs):
+            raise
+        expanded, origin = one_call_per_turn(tmsgs)
+        text = tokenizer.apply_chat_template(
+            expanded, add_generation_prompt=add_generation_prompt, tokenize=False, **kwargs)
+        tmsgs = expanded
     enc = tokenizer(text, add_special_tokens=False, return_offsets_mapping=True)
     offsets = [tuple(o) for o in enc["offset_mapping"]]
     spans = _locate_spans(text, tmsgs)
     roles, index = _assign(offsets, spans, tmsgs)
-    return Rendered(text, list(enc["input_ids"]), offsets, roles, index, spans)
+    # Report message indices and spans in terms of the caller's original messages.
+    index = [origin[i] if i >= 0 else -1 for i in index]
+    merged = [(-1, -1)] * len(messages)
+    for k, (s, e) in enumerate(spans):
+        if s < 0:
+            continue
+        ms, me = merged[origin[k]]
+        merged[origin[k]] = (s if ms < 0 else min(ms, s), max(me, e))
+    return Rendered(text, list(enc["input_ids"]), offsets, roles, index, merged)
 
 
 def common_prefix(a: list[int], b: list[int]) -> int:

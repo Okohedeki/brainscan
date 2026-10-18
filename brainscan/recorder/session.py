@@ -116,6 +116,7 @@ class Recorder:
         self._kv = None
         self._kv_ids: list[int] = []
         self._kv_epoch = -1
+        self._kv_run: str | None = None
         self.perf = {"decode_tok_s": None, "prefill_tok_s": None, "busy": False}
 
     # ---- interventions -------------------------------------------------------------
@@ -315,15 +316,18 @@ class Recorder:
         new_from = max((e for st, e in rendered.spans[:seen] if st >= 0), default=0)
         active = [iv.describe() for iv in self.tap.interventions if iv.run in (None, run.id)]
 
-        # Reuse cached keys/values for the shared prefix. One overlapping token is always
-        # re-fed so the prediction for the first new token is available.
-        lcp = common_prefix(self._kv_ids, ids) if self._kv is not None and self._kv_epoch == self._iv_epoch else 0
+        # Reuse cached keys/values for the prefix shared with this run's previous request.
+        # Never across runs: each run's tape must hold its own full prompt. One overlapping
+        # token is always re-fed so the prediction for the first new token is available.
+        reusable = self._kv is not None and self._kv_epoch == self._iv_epoch and self._kv_run == run.id
+        lcp = common_prefix(self._kv_ids, ids) if reusable else 0
         start = max(min(lcp, len(ids)) - 1, 0)
         if start == 0:
             self._kv = DynamicCache()
         elif self._kv.get_seq_length() > start:
             self._kv.crop(start - self._kv.get_seq_length())  # transformers 5 crops by a negative count
         self._kv_epoch = self._iv_epoch
+        self._kv_run = run.id
         self._kv_ids = ids[:start]
         self.tap.run_id = run.id
         self.tap.phase = "prefill"
