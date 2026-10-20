@@ -120,7 +120,8 @@ def _params(body: dict, request: Request) -> GenParams:
         stop=[stop] if isinstance(stop, str) else list(stop),
         seed=body.get("seed"),
         run_hint=request.headers.get("x-brainscan-run") or meta.get("brainscan_run"),
-        label=request.headers.get("x-brainscan-label") or meta.get("brainscan_label"))
+        label=request.headers.get("x-brainscan-label") or meta.get("brainscan_label"),
+        template_kwargs={**settings.template_kwargs(), **(body.get("chat_template_kwargs") or {})})
 
 
 def _usage(res) -> dict:
@@ -149,6 +150,8 @@ async def chat_completions(request: Request):
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     message = {"role": "assistant", "content": res.content}
+    if res.reasoning:
+        message["reasoning_content"] = res.reasoning
     if res.tool_calls:
         message["tool_calls"] = res.tool_calls
     return JSONResponse({
@@ -167,7 +170,8 @@ async def _stream(rec: Recorder, params: GenParams, model_name: str, include_usa
 
     def work():
         try:
-            put(("done", rec.generate(params, on_text=lambda delta: put(("text", delta)))))
+            put(("done", rec.generate(params, on_text=lambda delta: put(("text", delta)),
+                                      on_reasoning=lambda delta: put(("reasoning", delta)))))
         except Exception as exc:
             traceback.print_exc()
             put(("error", exc))
@@ -183,8 +187,8 @@ async def _stream(rec: Recorder, params: GenParams, model_name: str, include_usa
     yield chunk({"role": "assistant", "content": ""})
     while True:
         kind, val = await queue.get()
-        if kind == "text":
-            yield chunk({"content": val})
+        if kind in ("text", "reasoning"):
+            yield chunk({"content": val} if kind == "text" else {"reasoning_content": val})
             continue
         if kind == "done":
             if val.tool_calls:

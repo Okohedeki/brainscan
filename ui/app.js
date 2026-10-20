@@ -45,7 +45,7 @@ function readColors() {
     surface: v("--surface"), ink: v("--ink"), ink2: v("--ink-2"), muted: v("--muted"), grid: v("--grid"), axis: v("--axis"),
     series: [v("--series-1"), v("--series-2"), v("--series-3")], control: v("--control"),
     good: v("--good"), critical: v("--critical"), serious: v("--serious"), noData: v("--no-data"), focus: v("--focus"),
-    roles: { system: v("--role-system"), user: v("--role-user"), assistant: v("--role-assistant"), tool: v("--role-tool"), template: v("--role-template") },
+    roles: { system: v("--role-system"), user: v("--role-user"), assistant: v("--role-assistant"), reasoning: v("--role-reasoning"), tool: v("--role-tool"), template: v("--role-template") },
     ramp: v("--ramp").split(",").map((s) => s.trim()),
   };
   C.lut = buildLut(C.ramp);
@@ -71,6 +71,7 @@ function eventLook(e) {
     case "file_edit": return d.is_test ? { label: `▲ edited ${d.path}`, tone: "serious", glyph: "▲", line: true, status: "serious" }
       : { label: `✎ ${d.path}`, tone: "ink2", glyph: "✎" };
     case "final_answer": return { label: "■ answer", tone: "ink", glyph: "■" };
+    case "think_end": return { label: "◆ end of thinking", tone: "ink2", glyph: "◆" };
     case "verdict": return d.success ? { label: "✓ PASS", tone: "good", glyph: "✓", line: true, status: "good" }
       : { label: "✕ FAIL", tone: "critical", glyph: "✕", line: true, status: "critical" };
     default: return null;
@@ -329,7 +330,7 @@ function renderLegend() {
   const ds = dirSeries();
   $("#legend").innerHTML = [
     `<span class="item"><span class="grad" style="background:linear-gradient(90deg, ${C.ramp.join(",")})"></span>logit-lens p(token), log scale 10⁻⁶ → 1</span>`,
-    ...["system", "user", "assistant", "tool"].map((r) => `<span class="item"><span class="box" style="background:${C.roles[r]}"></span>${r}</span>`),
+    ...["system", "user", "reasoning", "assistant", "tool"].map((r) => `<span class="item"><span class="box" style="background:${C.roles[r]}"></span>${r}</span>`),
     `<span class="item"><span class="line" style="background:${C.series[0]}"></span>surprisal −log₂ p</span>`,
     `<span class="item"><span class="line" style="background:${C.series[1]}"></span>entropy</span>`,
     ...ds.map((d) => `<span class="item" title="${esc(d.meta.construction || "")}"><span class="line${d.control ? " dashed" : ""}" style="background:${d.color}"></span>${esc(d.name)} · L${d.meta.layer}</span>`),
@@ -452,8 +453,10 @@ function messageHtml(m) {
   const label = m.role === "tool" ? `tool · ${esc(m.name || "")}` : m.role;
   const content = m.content ? `<pre>${esc(m.content)}</pre>` : "";
   const long = (m.content || "").split("\n").length > 14 || (m.content || "").length > 900;
+  const words = (m.reasoning || "").split(/\s+/).filter(Boolean).length;
+  const thinking = m.reasoning ? `<details class="thinking"><summary>Thinking · ${words} words</summary><pre>${esc(m.reasoning)}</pre></details>` : "";
   return `<div class="msg-head"><span class="role">${label}</span><span>t${m.t}</span>${m.generated ? `<span>generated · ${esc(m.finish || "")}</span>` : ""}</div>
-    ${content}${long ? `<button class="more">Show all</button>` : ""}${calls}<div class="badges">${messageBadges(m)}</div>`;
+    ${thinking}${content}${long ? `<button class="more">Show all</button>` : ""}${calls}<div class="badges">${messageBadges(m)}</div>`;
 }
 
 function addMessageCard(m) {
@@ -485,10 +488,17 @@ function liveToken(rec) {
   if (!S.liveCard) {
     const empty = $("#messages .empty"); if (empty) empty.remove();
     S.liveCard = addMessageCard({ role: "assistant", t: rec.t, content: "", generated: true, finish: "generating…" });
-    S.liveCard.querySelector(".msg-head").insertAdjacentHTML("afterend", `<pre class="caret"></pre>`);
+    S.liveCard.querySelector(".msg-head").insertAdjacentHTML("afterend",
+      `<details class="thinking live" open hidden><summary>Thinking…</summary><pre></pre></details><pre class="caret"></pre>`);
   }
-  const pre = S.liveCard.querySelector("pre.caret");
-  if (!/^<\|.*\|>$/.test(rec.tx)) pre.textContent += rec.tx;
+  if (/^<\|.*\|>$/.test(rec.tx) || /^<\/?think>$/.test(rec.tx)) return;
+  if (rec.r === "reasoning") {
+    const think = S.liveCard.querySelector("details.thinking");
+    think.hidden = false;
+    think.querySelector("pre").textContent += rec.tx;
+  } else {
+    S.liveCard.querySelector("pre.caret").textContent += rec.tx;
+  }
   const box = $("#messages"); box.scrollTop = box.scrollHeight;
 }
 

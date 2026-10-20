@@ -56,10 +56,21 @@ def _slug(text: str) -> str:
     return re.sub(r"[^A-Za-z0-9._-]+", "-", text).strip("-")
 
 
+def display_name(spec: str) -> str:
+    """'org/Name' for Hugging Face ids and cache snapshots, the tag for Ollama models."""
+    if spec.startswith("ollama:"):
+        return spec.split(":", 1)[1]
+    cached = re.search(r"models--([^/\\]+)--([^/\\]+)", spec)
+    if cached:
+        return f"{cached.group(1)}/{cached.group(2)}"
+    return spec.rstrip("/").split("/")[-1] if Path(spec).exists() else spec
+
+
 def prepare(spec: str, dtype=torch.bfloat16) -> tuple[str, dict]:
     """Make sure the model exists as a Hugging Face checkpoint; return (path, provenance)."""
     if not spec.startswith("ollama:"):
-        return spec, {"spec": spec, "source": "huggingface", "quantization": None, "exploratory": False}
+        source = "local" if Path(spec).exists() else "huggingface"
+        return spec, {"spec": spec, "source": source, "quantization": None, "exploratory": False}
     tag = spec.split(":", 1)[1]
     local = CACHE / "models" / f"ollama-{_slug(tag)}"
     prov_file = local / "brainscan_provenance.json"
@@ -128,8 +139,8 @@ class Subject:
         path, self.provenance = prepare(spec, dtype)
         _check_vram(path, device)
         self.spec = spec
-        self.name = spec.split(":", 1)[1] if spec.startswith("ollama:") else spec.rstrip("/").split("/")[-1]
-        self.slug = _slug(self.name)
+        self.name = os.environ.get("BRAINSCAN_MODEL_NAME") or display_name(spec)
+        self.slug = _slug(self.name.split("/")[-1])
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.model = AutoModelForCausalLM.from_pretrained(
             path, dtype=dtype, device_map=device, attn_implementation="sdpa")
@@ -145,6 +156,14 @@ class Subject:
         self.d_model = config.hidden_size
         self.vocab_size = self.lm_head.weight.shape[0]
         self.dtype = str(dtype).replace("torch.", "")
+        # Linear-attention / SSM layers keep recurrent state that can't be cropped back to a
+        # shared prefix, so those models re-read the prompt on every request.
+        self.layer_types = list(getattr(config, "layer_types", None) or [])
+        self.croppable_cache = all(t in ("full_attention", "sliding_attention") for t in self.layer_types)
+        # Rows per logit-lens chunk, sized so one fp32 (rows x vocab) buffer stays near 400 MB,
+        # and a prefill chunk small enough that its logits fit beside the weights.
+        self.lens_chunk = max(64, int(1e8 // self.vocab_size))
+        self.prefill_chunk = 512 if self.vocab_size < 200_000 else 256
         self.stop_ids = self._stop_ids()
         n_tok = len(self.tokenizer)
         strings = self.tokenizer.batch_decode([[i] for i in range(n_tok)])
@@ -166,7 +185,8 @@ class Subject:
     def info(self) -> dict:
         return {"name": self.name, "spec": self.spec, "n_layers": self.n_layers, "d_model": self.d_model,
                 "vocab_size": self.vocab_size, "dtype": self.dtype, "provenance": self.provenance,
-                "architecture": type(self.model).__name__}
+                "architecture": type(self.model).__name__, "layer_types": self.layer_types,
+                "croppable_cache": self.croppable_cache}
 
 
 if __name__ == "__main__":

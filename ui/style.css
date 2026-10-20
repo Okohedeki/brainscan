@@ -22,6 +22,7 @@
   --role-system: #898781;
   --role-user: #c98500;
   --role-assistant: #6250d6;
+  --role-reasoning: #b3aaf0;
   --role-tool: #1baf7a;
   --role-template: #e1e0d9;
   --no-data: #efeee9;
@@ -51,6 +52,7 @@
     --role-system: #898781;
     --role-user: #c98500;
     --role-assistant: #9085e9;
+    --role-reasoning: #4f4796;
     --role-tool: #199e70;
     --role-template: #2c2c2a;
     --no-data: #222220;
@@ -78,6 +80,7 @@
   --role-system: #898781;
   --role-user: #c98500;
   --role-assistant: #9085e9;
+  --role-reasoning: #4f4796;
   --role-tool: #199e70;
   --role-template: #2c2c2a;
   --no-data: #222220;
@@ -171,6 +174,9 @@ button.primary:hover { filter: brightness(1.08); }
 }
 .msg.expanded pre { max-height: none; }
 .more { font-size: 11px; color: var(--series-1); background: none; border: none; padding: 4px 0 0; cursor: pointer; }
+.thinking { margin: 2px 0 6px; border-left: 2px solid var(--role-reasoning); padding-left: 8px; }
+.thinking summary { font-size: 11px; color: var(--ink-2); cursor: pointer; }
+.thinking pre { color: var(--ink-2); max-height: 260px; overflow: auto; }
 .call { font: 12px/1.4 var(--mono); padding: 4px 8px; border-radius: 6px; background: var(--surface); border: 1px solid var(--border); margin-top: 4px; word-break: break-word; }
 .call::before { content: "→ "; color: var(--muted); }
 .badges { display: flex; gap: 6px; flex-wrap: wrap; margin-top: 6px; }

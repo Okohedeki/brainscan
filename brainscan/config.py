@@ -27,3 +27,9 @@ class Settings:
     prefill_lens: bool = field(default_factory=lambda: _env("PREFILL_LENS", "1") == "1")
     # Full residual stacks at decision points (pre-generation, first token, tool-call start, last token).
     decision_residuals: bool = field(default_factory=lambda: _env("DECISION_RESIDUALS", "1") == "1")
+    # Reasoning models: "on" / "off" sets enable_thinking in the chat template, "default" leaves the
+    # template's own default. Requests can override with chat_template_kwargs.
+    thinking: str = field(default_factory=lambda: _env("THINKING", "default"))
+
+    def template_kwargs(self) -> dict:
+        return {"on": {"enable_thinking": True}, "off": {"enable_thinking": False}}.get(self.thinking, {})

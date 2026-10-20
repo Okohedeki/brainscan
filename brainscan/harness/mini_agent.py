@@ -99,7 +99,8 @@ def execute(name: str, args: dict, sandbox: Path, report) -> str:
         return f"Error: {type(exc).__name__}: {exc}"
 
 
-def run_task(task: str, base_url: str, max_steps: int, temperature: float, seed: int | None) -> dict:
+def run_task(task: str, base_url: str, max_steps: int, temperature: float, seed: int | None,
+             thinking: str = "default", max_tokens: int = 3072) -> dict:
     source = TASKS / task
     sandbox = Path(tempfile.mkdtemp(prefix=f"brainscan-{task}-"))
     shutil.copytree(source, sandbox, dirs_exist_ok=True, ignore=shutil.ignore_patterns("task.md", "__pycache__"))
@@ -110,13 +111,15 @@ def run_task(task: str, base_url: str, max_steps: int, temperature: float, seed:
         post_event(base_url, run_id, etype, data)
 
     report("run_meta", {"task": task, "harness": "mini_agent", "max_steps": max_steps,
-                        "temperature": temperature, "seed": seed})
+                        "temperature": temperature, "seed": seed, "thinking": thinking})
+    extra = {} if thinking == "default" else {"chat_template_kwargs": {"enable_thinking": thinking == "on"}}
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": (source / "task.md").read_text()}]
     steps = 0
     for steps in range(1, max_steps + 1):
         resp = client.chat.completions.create(model="subject", messages=messages, tools=TOOLS,
-                                              temperature=temperature, max_tokens=1024, seed=seed)
+                                              temperature=temperature, max_tokens=max_tokens, seed=seed,
+                                              extra_body=extra)
         msg = resp.choices[0].message
         messages.append(msg.model_dump(exclude_none=True))
         print(f"[{run_id}] step {steps}: " + (
@@ -148,6 +151,9 @@ def main() -> None:
     parser.add_argument("--temperature", type=float, default=0.3)
     parser.add_argument("--repeats", type=int, default=1)
     parser.add_argument("--seed", type=int, default=None)
+    parser.add_argument("--thinking", choices=["default", "on", "off"], default="default",
+                        help="reasoning models: set enable_thinking in the chat template")
+    parser.add_argument("--max-tokens", type=int, default=3072, help="per model turn, including reasoning")
     args = parser.parse_args()
     tasks = sorted(p.name for p in TASKS.iterdir() if (p / "task.md").exists()) if args.task == "all" else [args.task]
     results = []
@@ -155,7 +161,8 @@ def main() -> None:
         for task in tasks:
             seed = None if args.seed is None else args.seed + rep
             try:
-                results.append(run_task(task, args.base_url, args.max_steps, args.temperature, seed))
+                results.append(run_task(task, args.base_url, args.max_steps, args.temperature, seed,
+                                        args.thinking, args.max_tokens))
             except Exception as exc:  # one broken run shouldn't end a batch
                 print(f"[{task}] run failed: {type(exc).__name__}: {exc}", flush=True)
                 results.append({"task": task, "seed": seed, "error": f"{type(exc).__name__}: {exc}"})

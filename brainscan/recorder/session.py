@@ -26,14 +26,12 @@ import uuid
 from dataclasses import dataclass, field
 
 import torch
-from transformers import DynamicCache
 
 from .capture import MODES, PHASES, Intervention, LayerTap, predict
-from .chat import common_prefix, parse_tool_calls, render, to_template_messages
+from .chat import (THINK_CLOSE, THINK_OPEN, common_prefix, parse_tool_calls, render, split_reasoning,
+                   to_template_messages)
 from .directions import DirectionBank
 from .events import message_events
-
-PREFILL_CHUNK = 512
 
 
 @dataclass
@@ -47,6 +45,7 @@ class GenParams:
     seed: int | None = None
     run_hint: str | None = None
     label: str | None = None
+    template_kwargs: dict = field(default_factory=dict)  # e.g. {"enable_thinking": False}
 
 
 @dataclass
@@ -60,6 +59,37 @@ class GenResult:
     prompt_tokens: int
     completion_tokens: int
     cached_tokens: int
+    reasoning: str | None = None
+
+
+class OutputStream:
+    """Streams reasoning and answer text separately as tokens arrive. When tools are on
+    offer the answer is sent once at the end, after tool calls are parsed out of it."""
+
+    HOLD = len(THINK_CLOSE)  # hold back a possibly partial closing tag
+
+    def __init__(self, think_open: bool, buffered: bool, on_text, on_reasoning):
+        self.think_open, self.buffered = think_open, buffered
+        self.on_text, self.on_reasoning = on_text, on_reasoning
+        self.sent_reasoning = self.sent_text = 0
+
+    def update(self, text: str, final: bool = False) -> None:
+        reasoning, answer, closed = split_reasoning(text, self.think_open)
+        if reasoning is not None and self.on_reasoning is not None:
+            safe = reasoning if closed or final else reasoning[:max(0, len(reasoning) - self.HOLD)]
+            if len(safe) > self.sent_reasoning:
+                self.on_reasoning(safe[self.sent_reasoning:])
+                self.sent_reasoning = len(safe)
+        if closed and not self.buffered and self.on_text is not None:
+            body = answer.lstrip()
+            safe = body if final or not body.endswith("�") else body[:-1]
+            if len(safe) > self.sent_text:
+                self.on_text(safe[self.sent_text:])
+                self.sent_text = len(safe)
+
+    def finish(self, content: str | None) -> None:
+        if self.buffered and content and self.on_text is not None:
+            self.on_text(content)
 
 
 @dataclass
@@ -244,12 +274,12 @@ class Recorder:
 
     # ---- generation ----------------------------------------------------------------
 
-    def generate(self, p: GenParams, on_text=None) -> GenResult:
+    def generate(self, p: GenParams, on_text=None, on_reasoning=None) -> GenResult:
         with self.lock:
             self.perf["busy"] = True
             try:
                 with torch.no_grad():
-                    return self._generate(p, on_text)
+                    return self._generate(p, on_text, on_reasoning)
             finally:
                 self.perf["busy"] = False
 
@@ -271,38 +301,44 @@ class Recorder:
         run.pos2tape[int(pos)] = r["t"]
         return r
 
-    def _prefill_records(self, run, req, rendered, cs, chunk, resid, logits, pending, skip, new_from) -> list[dict]:
+    def _prefill_records(self, run, req, rendered, cs, chunk, resid, logits, pending, record_from,
+                         new_from) -> list[dict]:
+        """Records for this chunk's positions at or after `record_from`. Earlier positions were
+        recorded on a previous request of this run and are only re-read for context."""
+        first = max(cs, record_from)
+        if first >= cs + len(chunk):
+            return []
         rows_r, rows_l, targets, target_pos = [], [], [], []
-        if pending is not None:
+        if first == cs and pending is not None:
             rows_r.append(pending[0][:, None, :])
             rows_l.append(pending[1][None])
             targets.append(chunk[0])
             target_pos.append(cs)
-        if len(chunk) > 1:
-            rows_r.append(resid[:, :-1, :])
-            rows_l.append(logits[:-1].float())
-            targets += chunk[1:]
-            target_pos += range(cs + 1, cs + len(chunk))
+        inner = list(range(max(cs + 1, first), cs + len(chunk)))  # predicted from inside this chunk
+        if inner:
+            idx = torch.tensor([q - cs - 1 for q in inner], device=self.s.device)
+            rows_r.append(resid.index_select(1, idx))
+            rows_l.append(logits.index_select(0, idx).float())
+            targets += [chunk[q - cs] for q in inner]
+            target_pos += inner
         pred = None
         if targets:
             pred = predict(self.s, torch.cat(rows_r, 1), torch.cat(rows_l),
                            torch.tensor(targets, device=self.s.device), with_lens=self.settings.prefill_lens)
         row_of = {pos: i for i, pos in enumerate(target_pos)}
-        norms = resid.float().norm(dim=-1).cpu().numpy()
-        proj = self.directions.project(resid)
+        own = resid[:, first - cs:, :]
+        norms = own.float().norm(dim=-1).cpu().numpy()
+        proj = self.directions.project(own)
         recs = []
-        for j, tok in enumerate(chunk):
-            pos = cs + j
-            if pos == skip:  # recorded on an earlier request; re-fed only to recover its prediction
-                continue
+        for k, pos in enumerate(range(first, cs + len(chunk))):
             phase = "replay" if rendered.offsets[pos][0] < new_from else "prefill"
-            recs.append(self._record(run, req, pos, tok, rendered.roles[pos], rendered.msg_index[pos], phase,
-                                     pred, row_of.get(pos), norms[:, j], {k: v[j] for k, v in proj.items()}))
+            recs.append(self._record(run, req, pos, chunk[pos - cs], rendered.roles[pos], rendered.msg_index[pos],
+                                     phase, pred, row_of.get(pos), norms[:, k], {n: v[k] for n, v in proj.items()}))
         return recs
 
-    def _generate(self, p: GenParams, on_text) -> GenResult:
+    def _generate(self, p: GenParams, on_text, on_reasoning) -> GenResult:
         s = self.s
-        rendered = render(s.tokenizer, p.messages, p.tools)
+        rendered = render(s.tokenizer, p.messages, p.tools, template_kwargs=p.template_kwargs)
         ids = rendered.ids
         room = self.settings.max_context - len(ids)
         if room < 16:
@@ -316,23 +352,26 @@ class Recorder:
         new_from = max((e for st, e in rendered.spans[:seen] if st >= 0), default=0)
         active = [iv.describe() for iv in self.tap.interventions if iv.run in (None, run.id)]
 
-        # Reuse cached keys/values for the prefix shared with this run's previous request.
-        # Never across runs: each run's tape must hold its own full prompt. One overlapping
-        # token is always re-fed so the prediction for the first new token is available.
+        # Tokens shared with this run's previous request were already recorded. Never share
+        # across runs: each run's tape must hold its own full prompt. Attention-only models
+        # resume from the cache one token early (so the next prediction is available);
+        # models with recurrent layers can't roll their state back and re-read from the start.
         reusable = self._kv is not None and self._kv_epoch == self._iv_epoch and self._kv_run == run.id
-        lcp = common_prefix(self._kv_ids, ids) if reusable else 0
-        start = max(min(lcp, len(ids)) - 1, 0)
-        if start == 0:
-            self._kv = DynamicCache()
-        elif self._kv.get_seq_length() > start:
-            self._kv.crop(start - self._kv.get_seq_length())  # transformers 5 crops by a negative count
+        lcp = min(common_prefix(self._kv_ids, ids), len(ids)) if reusable else 0
+        if lcp and s.croppable_cache:
+            start = lcp - 1
+            if self._kv.get_seq_length() > start:
+                self._kv.crop(start - self._kv.get_seq_length())  # transformers 5 crops by a negative count
+        else:
+            start, self._kv = 0, None
+        record_from = lcp
         self._kv_epoch = self._iv_epoch
         self._kv_run = run.id
         self._kv_ids = ids[:start]
         self.tap.run_id = run.id
         self.tap.phase = "prefill"
         self.publish({"k": "req", "run": run.id, "req": req, "prompt_tokens": len(ids), "cached": start,
-                      "interventions": active})
+                      "already_recorded": record_from, "interventions": active})
 
         new_records: list[dict] = []
         pending = None
@@ -345,8 +384,8 @@ class Recorder:
             timing[key] += now - since
             return now
 
-        for cs in range(start, len(ids), PREFILL_CHUNK):
-            chunk = ids[cs:cs + PREFILL_CHUNK]
+        for cs in range(start, len(ids), s.prefill_chunk):
+            chunk = ids[cs:cs + s.prefill_chunk]
             tick = time.perf_counter()
             out = s.model(input_ids=torch.tensor([chunk], device=s.device), past_key_values=self._kv, use_cache=True)
             tick = lap("prefill_forward", tick)
@@ -354,7 +393,7 @@ class Recorder:
             resid = self.tap.stack()
             logits = out.logits[0]
             new_records += self._prefill_records(run, req, rendered, cs, chunk, resid, logits, pending,
-                                                 start if start > 0 else -1, new_from)
+                                                 record_from, new_from)
             pending = (resid[:, -1, :].clone(), logits[-1].float().clone())
             del out, resid, logits
             lap("prefill_readout", tick)
@@ -374,12 +413,15 @@ class Recorder:
             for etype, data in message_events(m):
                 self._event(run, t, etype, data)
 
-        # Decode, one token at a time, recording each step.
+        # Decode, one token at a time, recording each step. Tokens inside a <think> block are
+        # recorded with role "reasoning".
         self.tap.phase = "gen"
+        think_open = rendered.text.rstrip().endswith(THINK_OPEN)
+        stream = OutputStream(think_open, bool(p.tools), on_text, on_reasoning)
         pre_gen_t = run.pos2tape.get(len(ids) - 1)
         decision = {"pre_gen": (pre_gen_t, pending[0].to("cpu", torch.float16))}
         gen_ids, gen_tapes, text_lens, gen_states = [], [], [], []
-        text, streamed, mode = "", 0, (None if p.tools else "text")
+        text, think_end = "", None
         generator = torch.Generator(device=s.device)
         if p.seed is not None:
             generator.manual_seed(int(p.seed))
@@ -391,6 +433,8 @@ class Recorder:
             next_id = sample(pending[1], p.temperature, p.top_p, generator)
             pos = len(self._kv_ids)
             is_stop = next_id in s.stop_ids
+            reasoning, _, closed = split_reasoning(text, think_open)
+            role = "reasoning" if reasoning is not None and not closed else "assistant"
             own = out = None
             tick = time.perf_counter()
             if not is_stop:
@@ -403,7 +447,7 @@ class Recorder:
             pred = predict(s, pending[0][:, None, :], pending[1][None], torch.tensor([next_id], device=s.device))
             norm = None if own is None else own.float().norm(dim=-1).cpu().numpy()
             proj = {} if own is None else {k: v[0] for k, v in self.directions.project(own[:, None, :]).items()}
-            rec = self._record(run, req, pos, next_id, "assistant", msg_idx, "gen", pred, 0, norm, proj)
+            rec = self._record(run, req, pos, next_id, role, msg_idx, "gen", pred, 0, norm, proj)
             new_records.append(rec)
             self.publish({"k": "toks", "run": run.id, "items": [compact(rec)]})
             lap("decode_readout", tick)
@@ -414,42 +458,44 @@ class Recorder:
             pending = (own.clone(), out.logits[0, -1].float())
             gen_ids.append(next_id)
             gen_tapes.append(rec["t"])
-            text = s.tokenizer.decode(gen_ids, skip_special_tokens=True)
+            text = s.tokenizer.decode(gen_ids, skip_special_tokens=False)
             text_lens.append(len(text))
+            if role == "reasoning" and think_end is None and split_reasoning(text, think_open)[2]:
+                think_end = len(gen_states) - 1
+                self._event(run, rec["t"], "think_end", {"reasoning_tokens": len(gen_ids)})
             hit = next((x for x in p.stop if x and x in text), None)
             if hit:
                 text, finish = text[:text.index(hit)], "stop"
-            if on_text is not None:
-                if mode is None and text.strip():
-                    mode = "tool" if text.lstrip()[0] in "{<" else "text"
-                if mode == "text":
-                    safe = text[:-1] if text.endswith("�") else text
-                    if len(safe) > streamed:
-                        on_text(safe[streamed:])
-                        streamed = len(safe)
+            stream.update(text)
             if hit:
                 break
         decode_s = time.perf_counter() - t1
+        stream.update(text, final=True)
 
-        content, calls = parse_tool_calls(text) if p.tools else ((text or None), [])
-        if on_text is not None and not calls and len(text) > streamed:
-            on_text(text[streamed:])
+        reasoning, answer, _ = split_reasoning(text, think_open)
+        reasoning = reasoning.strip() if reasoning is not None else None
+        content, calls = parse_tool_calls(answer, p.tools) if p.tools else ((answer.strip() or None), [])
+        stream.finish(content)
         if calls:
             finish = "tool_calls"
+        answer_at = len(text) - len(answer)
         first_t = gen_tapes[0] if gen_tapes else (new_records[-1]["t"] if new_records else 0)
         for c in calls:
-            at = text.find(c["function"]["name"])
+            at = text.find(c["function"]["name"], answer_at)
             k = min(bisect.bisect_left(text_lens, at + 1), len(gen_tapes) - 1) if at >= 0 and gen_tapes else 0
             self._event(run, gen_tapes[k] if gen_tapes else first_t, "tool_call",
                         {"name": c["function"]["name"], "arguments": c["function"]["arguments"][:400]})
         if not calls:
-            self._event(run, first_t, "final_answer", {"chars": len(text), "finish": finish})
+            self._event(run, first_t, "final_answer", {"chars": len(answer), "finish": finish})
         self._add_message(run, {"i": msg_idx, "req": req, "t": first_t, "role": "assistant", "content": content,
-                                "tool_calls": calls or None, "generated": True, "finish": finish})
+                                "reasoning": reasoning, "tool_calls": calls or None, "generated": True,
+                                "finish": finish})
 
         if self.settings.decision_residuals and gen_states:
-            lead = len(text) - len(text.lstrip())
+            lead = answer_at + len(answer) - len(answer.lstrip())
             picks = {"first": 0, "last": len(gen_states) - 1}
+            if think_end is not None:
+                picks["think_end"] = think_end
             if calls:
                 picks["tool_call_start"] = min(bisect.bisect_right(text_lens, lead), len(gen_states) - 1)
             for label, k in picks.items():
@@ -472,11 +518,11 @@ class Recorder:
         self.perf.update(prefill_tok_s=round(n_new / prefill_s, 1) if prefill_s > 0 else None,
                          decode_tok_s=round(len(gen_ids) / decode_s, 1) if decode_s > 0 and gen_ids else None,
                          seconds={k: round(v, 3) for k, v in timing.items()})
-        print(f"[brainscan] {run.id} req {req}: prefill {n_new} tok, decode {len(gen_ids)} tok, "
-              + ", ".join(f"{k} {v:.2f}s" for k, v in timing.items()), flush=True)
+        print(f"[brainscan] {run.id} req {req}: prefill {n_new} tok ({len(ids) - record_from} recorded), "
+              f"decode {len(gen_ids)} tok, " + ", ".join(f"{k} {v:.2f}s" for k, v in timing.items()), flush=True)
         self.publish({"k": "done", "run": run.id, "req": req, "finish": finish, "perf": dict(self.perf),
                       "meta": run.meta})
-        return GenResult(run.id, req, text, content, calls, finish, len(ids), len(gen_ids), start)
+        return GenResult(run.id, req, text, content, calls, finish, len(ids), len(gen_ids), start, reasoning)
 
     # ---- reads ---------------------------------------------------------------------
 

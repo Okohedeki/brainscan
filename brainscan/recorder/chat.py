@@ -2,8 +2,9 @@
 
 Every token on the tape gets a role (system, user, assistant, tool or template) and
 the index of the message it came from, so harness events can be pinned to exact
-token positions. Tool calls in the model's output are parsed in both the Llama 3.x
-JSON style and the Hermes/Qwen <tool_call> style.
+token positions. Tool calls in the model's output are parsed in the Llama 3.x JSON
+style, the Hermes <tool_call>{json}</tool_call> style, and the Qwen3.5 / Qwen3-Coder
+XML style (<tool_call><function=name><parameter=key>value</parameter>...).
 """
 
 from __future__ import annotations
@@ -18,7 +19,10 @@ import numpy as np
 
 _SPECIAL = re.compile(r"<\|[A-Za-z0-9_]+\|>|<end_of_turn>|<start_of_turn>|</?tool_call>")
 _TAGGED = re.compile(r"<tool_call>\s*(.*?)\s*</tool_call>", re.S)
+_FUNCTION = re.compile(r"<function=([^>\n]+)>(.*?)(?:</function>|$)", re.S)
+_PARAMETER = re.compile(r"<parameter=([^>\n]+)>(.*?)(?:</parameter>|(?=<parameter=)|$)", re.S)
 _PYTHON_TAG = "<|python_tag|>"
+THINK_OPEN, THINK_CLOSE = "<think>", "</think>"
 
 
 @dataclass
@@ -56,6 +60,8 @@ def to_template_messages(messages: list[dict]) -> list[dict]:
     for m in messages:
         role = "system" if m.get("role") == "developer" else m.get("role")
         msg: dict = {"role": role, "content": text_of(m.get("content"))}
+        if role == "assistant" and m.get("reasoning_content"):
+            msg["reasoning_content"] = m["reasoning_content"]
         if role == "assistant" and m.get("tool_calls"):
             calls = []
             for c in m["tool_calls"]:
@@ -160,10 +166,11 @@ def one_call_per_turn(tmsgs: list[dict]) -> tuple[list[dict], list[int]]:
 
 
 def render(tokenizer, messages: list[dict], tools: list[dict] | None = None,
-           add_generation_prompt: bool = True) -> Rendered:
+           add_generation_prompt: bool = True, template_kwargs: dict | None = None) -> Rendered:
     tmsgs = to_template_messages(messages)
     origin = list(range(len(tmsgs)))
     kwargs = {"tools": tools} if tools else {}
+    kwargs.update(template_kwargs or {})
     try:
         text = tokenizer.apply_chat_template(
             tmsgs, add_generation_prompt=add_generation_prompt, tokenize=False, **kwargs)
@@ -231,12 +238,70 @@ def _as_call(obj) -> tuple[str, object] | None:
     return name, args
 
 
-def parse_tool_calls(text: str) -> tuple[str | None, list[dict]]:
+def split_reasoning(text: str, think_open: bool) -> tuple[str | None, str, bool]:
+    """Split generated text into (reasoning, answer, reasoning_finished).
+
+    think_open: the prompt already opened a <think> block (Qwen3.5 thinking mode).
+    Models that open the block themselves are handled too. Pieces are returned raw
+    so streaming can diff them; callers strip the final values.
+    """
+    if not think_open and text.lstrip().startswith(THINK_OPEN):
+        think_open, text = True, text.lstrip()[len(THINK_OPEN):]
+    if not think_open:
+        return None, text, True
+    if THINK_CLOSE in text:
+        reasoning, answer = text.split(THINK_CLOSE, 1)
+        return reasoning, answer, True
+    return text, "", False
+
+
+def _param_types(tools: list[dict] | None) -> dict[str, dict[str, str | None]]:
+    out = {}
+    for t in tools or []:
+        fn = t.get("function", t)
+        props = (fn.get("parameters") or {}).get("properties") or {}
+        out[fn.get("name")] = {k: (v or {}).get("type") for k, v in props.items()}
+    return out
+
+
+def _xml_calls(block: str, types: dict) -> list[tuple[str, dict]]:
+    """Parse <function=name><parameter=key>value</parameter></function> blocks.
+    Values stay strings unless the tool schema declares another type."""
+    calls = []
+    for fm in _FUNCTION.finditer(block):
+        name, kinds, args = fm.group(1).strip(), types.get(fm.group(1).strip(), {}), {}
+        for pm in _PARAMETER.finditer(fm.group(2)):
+            key, raw = pm.group(1).strip(), pm.group(2)
+            raw = raw[1:] if raw.startswith("\n") else raw
+            raw = raw[:-1] if raw.endswith("\n") else raw
+            if kinds.get(key) not in (None, "string"):
+                try:
+                    raw = json.loads(raw)
+                except json.JSONDecodeError:
+                    pass
+            args[key] = raw
+        calls.append((name, args))
+    return calls
+
+
+def _calls_in(block: str, types: dict) -> list[tuple[str, object]]:
+    if "<function=" in block:
+        return _xml_calls(block, types)
+    return [c for c in map(_as_call, _json_objects(block.strip())) if c]
+
+
+def parse_tool_calls(text: str, tools: list[dict] | None = None) -> tuple[str | None, list[dict]]:
     """Split model output into (content, OpenAI-style tool_calls)."""
+    types = _param_types(tools)
     found = []
     for m in _TAGGED.finditer(text):
-        found += [c for c in map(_as_call, _json_objects(m.group(1))) if c]
+        found += _calls_in(m.group(1), types)
     content = _TAGGED.sub("", text) if found else text
+    if not found and "<tool_call>" in text:  # generation stopped before the closing tag
+        head, _, tail = text.partition("<tool_call>")
+        found = _calls_in(tail, types)
+        if found:
+            content = head
     if not found:
         body = text.strip()
         if body.startswith(_PYTHON_TAG):

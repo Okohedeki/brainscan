@@ -97,8 +97,9 @@ class LayerTap:
 
 
 @torch.no_grad()
-def lens_rows(subject, x: torch.Tensor, targets: torch.Tensor, chunk: int = 512):
+def lens_rows(subject, x: torch.Tensor, targets: torch.Tensor, chunk: int | None = None):
     """Logit lens on rows of residuals: (prob of target token, top-1 token id) per row."""
+    chunk = chunk or subject.lens_chunk
     probs, tops = [], []
     for s in range(0, x.shape[0], chunk):
         logits = subject.lm_head(subject.norm(x[s:s + chunk])).float()
@@ -110,13 +111,14 @@ def lens_rows(subject, x: torch.Tensor, targets: torch.Tensor, chunk: int = 512)
 
 @torch.no_grad()
 def predict(subject, resid: torch.Tensor, logits: torch.Tensor, targets: torch.Tensor,
-            with_lens: bool = True, chunk: int = 256) -> dict:
+            with_lens: bool = True, chunk: int | None = None) -> dict:
     """Prediction stats for N slots whose next token is known.
 
     resid: (layers, N, d) residuals at the predicting positions
     logits: (N, vocab) the model's actual output logits at those positions
     targets: (N,) the token that actually came next
     """
+    chunk = chunk or max(32, subject.lens_chunk // 2)
     out = {"p": [], "ent": [], "top_p": [], "top_ids": []}
     for s in range(0, logits.shape[0], chunk):
         logp = torch.log_softmax(logits[s:s + chunk].float(), -1)
