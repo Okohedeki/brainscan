@@ -18,6 +18,7 @@ class Settings:
     # "ollama:<tag>" loads a model from the local Ollama store (dequantized from GGUF);
     # anything else is a Hugging Face repo id or local directory.
     model: str = field(default_factory=lambda: _env("MODEL", "ollama:llama3.1:8b"))
+    device: str = field(default_factory=lambda: _env("DEVICE", "cuda"))
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA", str(PROJECT_ROOT / "runs"))))
     disk_budget_gb: float = field(default_factory=lambda: float(_env("DISK_BUDGET_GB", "50")))
     host: str = field(default_factory=lambda: _env("HOST", "0.0.0.0"))

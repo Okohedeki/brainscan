@@ -23,6 +23,7 @@ from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
+from .recorder import workbench
 from .recorder.model import Subject
 from .recorder.session import GenParams, Recorder, compact
 from .recorder.store import RunStore
@@ -65,7 +66,7 @@ state: dict = {"recorder": None, "status": "loading", "step": "starting", "error
 def _load() -> None:
     try:
         state["step"] = f"loading {settings.model}"
-        subject = Subject(settings.model)
+        subject = Subject(settings.model, device=settings.device)
         rec = Recorder(subject, RunStore(settings.data_dir, settings.disk_budget_gb), settings, hub.publish)
         state["step"] = "building direction bank"
         with rec.lock:
@@ -310,6 +311,115 @@ async def post_direction(request: Request):
     except (KeyError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
     return rec.directions.describe()
+
+
+@app.post("/brainscan/directions/analyze")
+async def analyze_direction(request: Request):
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(recorder().analyze_direction, body.get("positive") or [],
+                                       body.get("negative") or [], body.get("position", "last"),
+                                       bool(body.get("chat", True)))
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/brainscan/directions/save")
+async def save_direction(request: Request):
+    body = await request.json()
+    rec = recorder()
+
+    def save():
+        with rec.lock:
+            return rec.directions.save_analysis(body["id"], int(body["layer"]), body["name"],
+                                                body.get("description", ""))
+    try:
+        await asyncio.to_thread(save)
+    except (KeyError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return rec.directions.describe()
+
+
+@app.delete("/brainscan/directions/{name}")
+async def delete_direction(name: str):
+    rec = recorder()
+    if any(e.direction == name for e in rec.edits.edits.values()) or \
+            any(iv.direction == name for iv in rec.interventions.values()):
+        raise HTTPException(409, f"{name} is used by an edit or intervention; remove those first")
+    try:
+        with rec.lock:
+            rec.directions.delete(name)
+    except KeyError as exc:
+        raise HTTPException(404, f"no direction {name}") from exc
+    return rec.directions.describe()
+
+
+@app.get("/brainscan/workbench")
+async def get_workbench():
+    return recorder().edits.summary()
+
+
+@app.post("/brainscan/workbench/edits")
+async def post_weight_edit(request: Request):
+    body = await request.json()
+    try:
+        edit = await asyncio.to_thread(recorder().add_weight_edit, **body)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return edit.describe()
+
+
+@app.patch("/brainscan/workbench/edits/{eid}")
+async def patch_weight_edit(eid: str, request: Request):
+    body = await request.json()
+    try:
+        return recorder().edits.set_enabled(eid, bool(body.get("enabled", True))).describe()
+    except KeyError as exc:
+        raise HTTPException(404, f"no edit {eid}") from exc
+
+
+@app.delete("/brainscan/workbench/edits/{eid}")
+async def delete_weight_edit(eid: str):
+    rec = recorder()
+    if eid in rec.edits.applied:
+        raise HTTPException(409, "this edit is applied; restore the original weights first")
+    try:
+        rec.edits.remove(eid)
+    except KeyError as exc:
+        raise HTTPException(404, f"no edit {eid}") from exc
+    return rec.edits.summary()
+
+
+@app.post("/brainscan/workbench/apply")
+async def apply_weight_edits():
+    try:
+        return await asyncio.to_thread(recorder().apply_weight_edits)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/brainscan/workbench/revert")
+async def revert_weight_edits():
+    return await asyncio.to_thread(recorder().revert_weight_edits)
+
+
+@app.post("/brainscan/workbench/compare")
+async def compare_weight_edits(request: Request):
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(workbench.compare, recorder(), body.get("prompts") or [],
+                                       int(body.get("max_tokens") or 96), body.get("reference") or None)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.post("/brainscan/workbench/export")
+async def export_edited_model(request: Request):
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(workbench.export, recorder(), body["path"])
+    except (KeyError, ValueError, OSError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.websocket("/brainscan/live")

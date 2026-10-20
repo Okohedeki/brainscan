@@ -31,6 +31,7 @@ from .capture import MODES, PHASES, Intervention, LayerTap, predict
 from .chat import (THINK_CLOSE, THINK_OPEN, common_prefix, parse_tool_calls, render, split_reasoning,
                    to_template_messages)
 from .directions import DirectionBank
+from .edits import EditStack
 from .events import message_events
 
 
@@ -137,6 +138,7 @@ class Recorder:
         self.s, self.store, self.settings, self.publish = subject, store, settings, publish
         self.tap = LayerTap(subject)
         self.directions = DirectionBank(store.root / "directions", subject, self.tap)
+        self.edits = EditStack(subject)
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}
@@ -188,6 +190,10 @@ class Recorder:
         self.tap.interventions = [iv for iv in self.interventions.values() if iv.enabled]
         self._iv_epoch += 1  # cached keys/values were computed under different edits
 
+    def _epoch(self) -> tuple[int, int]:
+        """Cached keys/values are only valid under the same steering and the same weights."""
+        return self._iv_epoch, self.edits.version
+
     # ---- runs ----------------------------------------------------------------------
 
     def _new_run(self, rid: str | None, label: str | None) -> RunState:
@@ -198,7 +204,7 @@ class Recorder:
                 "model": self.s.info(), "requests": 0, "tokens": 0, "outcome": None,
                 "settings": {"prefill_lens": self.settings.prefill_lens,
                              "decision_residuals": self.settings.decision_residuals},
-                "interventions": [], "residuals": []}
+                "interventions": [], "weight_edits": [], "residuals": []}
         run = RunState(rid, meta)
         self.runs[rid] = run
         self.store.write_meta(rid, meta)
@@ -351,12 +357,13 @@ class Recorder:
         seen = min(run.seen_msgs, len(p.messages))
         new_from = max((e for st, e in rendered.spans[:seen] if st >= 0), default=0)
         active = [iv.describe() for iv in self.tap.interventions if iv.run in (None, run.id)]
+        weight_edits = self.edits.active()
 
         # Tokens shared with this run's previous request were already recorded. Never share
         # across runs: each run's tape must hold its own full prompt. Attention-only models
         # resume from the cache one token early (so the next prediction is available);
         # models with recurrent layers can't roll their state back and re-read from the start.
-        reusable = self._kv is not None and self._kv_epoch == self._iv_epoch and self._kv_run == run.id
+        reusable = self._kv is not None and self._kv_epoch == self._epoch() and self._kv_run == run.id
         lcp = min(common_prefix(self._kv_ids, ids), len(ids)) if reusable else 0
         if lcp and s.croppable_cache:
             start = lcp - 1
@@ -365,7 +372,7 @@ class Recorder:
         else:
             start, self._kv = 0, None
         record_from = lcp
-        self._kv_epoch = self._iv_epoch
+        self._kv_epoch = self._epoch()
         self._kv_run = run.id
         self._kv_ids = ids[:start]
         self.tap.run_id = run.id
@@ -379,7 +386,8 @@ class Recorder:
         timing = {"prefill_forward": 0.0, "prefill_readout": 0.0, "decode_forward": 0.0, "decode_readout": 0.0}
 
         def lap(key: str, since: float) -> float:
-            torch.cuda.synchronize()
+            if s.device.type == "cuda":
+                torch.cuda.synchronize()
             now = time.perf_counter()
             timing[key] += now - since
             return now
@@ -512,6 +520,8 @@ class Recorder:
         run.meta.update(tokens=len(run.tape), updated=time.time())
         if active:
             run.meta["interventions"].append({"req": req, "active": active})
+        if weight_edits:
+            run.meta.setdefault("weight_edits", []).append({"req": req, "edits": weight_edits})
         self.store.write_tokens(run.id, req, new_records)
         self.store.write_meta(run.id, run.meta)
         n_new = len(ids) - start
@@ -541,4 +551,39 @@ class Recorder:
         return {"model": self.s.info(), "perf": self.perf,
                 "disk": {"used": self.store.used_bytes(), "budget": self.store.budget},
                 "interventions": [iv.describe() for iv in self.interventions.values()],
-                "directions": self.directions.describe()}
+                "directions": self.directions.describe(), "workbench": self.edits.summary()}
+
+    # ---- workbench -----------------------------------------------------------------
+
+    def add_weight_edit(self, kind: str, direction: str | None = None, seed: int | None = None, **kwargs):
+        vector = None
+        if kind == "orthogonalize":
+            if direction == "random":
+                vector = torch.randn(self.s.d_model, generator=torch.Generator().manual_seed(seed or 0))
+                direction = f"random(seed={seed or 0})"
+            elif direction in self.directions.dirs:
+                vector = self.directions.dirs[direction].unit
+            else:
+                raise ValueError(f"unknown direction {direction!r}")
+        with self.lock:
+            return self.edits.add(kind, direction=direction, vector=vector, **kwargs)
+
+    def apply_weight_edits(self) -> dict:
+        with self.lock, torch.no_grad():
+            t0 = time.perf_counter()
+            self.edits.apply()
+            summary = self.edits.summary() | {"seconds": round(time.perf_counter() - t0, 2)}
+        self.publish({"k": "workbench", "summary": summary})
+        return summary
+
+    def revert_weight_edits(self) -> dict:
+        with self.lock:
+            self.edits.revert()
+            summary = self.edits.summary()
+        self.publish({"k": "workbench", "summary": summary})
+        return summary
+
+    def analyze_direction(self, positive: list[str], negative: list[str], position: str, chat: bool) -> dict:
+        """Directions are measured on the original weights, even while edits are applied."""
+        with self.lock, self.edits.suspended():
+            return self.directions.analyze(positive, negative, position, chat)

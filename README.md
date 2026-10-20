@@ -37,6 +37,49 @@ experience.
   a |z| ≤ 2 band), a token inspector, and steering controls.
 - **Mini agent harness** with three tasks: `fix_fizzbuzz`, `toml_lite`, and `impossible_clamp`
   (contradictory tests, for studying giving up and test-editing).
+- **Reasoning models** (Qwen3.5): thinking tokens are recorded as their own role and shown as
+  collapsible thinking in the transcript; `--thinking on|off` on the harness, or
+  `chat_template_kwargs` per request.
+
+## Workbench: edit the weights
+
+The Workbench tab changes the model's parameters, the way "abliterated" models are made, and
+measures what that does. Runtime steering (Scanner tab) edits activations during a run; the
+workbench edits the weights themselves.
+
+1. **Find a direction.** Paste two sets of examples. Brainscan reads the residual stream for each
+   at every layer, takes the difference of the set means, and charts how well each layer's
+   direction separates held-out examples. Pick a layer and save the direction to the bank.
+   Directions are always measured on the original weights.
+2. **Edit weights.** Stack edits, then apply them:
+   - *Remove a direction*: orthogonalize the weights that write to the residual stream (token
+     embeddings, attention and MLP outputs) or read from it (attention and MLP inputs,
+     unembedding), at chosen layers and strength. Embeddings plus all attention and MLP outputs
+     at strength 1 is the directional ablation of Arditi et al. (2024).
+   - *Scale a component*: a layer's attention or MLP block, one attention head, or one MLP neuron
+     (factor 0 is a lesion).
+   Add a random-direction edit with the same settings as a control. Applying keeps a CPU copy of
+   every touched weight, so restore is exact, and every recording made while edits are applied is
+   tagged with them (`weight_edits` in the run metadata; "weights edited" in the header).
+3. **Compare.** Runs prompts on the original and edited weights side by side (greedy, steering
+   off), with a refusal-phrase heuristic and side-effect checks on neutral text (KL divergence and
+   perplexity).
+4. **Export.** Saves the edited weights as a Hugging Face checkpoint with `brainscan_edits.json`
+   recording the base model and every edit.
+
+To try the whole stack without a GPU, build a tiny random model and serve it on CPU:
+
+```bash
+wsl -e bash scripts/run.sh scripts/make_tiny_model.py
+```
+
+```bash
+wsl -e env BRAINSCAN_MODEL=/home/$USER/.cache/brainscan/models/tiny-llama-test BRAINSCAN_DEVICE=cpu BRAINSCAN_DATA=/tmp/brainscan-smoke BRAINSCAN_PORT=8766 bash scripts/run.sh -m brainscan.server
+```
+
+```bash
+wsl -e bash scripts/run.sh scripts/smoke_workbench.py
+```
 
 ## Run it
 
@@ -67,9 +110,15 @@ wsl -e bash scripts/run.sh -m brainscan.hardware
 
 ### Settings (environment variables)
 
+Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.env.example`).
+`scripts/run.sh` reads it, and variables already set in the environment win.
+
 | Variable | Default | Meaning |
 |---|---|---|
-| `BRAINSCAN_MODEL` | `ollama:llama3.1:8b` | `ollama:<tag>` (dequantized from the local Ollama GGUF) or a Hugging Face repo id / path |
+| `BRAINSCAN_MODEL` | `ollama:llama3.1:8b` | `ollama:<tag>` (dequantized from the local Ollama GGUF), a Hugging Face repo id, or a local checkpoint folder |
+| `BRAINSCAN_MODEL_NAME` | from the path | Display name, e.g. `Qwen/Qwen3.5-9B` |
+| `BRAINSCAN_DEVICE` | `cuda` | `cpu` for testing without a GPU |
+| `BRAINSCAN_THINKING` | `default` | Reasoning models: `on`, `off`, or the chat template's default |
 | `BRAINSCAN_DATA` | `./runs` | Where recordings go |
 | `BRAINSCAN_DISK_BUDGET_GB` | `50` | Stop writing residuals beyond this |
 | `BRAINSCAN_PORT` | `8765` | Server port |
@@ -86,13 +135,19 @@ wsl -e bash scripts/run.sh -m brainscan.hardware
 - **Plain hooks, not nnsight.** The recorder uses raw PyTorch forward hooks (the same mechanism
   nnsight wraps) because the streaming server needs a hand-written decode loop with KV reuse.
   nnsight remains the tool for offline analysis.
+- **Weight edits on some architectures are approximate or unsupported.** Gemma 2/3 pass block
+  outputs through an extra norm before the residual add, so removing a direction from their
+  output weights doesn't fully remove it from the stream. Mixture-of-experts MLPs (GPT-OSS) are
+  not edited yet. Head scaling needs standard attention (`o_proj`); Qwen3.5's linear-attention
+  layers have none.
 - **Not built yet:** SAE features, attention summaries, MoE routing capture, and nnsight-based
   analysis modules. One request runs at a time.
 
 ## Layout
 
 ```
-brainscan/recorder/   model loading, hooks, chat rendering, events, storage, session, directions
+brainscan/recorder/   model loading, hooks, chat rendering, events, storage, session, directions,
+                      weight edits (edits.py) and workbench checks (workbench.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report

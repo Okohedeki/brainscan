@@ -724,7 +724,9 @@ async function pollStatus() {
     S.nLayers = S.meta?.model?.n_layers || st.model.n_layers;
     const prov = st.model.provenance || {};
     const q = prov.quantization ? `<span class="warn" title="${esc(prov.note || "")}">${esc(prov.quantization)} → ${esc(st.model.dtype)} · exploratory</span>` : `<span>${esc(st.model.dtype)}</span>`;
-    $("#model-badge").innerHTML = `${esc(st.model.name)} · ${st.model.n_layers} layers · ${q}`;
+    const edited = st.workbench?.applied?.length;
+    const ed = edited ? ` · <span class="warn" title="${esc(st.workbench.applied.map((e) => e.summary).join("\n"))}">weights edited (${edited})</span>` : "";
+    $("#model-badge").innerHTML = `${esc(st.model.name)} · ${st.model.n_layers} layers · ${q}${ed}`;
   } else {
     $("#model-badge").textContent = st.status === "error" ? "Recorder error" : `Loading: ${st.step || ""}`;
   }
