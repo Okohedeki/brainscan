@@ -127,6 +127,7 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 | `BRAINSCAN_MAX_CONTEXT` | `16384` | Prompt plus completion limit |
 | `BRAINSCAN_PREFILL_LENS` | `1` | Logit lens on prompt and tool-result tokens too |
 | `BRAINSCAN_DECISION_RESIDUALS` | `1` | Save full residual stacks at decision points |
+| `BRAINSCAN_GRAPH_DECODE` | `1` | Replay decode steps from CUDA graphs (same outputs, about 3x faster); `0` decodes eagerly |
 
 ## Known limits
 
@@ -142,9 +143,11 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
   checks free memory at load time, releases cached memory after workbench operations and
   when free memory runs low, and uses expandable allocator segments. Other GPU apps
   (image generators, local LLM servers) still need to be closed for 9B-class models.
-- **Qwen3.5 decodes at about 13 tokens/s** on a 4090. The `causal_conv1d` kernel isn't installed,
-  so its linear-attention layers use a slower PyTorch fallback; the recording itself adds about
-  5 ms per token.
+- **One token at a time.** Qwen3.5-9B records at about 34 tokens/s on a 4090: each decode step
+  replays the forward from CUDA graphs (`recorder/graphs.py`, about 22 ms per token, bit-identical
+  to eager decoding) and the readout (logit lens, norms, projections) adds about 6 ms. Eager decoding
+  (`BRAINSCAN_GRAPH_DECODE=0`) manages about 12 tokens/s: its forward takes about 78 ms, most of it
+  CPU time spent launching some 2,000 small kernels, while the GPU work itself takes about 22 ms.
 - **Weight edits on some architectures are approximate or unsupported.** Gemma 2/3 pass block
   outputs through an extra norm before the residual add, so removing a direction from their
   output weights doesn't fully remove it from the stream. Mixture-of-experts MLPs (GPT-OSS) are

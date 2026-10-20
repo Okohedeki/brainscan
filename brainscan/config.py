@@ -31,6 +31,8 @@ class Settings:
     # Reasoning models: "on" / "off" sets enable_thinking in the chat template, "default" leaves the
     # template's own default. Requests can override with chat_template_kwargs.
     thinking: str = field(default_factory=lambda: _env("THINKING", "default"))
+    # Replay each decode step from CUDA graphs (recorder/graphs.py); outputs are bit-identical to eager.
+    graph_decode: bool = field(default_factory=lambda: _env("GRAPH_DECODE", "1") == "1")
 
     def template_kwargs(self) -> dict:
         return {"on": {"enable_thinking": True}, "off": {"enable_thinking": False}}.get(self.thinking, {})

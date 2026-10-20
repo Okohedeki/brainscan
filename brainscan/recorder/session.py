@@ -33,6 +33,7 @@ from .chat import (THINK_CLOSE, THINK_OPEN, common_prefix, parse_tool_calls, ren
 from .directions import DirectionBank
 from .edits import EditStack
 from .events import message_events
+from .graphs import DecodeGraphs
 
 
 @dataclass
@@ -139,6 +140,8 @@ class Recorder:
         self.tap = LayerTap(subject)
         self.directions = DirectionBank(store.root / "directions", subject, self.tap)
         self.edits = EditStack(subject)
+        use_graphs = settings.graph_decode and DecodeGraphs.available(subject)
+        self.graphs = DecodeGraphs(subject, self.tap) if use_graphs else None
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}
@@ -447,6 +450,8 @@ class Recorder:
         else:
             generator.seed()
         finish, msg_idx = "length", len(p.messages)
+        # Interventions are baked into the decode graphs, so the set that applies keys them.
+        graph_key = tuple(iv.id for iv in self.tap.interventions if iv.applies("gen", run.id))
         t1 = time.perf_counter()
         for _ in range(max_tokens):
             next_id = sample(pending[1], p.temperature, p.top_p, generator)
@@ -454,12 +459,15 @@ class Recorder:
             is_stop = next_id in s.stop_ids
             reasoning, _, closed = split_reasoning(text, think_open)
             role = "reasoning" if reasoning is not None and not closed else "assistant"
-            own = out = None
+            own = logits = None
             tick = time.perf_counter()
             if not is_stop:
-                out = s.model(input_ids=torch.tensor([[next_id]], device=s.device),
-                              past_key_values=self._kv, use_cache=True)
-                self._kv = out.past_key_values
+                if self.graphs is not None:
+                    logits = self.graphs.step(next_id, self._kv, graph_key)
+                if logits is None:
+                    out = s.model(input_ids=torch.tensor([[next_id]], device=s.device),
+                                  past_key_values=self._kv, use_cache=True)
+                    self._kv, logits = out.past_key_values, out.logits
                 self._kv_ids.append(next_id)
                 own = self.tap.stack()[:, 0, :]
             tick = lap("decode_forward", tick)
@@ -474,7 +482,7 @@ class Recorder:
                 finish = "stop"
                 break
             gen_states.append((rec["t"], own.to("cpu", torch.float16)))
-            pending = (own.clone(), out.logits[0, -1].float())
+            pending = (own.clone(), logits[0, -1].float())  # copies: graph outputs are reused next step
             gen_ids.append(next_id)
             gen_tapes.append(rec["t"])
             text = s.tokenizer.decode(gen_ids, skip_special_tokens=False)
@@ -563,7 +571,8 @@ class Recorder:
         return r
 
     def status(self) -> dict:
-        return {"model": self.s.info(), "perf": self.perf,
+        graphs = self.graphs.describe() if self.graphs else {"on": False, "off": "disabled"}
+        return {"model": self.s.info(), "perf": self.perf | {"decode_graphs": graphs},
                 "disk": {"used": self.store.used_bytes(), "budget": self.store.budget},
                 "interventions": [iv.describe() for iv in self.interventions.values()],
                 "directions": self.directions.describe(), "workbench": self.edits.summary()}
