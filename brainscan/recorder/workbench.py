@@ -51,15 +51,16 @@ def _generate(subject, prompt: str, max_tokens: int, template_kwargs: dict) -> s
     return tok.decode(out[0, ids.shape[1]:], skip_special_tokens=True).strip()
 
 
+def _reference_ids(subject, text: str) -> list[int]:
+    return [subject.sink_id] + subject.tokenizer(text, add_special_tokens=False).input_ids
+
+
 @torch.no_grad()
 def _reference_logprobs(subject, texts: list[str]) -> list[tuple[torch.Tensor, torch.Tensor]]:
     """Per text: (log-probs of each next-token distribution [T-1, V] in fp16 on CPU, next-token ids)."""
     tok, out = subject.tokenizer, []
     for text in texts:
-        ids = tok(text, add_special_tokens=False).input_ids
-        if tok.bos_token_id is not None:
-            ids = [tok.bos_token_id] + ids
-        x = torch.tensor([ids], device=subject.device)
+        x = torch.tensor([_reference_ids(subject, text)], device=subject.device)
         logp = torch.log_softmax(subject.model(input_ids=x, use_cache=False).logits[0, :-1].float(), -1)
         out.append((logp.to("cpu", torch.float16), x[0, 1:].cpu()))
     return out
@@ -75,6 +76,13 @@ def compare(recorder, prompts: list[str], max_tokens: int = 96, reference: list[
     s, refs = recorder.s, reference or REFERENCE_TEXTS
     kwargs = {"enable_thinking": False, **(template_kwargs or {})}
     t0 = time.perf_counter()
+    try:
+        return _compare(recorder, s, prompts, max_tokens, refs, kwargs, t0)
+    finally:
+        recorder.release_memory()
+
+
+def _compare(recorder, s, prompts, max_tokens, refs, kwargs, t0) -> dict:
     with recorder.lock, recorder.tap.paused():
         with recorder.edits.suspended():
             original = [_generate(s, p, max_tokens, kwargs) for p in prompts]
@@ -83,10 +91,7 @@ def compare(recorder, prompts: list[str], max_tokens: int = 96, reference: list[
         kl_sum = nll_o = nll_e = 0.0
         n_tok = 0
         for (lp_o, nxt), text in zip(ref_orig, refs):
-            ids = s.tokenizer(text, add_special_tokens=False).input_ids
-            if s.tokenizer.bos_token_id is not None:
-                ids = [s.tokenizer.bos_token_id] + ids
-            x = torch.tensor([ids], device=s.device)
+            x = torch.tensor([_reference_ids(s, text)], device=s.device)
             lp_e = torch.log_softmax(s.model(input_ids=x, use_cache=False).logits[0, :-1].float(), -1)
             lp_o = lp_o.to(s.device).float()
             kl_sum += float((lp_o.exp() * (lp_o - lp_e)).sum())
@@ -127,7 +132,10 @@ def export(recorder, path: str) -> dict:
         raise ValueError(f"not enough disk space at {probe}: need about {need / 1e9:.1f} GB, {free / 1e9:.1f} GB free")
     out.mkdir(parents=True, exist_ok=True)
     with recorder.lock:
-        s.model.save_pretrained(out)
+        try:
+            s.model.save_pretrained(out)
+        finally:
+            recorder.release_memory()
         s.tokenizer.save_pretrained(out)
         record = {"base_model": s.spec, "base_name": s.name, "base_provenance": s.provenance,
                   "edits": recorder.edits.active(), "created": time.strftime("%Y-%m-%d %H:%M:%S"),

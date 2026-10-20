@@ -190,6 +190,16 @@ class Recorder:
         self.tap.interventions = [iv for iv in self.interventions.values() if iv.enabled]
         self._iv_epoch += 1  # cached keys/values were computed under different edits
 
+    def release_memory(self, below_gb: float | None = None) -> None:
+        """Hand cached GPU blocks back to the driver. On Windows/WSL an over-full GPU doesn't raise
+        out-of-memory; the driver spills into system RAM and every forward pass crawls. With
+        below_gb, only release when free memory has dropped under that many GB."""
+        if self.s.device.type != "cuda":
+            return
+        if below_gb is not None and torch.cuda.mem_get_info()[0] >= below_gb * 2 ** 30:
+            return
+        torch.cuda.empty_cache()
+
     def _epoch(self) -> tuple[int, int]:
         """Cached keys/values are only valid under the same steering and the same weights."""
         return self._iv_epoch, self.edits.version
@@ -284,6 +294,7 @@ class Recorder:
         with self.lock:
             self.perf["busy"] = True
             try:
+                self.release_memory(below_gb=2.0)
                 with torch.no_grad():
                     return self._generate(p, on_text, on_reasoning)
             finally:
@@ -493,7 +504,11 @@ class Recorder:
             k = min(bisect.bisect_left(text_lens, at + 1), len(gen_tapes) - 1) if at >= 0 and gen_tapes else 0
             self._event(run, gen_tapes[k] if gen_tapes else first_t, "tool_call",
                         {"name": c["function"]["name"], "arguments": c["function"]["arguments"][:400]})
-        if not calls:
+        if finish == "length" and not calls:
+            last_t = gen_tapes[-1] if gen_tapes else first_t
+            self._event(run, last_t, "cutoff", {"tokens": len(gen_ids), "while_reasoning": think_open and
+                                                not split_reasoning(text, think_open)[2]})
+        elif not calls:
             self._event(run, first_t, "final_answer", {"chars": len(answer), "finish": finish})
         self._add_message(run, {"i": msg_idx, "req": req, "t": first_t, "role": "assistant", "content": content,
                                 "reasoning": reasoning, "tool_calls": calls or None, "generated": True,
@@ -571,7 +586,10 @@ class Recorder:
     def apply_weight_edits(self) -> dict:
         with self.lock, torch.no_grad():
             t0 = time.perf_counter()
-            self.edits.apply()
+            try:
+                self.edits.apply()
+            finally:
+                self.release_memory()
             summary = self.edits.summary() | {"seconds": round(time.perf_counter() - t0, 2)}
         self.publish({"k": "workbench", "summary": summary})
         return summary
@@ -579,11 +597,16 @@ class Recorder:
     def revert_weight_edits(self) -> dict:
         with self.lock:
             self.edits.revert()
+            self.release_memory()
             summary = self.edits.summary()
         self.publish({"k": "workbench", "summary": summary})
         return summary
 
     def analyze_direction(self, positive: list[str], negative: list[str], position: str, chat: bool) -> dict:
         """Directions are measured on the original weights, even while edits are applied."""
-        with self.lock, self.edits.suspended():
-            return self.directions.analyze(positive, negative, position, chat)
+        with self.lock:
+            try:
+                with self.edits.suspended():
+                    return self.directions.analyze(positive, negative, position, chat)
+            finally:
+                self.release_memory()

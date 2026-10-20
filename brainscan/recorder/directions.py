@@ -49,10 +49,7 @@ class DirectionBank:
 
     @torch.no_grad()
     def _token_acts(self, text: str, layer: int) -> torch.Tensor:
-        ids = self.s.tokenizer(text, add_special_tokens=False).input_ids
-        bos = self.s.tokenizer.bos_token_id
-        if bos is not None:  # some converted tokenizers don't add BOS themselves
-            ids = [bos] + ids
+        ids = [self.s.sink_id] + self.s.tokenizer(text, add_special_tokens=False).input_ids
         if len(ids) < 2:
             raise ValueError(f"text {text!r} has no tokens after the first position")
         with self.tap.paused():
@@ -66,8 +63,7 @@ class DirectionBank:
             rendered = tok.apply_chat_template([{"role": "user", "content": text}], add_generation_prompt=True,
                                                tokenize=False, enable_thinking=False)
             return tok(rendered, add_special_tokens=False).input_ids
-        ids = tok(text, add_special_tokens=False).input_ids
-        return ([tok.bos_token_id] if tok.bos_token_id is not None else []) + ids
+        return [self.s.sink_id] + tok(text, add_special_tokens=False).input_ids
 
     @torch.no_grad()
     def layer_acts(self, text: str, position: str = "last", chat: bool = True) -> torch.Tensor:
@@ -82,12 +78,14 @@ class DirectionBank:
         return torch.stack(rows).float().cpu()
 
     def analyze(self, positive: list[str], negative: list[str], position: str = "last", chat: bool = True) -> dict:
-        """Diff-of-means direction at every layer, scored on held-out examples.
+        """Diff-of-means direction at every layer, scored by cross-validation.
 
-        A quarter of each set (at least one example) is held out when both sets have four or
-        more examples. Separation d is the gap between held-out class means divided by the
-        within-class spread of the training projections (stable even with one held-out example
-        per set); accuracy is a midpoint-threshold classifier on the held-out examples.
+        With four or more examples per set, each set is split into k folds (k = up to 5, at
+        least two examples per fold); every fold is held out once while the direction is built
+        from the rest. Separation d is the gap between held-out class means divided by the
+        within-class spread of the training projections; accuracy is a midpoint-threshold
+        classifier on the held-out examples. Both are averaged over folds, and d_sd is the
+        spread of d across folds. With fewer examples the scores are in-sample.
         """
         positive = [t for t in (x.strip() for x in positive) if t]
         negative = [t for t in (x.strip() for x in negative) if t]
@@ -98,34 +96,46 @@ class DirectionBank:
         pos = torch.stack([self.layer_acts(t, position, chat) for t in positive])  # (n, L, d)
         neg = torch.stack([self.layer_acts(t, position, chat) for t in negative])
         held_out = len(positive) >= 4 and len(negative) >= 4
+        k = min(5, len(positive) // 2, len(negative) // 2) if held_out else 1
         rng = random.Random(0)
 
-        def split(n):
+        def folds(n: int) -> list[list[int]]:
             idx = list(range(n))
             rng.shuffle(idx)
-            k = max(1, n // 4) if held_out else 0
-            return (idx[k:], idx[:k]) if held_out else (idx, idx)
+            return [idx[i::k] for i in range(k)]
 
-        (p_tr, p_te), (n_tr, n_te) = split(len(positive)), split(len(negative))
+        p_folds, n_folds = folds(len(positive)), folds(len(negative))
+        splits = []
+        for f in range(k):
+            if held_out:
+                p_tr = [i for g, fold in enumerate(p_folds) if g != f for i in fold]
+                n_tr = [i for g, fold in enumerate(n_folds) if g != f for i in fold]
+                splits.append((p_tr, p_folds[f], n_tr, n_folds[f]))
+            else:
+                splits.append((list(range(len(positive))),) * 2 + (list(range(len(negative))),) * 2)
+
         layers = []
         for layer in range(pos.shape[1]):
-            diff = pos[p_tr, layer].mean(0) - neg[n_tr, layer].mean(0)
-            unit = diff / diff.norm().clamp_min(1e-8)
-            tp, tn = pos[p_tr, layer] @ unit, neg[n_tr, layer] @ unit
-            spread = torch.sqrt((tp.var(unbiased=False) + tn.var(unbiased=False)) / 2)
-            spread = spread.clamp_min(1e-3 * float((tp.mean() - tn.mean()).abs()) + 1e-6)
-            pp, nn_ = pos[p_te, layer] @ unit, neg[n_te, layer] @ unit
-            mid = (tp.mean() + tn.mean()) / 2
-            acc = ((pp > mid).float().sum() + (nn_ <= mid).float().sum()) / (len(pp) + len(nn_))
-            layers.append({"layer": layer, "d": round(float((pp.mean() - nn_.mean()) / spread), 3),
-                           "acc": round(float(acc), 3)})
+            ds, accs = [], []
+            for p_tr, p_te, n_tr, n_te in splits:
+                diff = pos[p_tr, layer].mean(0) - neg[n_tr, layer].mean(0)
+                unit = diff / diff.norm().clamp_min(1e-8)
+                tp, tn = pos[p_tr, layer] @ unit, neg[n_tr, layer] @ unit
+                spread = torch.sqrt((tp.var(unbiased=False) + tn.var(unbiased=False)) / 2)
+                spread = spread.clamp_min(1e-3 * float((tp.mean() - tn.mean()).abs()) + 1e-6)
+                pp, nn_ = pos[p_te, layer] @ unit, neg[n_te, layer] @ unit
+                mid = (tp.mean() + tn.mean()) / 2
+                ds.append(float((pp.mean() - nn_.mean()) / spread))
+                accs.append(float(((pp > mid).float().sum() + (nn_ <= mid).float().sum()) / (len(pp) + len(nn_))))
+            layers.append({"layer": layer, "d": round(float(np.mean(ds)), 3), "d_sd": round(float(np.std(ds)), 3),
+                           "acc": round(float(np.mean(accs)), 3)})
         aid = uuid.uuid4().hex[:10]
-        self._analyses[aid] = {"pos": pos, "neg": neg, "position": position, "chat": chat,
+        self._analyses[aid] = {"pos": pos, "neg": neg, "position": position, "chat": chat, "folds": k,
                                "positive": positive, "negative": negative, "layers": layers, "held_out": held_out}
         while len(self._analyses) > 4:
             self._analyses.popitem(last=False)
         best = max(layers, key=lambda x: x["d"])["layer"]
-        return {"id": aid, "layers": layers, "best": best, "held_out": held_out,
+        return {"id": aid, "layers": layers, "best": best, "held_out": held_out, "folds": k,
                 "n_positive": len(positive), "n_negative": len(negative)}
 
     def save_analysis(self, aid: str, layer: int, name: str, description: str = "") -> Direction:
@@ -140,11 +150,12 @@ class DirectionBank:
         unit = (diff / diff.norm()).to(self.s.device)
         score = a["layers"][layer]
         where = f"the {'last token' if a['position'] == 'last' else 'mean over tokens'}"
+        separation = (f"{a['folds']}-fold cross-validated separation d={score['d']} ± {score['d_sd']}"
+                      if a["held_out"] else f"in-sample separation d={score['d']}")
         meta = {"kind": "contrast", "description": description,
                 "construction": f"difference of means at {where}{' of chat-formatted prompts' if a['chat'] else ''}, "
                                 f"layer {layer}, {len(a['positive'])} vs {len(a['negative'])} examples; "
-                                f"{'held-out' if a['held_out'] else 'in-sample'} separation d={score['d']}, "
-                                f"accuracy {score['acc']:.0%}; z-scored on the same examples",
+                                f"{separation}, accuracy {score['acc']:.0%}; z-scored on the same examples",
                 "positive": a["positive"], "negative": a["negative"], "position": a["position"],
                 "chat": a["chat"], "separation": score}
         samples = torch.cat([a["pos"][:, layer], a["neg"][:, layer]]).to(self.s.device)

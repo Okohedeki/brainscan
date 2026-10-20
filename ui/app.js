@@ -72,6 +72,7 @@ function eventLook(e) {
       : { label: `✎ ${d.path}`, tone: "ink2", glyph: "✎" };
     case "final_answer": return { label: "■ answer", tone: "ink", glyph: "■" };
     case "think_end": return { label: "◆ end of thinking", tone: "ink2", glyph: "◆" };
+    case "cutoff": return { label: d.while_reasoning ? "▲ cut off while thinking" : "▲ cut off", tone: "serious", glyph: "▲", line: true, status: "serious" };
     case "verdict": return d.success ? { label: "✓ PASS", tone: "good", glyph: "✓", line: true, status: "good" }
       : { label: "✕ FAIL", tone: "critical", glyph: "✕", line: true, status: "critical" };
     default: return null;

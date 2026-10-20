@@ -165,6 +165,11 @@ class Subject:
         self.lens_chunk = max(64, int(1e8 // self.vocab_size))
         self.prefill_chunk = 512 if self.vocab_size < 200_000 else 256
         self.stop_ids = self._stop_ids()
+        # Token placed before raw texts (direction building, reference text): BOS where the model
+        # has one, otherwise its document separator. It absorbs the first-position attention sink.
+        vocab = self.tokenizer.get_vocab()
+        self.sink_id = (self.tokenizer.bos_token_id if self.tokenizer.bos_token_id is not None
+                        else vocab.get("<|endoftext|>", self.tokenizer.eos_token_id))
         n_tok = len(self.tokenizer)
         strings = self.tokenizer.batch_decode([[i] for i in range(n_tok)])
         self._token_strs = strings + [f"<{i}>" for i in range(n_tok, self.vocab_size)]

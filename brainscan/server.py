@@ -8,7 +8,13 @@ requests into a run explicitly; otherwise runs are inferred from shared prefixes
 
 from __future__ import annotations
 
-import asyncio
+import os
+
+# Less fragmentation from the very different tensor sizes the recorder and workbench allocate.
+# Must be set before CUDA initialises.
+os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
+
+import asyncio  # noqa: E402
 import json
 import threading
 import time

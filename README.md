@@ -49,8 +49,10 @@ workbench edits the weights themselves.
 
 1. **Find a direction.** Paste two sets of examples. Brainscan reads the residual stream for each
    at every layer, takes the difference of the set means, and charts how well each layer's
-   direction separates held-out examples. Pick a layer and save the direction to the bank.
-   Directions are always measured on the original weights.
+   direction separates held-out examples (k-fold cross-validated, with the spread across folds).
+   Pick a layer and save the direction to the bank. Directions are always measured on the
+   original weights. With ten or so examples per set the best layer is a rough guide; use
+   30 or more for a steady choice.
 2. **Edit weights.** Stack edits, then apply them:
    - *Remove a direction*: orthogonalize the weights that write to the residual stream (token
      embeddings, attention and MLP outputs) or read from it (attention and MLP inputs,
@@ -135,6 +137,14 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 - **Plain hooks, not nnsight.** The recorder uses raw PyTorch forward hooks (the same mechanism
   nnsight wraps) because the streaming server needs a hand-written decode loop with KV reuse.
   nnsight remains the tool for offline analysis.
+- **A full GPU slows down instead of failing on Windows/WSL.** The driver spills into system
+  RAM, so a recorder that runs out of VRAM crawls rather than raising an error. The recorder
+  checks free memory at load time, releases cached memory after workbench operations and
+  when free memory runs low, and uses expandable allocator segments. Other GPU apps
+  (image generators, local LLM servers) still need to be closed for 9B-class models.
+- **Qwen3.5 decodes at about 13 tokens/s** on a 4090. The `causal_conv1d` kernel isn't installed,
+  so its linear-attention layers use a slower PyTorch fallback; the recording itself adds about
+  5 ms per token.
 - **Weight edits on some architectures are approximate or unsupported.** Gemma 2/3 pass block
   outputs through an extra norm before the residual add, so removing a direction from their
   output weights doesn't fully remove it from the stream. Mixture-of-experts MLPs (GPT-OSS) are

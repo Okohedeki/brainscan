@@ -74,8 +74,8 @@ async function analyze(ev) {
     $("#wb-layer").value = W.layer;
     renderSweep();
     const best = W.sweep.layers[W.sweep.best];
-    message("#wb-find-msg", `Best separation at layer ${best.layer}: d = ${best.d}, ${W.sweep.held_out ? "held-out" : "in-sample"} accuracy ${pct(best.acc)}.` +
-      (W.sweep.held_out ? "" : " Add four or more examples per set to score on held-out examples."));
+    message("#wb-find-msg", `Best separation at layer ${best.layer}: d = ${best.d}${W.sweep.held_out ? ` ± ${best.d_sd} across ${W.sweep.folds} folds` : ""}, ${W.sweep.held_out ? "cross-validated" : "in-sample"} accuracy ${pct(best.acc)}.` +
+      (W.sweep.held_out ? " With few examples the best layer can shift; 30 or more per set gives a steadier choice." : " Add four or more examples per set to cross-validate."));
   } catch (err) { message("#wb-find-msg", err.message, "error"); }
 }
 
@@ -91,7 +91,7 @@ function renderSweep() {
     return `<g class="bar" data-layer="${i}"><rect x="${padL + i * bw}" y="${padT}" width="${bw}" height="${plotH}" fill="transparent"/>
       <rect x="${padL + i * bw + Math.min(1, bw * 0.15)}" y="${y}" width="${Math.max(1, bw - Math.min(2, bw * 0.3))}" height="${bh}" rx="${bw > 8 ? 2 : 0}"
         fill="${sel ? c.sel : c.bar}" opacity="${sel ? 1 : 0.8}"/>
-      <title>Layer ${i}: separation d = ${x.d}, ${s.held_out ? "held-out" : "in-sample"} accuracy ${pct(x.acc)}</title></g>`;
+      <title>Layer ${i}: separation d = ${x.d}${s.held_out ? ` ± ${x.d_sd}` : ""}, ${s.held_out ? "cross-validated" : "in-sample"} accuracy ${pct(x.acc)}</title></g>`;
   }).join("");
   const sel = s.layers[W.layer];
   const selX = padL + W.layer * bw + bw / 2, selY = sel.d >= 0 ? base - Math.abs(sel.d) * k - 4 : base + Math.abs(sel.d) * k + 12;
