@@ -11,7 +11,8 @@ change the parameters themselves, the way "abliterated" models are made:
                  the directional ablation of Arditi et al. (2024), "Refusal in language
                  models is mediated by a single direction".
   scale          multiply a component's contribution by a factor: a layer's whole attention
-                 or MLP block, one attention head, or one MLP neuron. Factor 0 is a lesion.
+                 or MLP block, one attention head (standard or linear attention), or one or
+                 more MLP neurons. Factor 0 is a lesion.
 
 Every parameter is copied to CPU before its first change. Applying the stack restores
 those copies and replays the enabled edits in order, so toggling, reordering and
@@ -91,6 +92,23 @@ def residual_linears(block: nn.Module | None, d_model: int, side: str) -> list[n
     return found
 
 
+def attention_heads(attn: nn.Module | None, d_model: int, config=None) -> tuple[nn.Linear, int, int] | None:
+    """(output projection, number of heads, head dim) for standard and linear attention blocks, or
+    None when the block has no single output projection to split by head."""
+    writers = residual_linears(attn, d_model, "out")
+    if len(writers) != 1:
+        return None
+    w = writers[0]
+    for attr in ("head_v_dim", "head_dim"):  # linear attention (gated delta net) first: its heads are value heads
+        hd = getattr(attn, attr, None)
+        if isinstance(hd, int) and hd > 0 and w.in_features % hd == 0:
+            return w, w.in_features // hd, hd
+    n = getattr(attn, "num_heads", None) or getattr(config, "num_attention_heads", None)
+    if isinstance(n, int) and n > 0 and w.in_features % n == 0:
+        return w, n, w.in_features // n
+    return None
+
+
 @torch.no_grad()
 def remove_from_rows(w: torch.Tensor, v: torch.Tensor, a: float) -> None:
     """Rows of w are residual vectors (embeddings) or readers (W[out, d]): w -= a (w v) v^T."""
@@ -118,7 +136,7 @@ class WeightEdit:
     vector: torch.Tensor | None = None  # unit direction, fp32 on CPU
     strength: float = 1.0               # orthogonalize: fraction of the component removed
     factor: float = 0.0                 # scale: multiplier on the component
-    index: int | None = None            # scale: head or neuron number
+    index: int | list[int] | None = None  # scale: head number, or one or more neuron numbers
     enabled: bool = True
     note: str = ""
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
@@ -127,7 +145,10 @@ class WeightEdit:
         where = f"L{layer_ranges(self.layers)}"
         if self.kind == "orthogonalize":
             return f"remove {self.direction} ×{self.strength:g} from {', '.join(self.targets)} @ {where}"
-        what = f"{self.targets[0]} {self.index}" if self.index is not None else self.targets[0]
+        if isinstance(self.index, list):
+            what = f"{len(self.index)} neurons" + (f" ({self.note})" if self.note else "")
+        else:
+            what = f"{self.targets[0]} {self.index}" if self.index is not None else self.targets[0]
         return f"scale {what} ×{self.factor:g} @ {where}"
 
     def describe(self) -> dict:
@@ -171,10 +192,16 @@ class EditStack:
                 raise ValueError(f"scale needs one target from {SCALE_TARGETS}")
             if targets[0] in ("head", "neuron") and index is None:
                 raise ValueError(f"scaling a {targets[0]} needs its index")
+            if isinstance(index, (list, tuple)):
+                if targets[0] != "neuron" or not index:
+                    raise ValueError("a list of indices is only for scaling a group of neurons")
+                index = sorted({int(i) for i in index})
+            elif index is not None:
+                index = int(index)
         else:
             raise ValueError(f"kind must be one of {KINDS}")
         edit = WeightEdit(kind, parse_layers(layers, n_layers), targets, direction, vector, float(strength),
-                          float(factor), None if index is None else int(index), note=note)
+                          float(factor), index, note=note)
         self._plan(edit)  # validate against the architecture now, not at apply time
         self.edits[edit.id] = edit
         return edit
@@ -229,20 +256,22 @@ class EditStack:
                     if lin.bias is not None:
                         ops.append((lin.bias, lambda p: p.mul_(f)))
             elif target == "head":
-                o_proj = getattr(attn, "o_proj", None) if attn is not None else None
-                if o_proj is None:
-                    raise ValueError(f"layer {layer} has no standard attention heads (head scaling needs o_proj)")
-                hd = o_proj.in_features // cfg.num_attention_heads
-                if not 0 <= e.index < cfg.num_attention_heads:
-                    raise ValueError(f"head must be in 0..{cfg.num_attention_heads - 1}")
-                ops.append((o_proj.weight, lambda p, s=e.index * hd, hd=hd: p[:, s:s + hd].mul_(f)))
+                heads = attention_heads(attn, d, cfg)
+                if heads is None:
+                    raise ValueError(f"layer {layer} has no attention output projection to split by head")
+                _, n_heads, hd = heads
+                if not 0 <= e.index < n_heads:
+                    raise ValueError(f"head must be in 0..{n_heads - 1} at layer {layer}")
+                ops.append((heads[0].weight, lambda p, s=e.index * hd, hd=hd: p[:, s:s + hd].mul_(f)))
             else:
                 down = residual_linears(mlp, d, "out")
                 if not down:
                     raise ValueError(f"layer {layer} has no dense MLP output projection")
-                if not 0 <= e.index < down[0].in_features:
+                idx = e.index if isinstance(e.index, list) else [e.index]
+                if not all(0 <= n < down[0].in_features for n in idx):
                     raise ValueError(f"neuron must be in 0..{down[0].in_features - 1}")
-                ops.append((down[0].weight, lambda p, n=e.index: p[:, n].mul_(f)))
+                cols = torch.tensor(idx, device=down[0].weight.device)
+                ops.append((down[0].weight, lambda p, cols=cols: p.index_copy_(1, cols, p.index_select(1, cols) * f)))
         return ops
 
     def _v(self, e: WeightEdit) -> torch.Tensor:
