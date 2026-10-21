@@ -143,9 +143,12 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
   checks free memory at load time, releases cached memory after workbench operations and
   when free memory runs low, and uses expandable allocator segments. Other GPU apps
   (image generators, local LLM servers) still need to be closed for 9B-class models.
-- **One token at a time.** Qwen3.5-9B records at about 34 tokens/s on a 4090: each decode step
-  replays the forward from CUDA graphs (`recorder/graphs.py`, about 22 ms per token, bit-identical
-  to eager decoding) and the readout (logit lens, norms, projections) adds about 6 ms. Eager decoding
+- **One token at a time.** Qwen3.5-9B records at about 40 tokens/s on a 4090: each decode step
+  replays the forward from CUDA graphs (`recorder/graphs.py`, about 21 ms per token, bit-identical
+  to eager decoding) and the readout (logit lens, norms, projections) adds about 3.5 ms, most of it
+  the logit lens reading the 248k-row unembedding. The readout is queued behind the forward and
+  copied back with one wait per token, so its CPU side (kernel launches, detokenizing, the token
+  record) runs while the GPU works. Eager decoding
   (`BRAINSCAN_GRAPH_DECODE=0`) manages about 12 tokens/s: its forward takes about 78 ms, most of it
   CPU time spent launching some 2,000 small kernels, while the GPU work itself takes about 22 ms.
 - **Weight edits on some architectures are approximate or unsupported.** Gemma 2/3 pass block

@@ -216,10 +216,11 @@ class DirectionBank:
             layer = round(r["layer_fraction"] * (self.s.n_layers - 1))
             self.build_random(r["name"], layer, reference, r["seed"], r["description"])
 
-    def project(self, resid: torch.Tensor) -> dict[str, np.ndarray]:
-        """z-scored projections for residuals of shape (layers, tokens, d)."""
-        return {name: ((resid[d.layer].float() @ d.unit - d.mean) / d.std).cpu().numpy()
-                for name, d in self.dirs.items()}
+    def project(self, resid: torch.Tensor, host: bool = True) -> dict:
+        """z-scored projections for residuals of shape (layers, tokens, d): numpy arrays, or
+        device tensors with host=False."""
+        out = {name: (resid[d.layer].float() @ d.unit - d.mean) / d.std for name, d in self.dirs.items()}
+        return {k: v.cpu().numpy() for k, v in out.items()} if host else out
 
     def describe(self) -> list[dict]:
         return [{k: v for k, v in d.meta.items() if k not in ("positive", "negative")}

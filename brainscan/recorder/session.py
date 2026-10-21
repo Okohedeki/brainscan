@@ -134,6 +134,14 @@ def sample(logits: torch.Tensor, temperature: float, top_p: float, generator: to
     return int(torch.multinomial(probs, 1, generator=generator))
 
 
+def to_host(x):
+    """Queue copies of a device tensor (or a nested dict of them) into pinned host memory without
+    waiting for the GPU. The copies hold the values only once the stream has been synchronized."""
+    if isinstance(x, dict):
+        return {k: to_host(v) for k, v in x.items()}
+    return x.to("cpu", non_blocking=True)
+
+
 class Recorder:
     def __init__(self, subject, store, settings, publish):
         self.s, self.store, self.settings, self.publish = subject, store, settings, publish
@@ -436,7 +444,10 @@ class Recorder:
                 self._event(run, t, etype, data)
 
         # Decode, one token at a time, recording each step. Tokens inside a <think> block are
-        # recorded with role "reasoning".
+        # recorded with role "reasoning". A step queues the forward, then its readout, starts the
+        # copies back to the host and waits for the GPU once. While the GPU works, the CPU settles the
+        # previous step (record, events, streamed text) and detokenizes. Whether to go on is decided
+        # from the text before the next forward, so the steps run exactly as they would one by one.
         self.tap.phase = "gen"
         think_open = rendered.text.rstrip().endswith(THINK_OPEN)
         stream = OutputStream(think_open, bool(p.tools), on_text, on_reasoning)
@@ -452,50 +463,90 @@ class Recorder:
         finish, msg_idx = "length", len(p.messages)
         # Interventions are baked into the decode graphs, so the set that applies keys them.
         graph_key = tuple(iv.id for iv in self.tap.interventions if iv.applies("gen", run.id))
+        cuda = s.device.type == "cuda"
+        marks = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) if cuda else None
+
+        def settle(st: dict) -> None:
+            """Record a decoded step and do its bookkeeping. Runs while the next step's forward is on
+            the GPU; what decides whether decoding goes on (stop token, stop strings) is settled earlier."""
+            nonlocal think_end
+            host = st["host"]
+            pred = {k: v.numpy() for k, v in host["pred"].items()}
+            norm = host["norm"].numpy() if "norm" in host else None
+            proj = {k: v.numpy()[0] for k, v in host["proj"].items()} if "proj" in host else {}
+            rec = self._record(run, req, st["pos"], st["tok"], st["role"], msg_idx, "gen", pred, 0, norm, proj)
+            new_records.append(rec)
+            self.publish({"k": "toks", "run": run.id, "items": [compact(rec)]})
+            if "state" not in host:  # a stop token: nothing was fed to the model
+                return
+            gen_states.append((rec["t"], host["state"].to(torch.float16)))
+            gen_tapes.append(rec["t"])
+            text_lens.append(st["text_len"])
+            if st["role"] == "reasoning" and think_end is None and st["closed"]:
+                think_end = len(gen_states) - 1
+                self._event(run, rec["t"], "think_end", {"reasoning_tokens": st["n_gen"]})
+            stream.update(st["text"])
+
+        unsettled, picked = None, None
         t1 = time.perf_counter()
         for _ in range(max_tokens):
-            next_id = sample(pending[1], p.temperature, p.top_p, generator)
+            next_id = sample(pending[1], p.temperature, p.top_p, generator) if picked is None else picked
             pos = len(self._kv_ids)
             is_stop = next_id in s.stop_ids
             reasoning, _, closed = split_reasoning(text, think_open)
             role = "reasoning" if reasoning is not None and not closed else "assistant"
-            own = logits = None
             tick = time.perf_counter()
-            if not is_stop:
-                if self.graphs is not None:
-                    logits = self.graphs.step(next_id, self._kv, graph_key)
+            read, dev, forward_s = pending, {}, 0.0
+            if not is_stop:  # the forward goes first so the readout's small kernels launch while it runs
+                tf = time.perf_counter()
+                if cuda:
+                    marks[0].record()
+                logits = self.graphs.step(next_id, self._kv, graph_key) if self.graphs is not None else None
                 if logits is None:
                     out = s.model(input_ids=torch.tensor([[next_id]], device=s.device),
                                   past_key_values=self._kv, use_cache=True)
                     self._kv, logits = out.past_key_values, out.logits
+                if cuda:
+                    marks[1].record()
+                forward_s = time.perf_counter() - tf
                 self._kv_ids.append(next_id)
                 own = self.tap.stack()[:, 0, :]
-            tick = lap("decode_forward", tick)
-            pred = predict(s, pending[0][:, None, :], pending[1][None], torch.tensor([next_id], device=s.device))
-            norm = None if own is None else own.float().norm(dim=-1).cpu().numpy()
-            proj = {} if own is None else {k: v[0] for k, v in self.directions.project(own[:, None, :]).items()}
-            rec = self._record(run, req, pos, next_id, role, msg_idx, "gen", pred, 0, norm, proj)
-            new_records.append(rec)
-            self.publish({"k": "toks", "run": run.id, "items": [compact(rec)]})
-            lap("decode_readout", tick)
+                pending = (own.clone(), logits[0, -1].float())  # copies: graph outputs are reused next step
+                gen_ids.append(next_id)
+            # torch.full, not torch.tensor: a host-to-device copy would wait for the forward.
+            target = torch.full((1,), next_id, dtype=torch.long, device=s.device)
+            dev["pred"] = predict(s, read[0][:, None, :], read[1][None], target, host=False)
+            if not is_stop:
+                dev |= {"norm": own.float().norm(dim=-1), "state": own,
+                        "proj": self.directions.project(own[:, None, :], host=False)}
+                if p.temperature <= 0:  # the next greedy pick comes back with this step's copies
+                    dev["next"] = pending[1].argmax()
+            host = to_host(dev)
+            if unsettled is not None:
+                settle(unsettled)
+            st = {"host": host, "pos": pos, "tok": next_id, "role": role}
+            if not is_stop:
+                text = s.tokenizer.decode(gen_ids, skip_special_tokens=False)
+                st |= {"text_len": len(text), "closed": split_reasoning(text, think_open)[2], "n_gen": len(gen_ids)}
+            if cuda:
+                torch.cuda.current_stream().synchronize()
+                if not is_stop:
+                    forward_s = marks[0].elapsed_time(marks[1]) / 1e3
+            picked = int(host["next"]) if "next" in host else None
+            timing["decode_forward"] += forward_s
+            timing["decode_readout"] += time.perf_counter() - tick - forward_s
+            unsettled = st
             if is_stop:
                 finish = "stop"
                 break
-            gen_states.append((rec["t"], own.to("cpu", torch.float16)))
-            pending = (own.clone(), logits[0, -1].float())  # copies: graph outputs are reused next step
-            gen_ids.append(next_id)
-            gen_tapes.append(rec["t"])
-            text = s.tokenizer.decode(gen_ids, skip_special_tokens=False)
-            text_lens.append(len(text))
-            if role == "reasoning" and think_end is None and split_reasoning(text, think_open)[2]:
-                think_end = len(gen_states) - 1
-                self._event(run, rec["t"], "think_end", {"reasoning_tokens": len(gen_ids)})
             hit = next((x for x in p.stop if x and x in text), None)
             if hit:
                 text, finish = text[:text.index(hit)], "stop"
-            stream.update(text)
+            st["text"] = text
             if hit:
                 break
+        if unsettled is not None:
+            settle(unsettled)
         decode_s = time.perf_counter() - t1
         stream.update(text, final=True)
 

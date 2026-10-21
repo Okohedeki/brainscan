@@ -111,12 +111,14 @@ def lens_rows(subject, x: torch.Tensor, targets: torch.Tensor, chunk: int | None
 
 @torch.no_grad()
 def predict(subject, resid: torch.Tensor, logits: torch.Tensor, targets: torch.Tensor,
-            with_lens: bool = True, chunk: int | None = None) -> dict:
+            with_lens: bool = True, chunk: int | None = None, host: bool = True) -> dict:
     """Prediction stats for N slots whose next token is known.
 
     resid: (layers, N, d) residuals at the predicting positions
     logits: (N, vocab) the model's actual output logits at those positions
     targets: (N,) the token that actually came next
+    Returns numpy arrays, or with host=False the same values as device tensors, so the caller
+    can queue the whole readout without waiting on the GPU.
     """
     chunk = chunk or max(32, subject.lens_chunk // 2)
     out = {"p": [], "ent": [], "top_p": [], "top_ids": []}
@@ -128,10 +130,10 @@ def predict(subject, resid: torch.Tensor, logits: torch.Tensor, targets: torch.T
         out["top_p"].append(top_p)
         out["top_ids"].append(top_ids)
         out["p"].append(p.gather(-1, targets[s:s + chunk, None]).squeeze(-1))
-    result = {k: torch.cat(v).cpu().numpy() for k, v in out.items()}
+    result = {k: torch.cat(v) for k, v in out.items()}
     if with_lens:
         n_layers, n, d = resid.shape
         lp, lt = lens_rows(subject, resid.reshape(n_layers * n, d), targets.repeat(n_layers))
-        result["lens_p"] = lp.view(n_layers, n).T.cpu().numpy()
-        result["lens_top"] = lt.view(n_layers, n).T.cpu().numpy()
-    return result
+        result["lens_p"] = lp.view(n_layers, n).T
+        result["lens_top"] = lt.view(n_layers, n).T
+    return {k: v.cpu().numpy() for k, v in result.items()} if host else result
