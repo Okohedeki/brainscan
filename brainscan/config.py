@@ -33,6 +33,10 @@ class Settings:
     thinking: str = field(default_factory=lambda: _env("THINKING", "default"))
     # Replay each decode step from CUDA graphs (recorder/graphs.py); outputs are bit-identical to eager.
     graph_decode: bool = field(default_factory=lambda: _env("GRAPH_DECODE", "1") == "1")
+    # Weight anatomy (recorder/anatomy.py): per-token activity of attention heads and MLP neuron
+    # clusters, and the Weights tab. ANATOMY_CLUSTERS sets the clusters per MLP layer.
+    anatomy: bool = field(default_factory=lambda: _env("ANATOMY", "1") == "1")
+    anatomy_clusters: int = field(default_factory=lambda: int(_env("ANATOMY_CLUSTERS", "64")))
 
     def template_kwargs(self) -> dict:
         return {"on": {"enable_thinking": True}, "off": {"enable_thinking": False}}.get(self.thinking, {})

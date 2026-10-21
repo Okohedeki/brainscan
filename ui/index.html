@@ -14,6 +14,7 @@
     </div>
     <nav class="tabs" role="tablist" aria-label="View">
       <button role="tab" data-view="scanner" aria-selected="true" class="active">Scanner</button>
+      <button role="tab" data-view="weights" aria-selected="false">Weights</button>
       <button role="tab" data-view="workbench" aria-selected="false">Workbench</button>
     </nav>
     <div class="model-badge" id="model-badge">Starting…</div>
@@ -99,6 +100,60 @@
         </section>
       </div>
     </div>
+  </main>
+
+  <main class="anatomy" id="view-weights" hidden>
+    <section class="panel an-map" aria-labelledby="h-map">
+      <div class="panel-head">
+        <h2 id="h-map">Weight map</h2>
+        <div class="toolbar">
+          <label>Color
+            <select id="an-mode" aria-label="What the map colors show">
+              <option value="rel">activity vs. its run average</option>
+              <option value="abs">activity, absolute</option>
+              <option value="norm">weight size (no run needed)</option>
+            </select>
+          </label>
+          <label class="check" title="Units that were well above their average in the last few tokens keep a fading outline">
+            <input type="checkbox" id="an-trail" checked> Trail</label>
+          <label class="check"><input type="checkbox" id="an-follow" checked> Follow live</label>
+          <button type="button" id="an-play" title="Step through the run token by token">▶ Replay</button>
+        </div>
+      </div>
+      <div class="an-readout" id="an-readout" role="status"></div>
+      <div class="canvas-wrap" id="an-map-wrap">
+        <canvas id="an-map" aria-label="Weight map: one row per layer, attention heads then MLP neuron clusters, colored by activity at the current token"></canvas>
+        <div class="tooltip" id="an-tip" hidden></div>
+        <div class="overlay" id="an-overlay" hidden></div>
+      </div>
+      <div class="legend" id="an-legend"></div>
+      <div class="trace-head">
+        <h3>Trace</h3>
+        <span class="muted small" id="an-trace-note"></span>
+        <button type="button" class="link" id="an-fit">Fit whole run</button>
+      </div>
+      <div class="canvas-wrap" id="an-trace-wrap">
+        <canvas id="an-trace" aria-label="Token trace: how many units were hit at each token, or the selected unit's activity"></canvas>
+        <div class="tooltip" id="an-trace-tip" hidden></div>
+      </div>
+      <details class="how">
+        <summary>How activity is measured</summary>
+        <p id="an-how" class="hint"></p>
+      </details>
+      <details class="params" id="an-params">
+        <summary>Browse every parameter</summary>
+        <input type="text" id="an-param-filter" placeholder="Filter, e.g. layers.12.mlp or embed" spellcheck="false" aria-label="Filter parameters">
+        <ul id="an-param-list"></ul>
+      </details>
+    </section>
+
+    <section class="panel an-detail" aria-labelledby="h-unit">
+      <div class="panel-head"><h2 id="h-unit">Unit</h2><span class="muted small" id="an-unit-where"></span></div>
+      <div id="an-detail">
+        <p class="empty">Click a cell in the weight map to open that attention head or neuron cluster: its weights,
+          what it writes, and the tokens where it was most active.</p>
+      </div>
+    </section>
   </main>
 
   <main class="workbench" id="view-workbench" hidden>
@@ -217,5 +272,6 @@
   </footer>
   <script type="module" src="/ui/app.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
+  <script type="module" src="/ui/weights.js"></script>
 </body>
 </html>

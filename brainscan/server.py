@@ -16,6 +16,7 @@ os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import asyncio  # noqa: E402
 import json
+import struct
 import threading
 import time
 import traceback
@@ -25,7 +26,7 @@ from contextlib import asynccontextmanager
 import torch
 import uvicorn
 from fastapi import FastAPI, HTTPException, Request, WebSocket, WebSocketDisconnect
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
@@ -426,6 +427,80 @@ async def export_edited_model(request: Request):
         return await asyncio.to_thread(workbench.export, recorder(), body["path"])
     except (KeyError, ValueError, OSError) as exc:
         raise HTTPException(400, str(exc)) from exc
+
+
+def _anatomy(rec: Recorder):
+    if getattr(rec, "anatomy", None) is None:
+        raise HTTPException(404, "weight anatomy is off (BRAINSCAN_ANATOMY=0)")
+    return rec.anatomy
+
+
+@app.get("/brainscan/anatomy")
+async def get_anatomy():
+    rec = recorder()
+    an = _anatomy(rec)
+    return an.describe() | {"edited": an.edited_units(rec.edits), "edits_version": rec.edits.version}
+
+
+@app.get("/brainscan/anatomy/edited")
+async def get_edited_units():
+    rec = recorder()
+    return {"edited": _anatomy(rec).edited_units(rec.edits), "edits_version": rec.edits.version}
+
+
+@app.get("/brainscan/anatomy/params")
+async def get_params():
+    return _anatomy(recorder()).param_list()
+
+
+@app.get("/brainscan/anatomy/units/{g}")
+async def get_unit(g: int):
+    rec = recorder()
+    an = _anatomy(rec)
+    try:
+        return await asyncio.to_thread(an.unit_detail, g, set(an.edited_units(rec.edits)))
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/brainscan/anatomy/units/{g}/lesion")
+async def lesion_unit(g: int, request: Request):
+    """Add a workbench edit that scales this unit's output weights (factor 0 by default). It changes
+    the weights only when the stack is applied."""
+    body = await request.json()
+    rec = recorder()
+    try:
+        spec = _anatomy(rec).lesion(g, float(body.get("factor", 0.0)))
+        edit = await asyncio.to_thread(rec.add_weight_edit, **spec)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return edit.describe()
+
+
+@app.post("/brainscan/anatomy/tile")
+async def post_tile(request: Request):
+    body = await request.json()
+    rec = recorder()
+    try:
+        return await asyncio.to_thread(_anatomy(rec).tile, body, rec.edits.version)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/brainscan/runs/{run_id}/anatomy")
+async def get_run_anatomy(run_id: str):
+    """Per-token unit activity for a run: a 4-byte little-endian header length, a JSON header
+    (tape indices, unit count, unit-map key), then one byte per unit per token, row-major."""
+    rec = recorder()
+    an = _anatomy(rec)
+    t, codes, skipped = await asyncio.to_thread(an.read_run, rec.store, run_id)
+    header = json.dumps({"n": int(len(t)), "units": an.n_units, "key": an.key, "skipped": skipped,
+                         "t": t.tolist()}).encode()
+    return Response(struct.pack("<I", len(header)) + header + codes.tobytes(), media_type="application/octet-stream")
 
 
 @app.websocket("/brainscan/live")

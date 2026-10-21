@@ -637,6 +637,7 @@ async function openRun(id) {
   $("#inspector").innerHTML = `<p class="empty">Click any token in the scope or transcript to see what the model predicted there, layer by layer.</p>`;
   $("#insp-where").textContent = "";
   renderRunSelect();
+  document.dispatchEvent(new CustomEvent("brainscan:run", { detail: id }));  // the Weights tab follows the same run
   if (!id) { renderTranscript(); schedule(); return; }
   // Live messages for this run that arrive while the snapshot loads are buffered, then replayed.
   S.loadingRun = id; S.buffer = [];

@@ -444,23 +444,30 @@ class Anatomy:
                 "b64": base64.b64encode(codes.tobytes()).decode()}
 
     def flush(self, store, run_id: str, req: int) -> bool:
-        parts = self.pending.pop(run_id, [])
+        """Write the request's slices to the run. Readers may briefly see a slice twice (on disk and
+        pending), never zero times; the UI keys slices by tape index."""
+        parts = list(self.pending.get(run_id, []))
         if not parts:
             return False
-        ts = np.concatenate([p[0] for p in parts])
-        codes = np.concatenate([p[1] for p in parts])
-        if not store.can_write(codes.nbytes):
-            return False
-        path = store.run_dir(run_id) / "anatomy" / f"req{req:04d}.npz"
-        path.parent.mkdir(exist_ok=True)
-        np.savez_compressed(path, t=ts, codes=codes, atlas=np.array(self.key))
-        store._grew(path.stat().st_size)
-        return True
+        try:
+            ts = np.concatenate([p[0] for p in parts])
+            codes = np.concatenate([p[1] for p in parts])
+            if not store.can_write(codes.nbytes):
+                return False
+            path = store.run_dir(run_id) / "anatomy" / f"req{req:04d}.npz"
+            path.parent.mkdir(exist_ok=True)
+            tmp = path.with_name(path.stem + ".tmp.npz")
+            np.savez_compressed(tmp, t=ts, codes=codes, atlas=np.array(self.key))
+            tmp.replace(path)
+            store._grew(path.stat().st_size)
+            return True
+        finally:
+            self.pending.pop(run_id, None)
 
     def read_run(self, store, run_id: str) -> tuple[np.ndarray, np.ndarray, int]:
         """(tape indices, bytes (n, units), slices skipped because they were recorded with another unit map)."""
         ts, codes, skipped = [], [], 0
-        for path in sorted((store.runs_dir / run_id / "anatomy").glob("req*.npz")):
+        for path in sorted((store.runs_dir / run_id / "anatomy").glob("req????.npz")):
             with np.load(path) as z:
                 if str(z["atlas"]) != self.key or z["codes"].shape[1] != self.n_units:
                     skipped += 1
@@ -632,8 +639,10 @@ class Anatomy:
                 aligned = W[order] * cos[order].sign()[:, None]
                 labels = self.top_tokens(aligned, 3)
                 out["n_neurons"] = int(idx.numel())
-                out["neurons"] = [{"n": int(idx[j]), "norm": round(float(norms[j]), 4), "cos": round(abs(float(cos[j])), 3),
-                                   "top": labels[r][0]} for r, j in enumerate(order.tolist())]
+                out["neuron_ids"] = idx.tolist()  # neuron number of each row of the cluster's matrices
+                out["neurons"] = [{"n": int(idx[j]), "row": j, "norm": round(float(norms[j]), 4),
+                                   "cos": round(abs(float(cos[j])), 3), "top": labels[r][0]}
+                                  for r, j in enumerate(order.tolist())]
         return out
 
     def lesion(self, g: int, factor: float = 0.0) -> dict:

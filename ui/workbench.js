@@ -39,8 +39,10 @@ async function busy(btn, label, fn) {
 }
 
 // ---------------------------------------------------------------- tabs
+const VIEWS = ["scanner", "weights", "workbench"];
+
 function show(view) {
-  for (const v of ["scanner", "workbench"]) {
+  for (const v of VIEWS) {
     $(`#view-${v}`).hidden = v !== view;
     const tab = document.querySelector(`.tabs [data-view="${v}"]`);
     tab.setAttribute("aria-selected", String(v === view));
@@ -48,6 +50,7 @@ function show(view) {
   }
   try { localStorage.setItem("brainscan-view", view); } catch { /* storage unavailable */ }
   if (view === "workbench") refresh();
+  document.dispatchEvent(new CustomEvent("brainscan:view", { detail: view }));
 }
 
 // ---------------------------------------------------------------- state
@@ -259,6 +262,6 @@ function boot() {
   $("#wb-export").onclick = exportModel;
   syncForm();
   const saved = (() => { try { return localStorage.getItem("brainscan-view"); } catch { return null; } })();
-  show(saved === "workbench" ? "workbench" : "scanner");
+  show(VIEWS.includes(saved) ? saved : "scanner");
 }
 boot();
