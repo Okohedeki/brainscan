@@ -69,6 +69,39 @@ workbench edits the weights themselves.
 4. **Export.** Saves the edited weights as a Hugging Face checkpoint with `brainscan_edits.json`
    recording the base model and every edit.
 
+## Weights: the model as a live graph
+
+The Weights tab draws the model as a node graph on a zoomable canvas. Layers run left to right
+along the residual stream; each layer's attention heads sit above it and its MLP neurons, grouped
+into clusters by the direction of their output weights (64 per layer by default), sit below.
+
+- **Activity.** Every weight takes part in every token, so a node shows how much its unit *wrote*
+  into the residual stream at the current token: the exact norm of each head's write, and each
+  cluster's write mass (the summed size of its neurons' writes). Nodes are colored against their
+  own average over the run on a log scale; a unit counts as hit at 3σ above it. Units hit in the
+  last few tokens keep a fading ring.
+- **Edges.** Curved edges join units whose weights compose: a later unit's input weights (after
+  the norm in front of its block) read an earlier unit's top output directions, scored against a
+  random direction (1× = chance; Elhage et al., 2021). They are computed once per model from the
+  weights and cached. "Circuit" shows the strongest edges between units active at this token;
+  selecting a node shows its strongest inputs and outputs. They describe the weights, not a
+  measured causal effect.
+- **Zoom.** Scroll to zoom and drag to pan: dots become labelled nodes, then cards with a
+  thumbnail of each unit's output weights. A minimap, a jump-to palette (Ctrl/Cmd+K: "L12 c7",
+  "L3 h5", a token, or a parameter name) and keyboard shortcuts (F fit, Space replay, arrows step
+  tokens) help move around.
+- **A unit.** Clicking a node opens a drawer: its output and input weights as a heatmap you can
+  zoom down to single weights, the value histogram and singular values, the tokens its main write
+  direction promotes and suppresses through the unembedding, its strongest connections, its most
+  active tokens in the run, its neurons, and a button that adds a lesion of it to the Workbench
+  stack. The token embedding and unembedding nodes open their matrices the same way.
+- **Timeline.** The dock follows a live run (units hit per token, or the selected unit's activity)
+  and can replay a recorded one token by token.
+
+Activity costs one byte per unit per token (2,944 units, about 3 KB per token, for Qwen3.5-9B) and
+is stored under `runs/<run>/anatomy/`. The first start on a model clusters the neurons and scores
+the edges once, then caches both.
+
 To try the whole stack without a GPU, build a tiny random model and serve it on CPU:
 
 ```bash
@@ -127,6 +160,8 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 | `BRAINSCAN_MAX_CONTEXT` | `16384` | Prompt plus completion limit |
 | `BRAINSCAN_PREFILL_LENS` | `1` | Logit lens on prompt and tool-result tokens too |
 | `BRAINSCAN_DECISION_RESIDUALS` | `1` | Save full residual stacks at decision points |
+| `BRAINSCAN_ANATOMY` | `1` | Record per-token unit activity for the Weights tab; `0` turns it off |
+| `BRAINSCAN_ANATOMY_CLUSTERS` | `64` | MLP neuron clusters per layer in the Weights tab |
 | `BRAINSCAN_GRAPH_DECODE` | `1` | Replay decode steps from CUDA graphs (same outputs, about 3x faster); `0` decodes eagerly |
 
 ## Known limits
@@ -156,6 +191,10 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
   output weights doesn't fully remove it from the stream. Mixture-of-experts MLPs (GPT-OSS) are
   not edited yet. Head scaling needs standard attention (`o_proj`); Qwen3.5's linear-attention
   layers have none.
+- **Weights tab measures are coarse.** Per-neuron activations are not recorded, only each
+  cluster's write mass, which is an upper bound on what the cluster writes together. Unit labels
+  read write directions straight through the unembedding, which is noisy in early layers. Edges use
+  each unit's top four output directions and the original weights. MoE layers have no clusters yet.
 - **Not built yet:** SAE features, attention summaries, MoE routing capture, and nnsight-based
   analysis modules. One request runs at a time.
 
@@ -163,11 +202,13 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 
 ```
 brainscan/recorder/   model loading, hooks, chat rendering, events, storage, session, directions,
-                      weight edits (edits.py) and workbench checks (workbench.py)
+                      weight edits (edits.py), workbench checks (workbench.py), and the weight
+                      graph's units, activity probe and edges (anatomy.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
-ui/                   scanner (plain HTML, CSS and canvas JavaScript; no build step)
+ui/                   scanner, weight graph (graph.js, weights.js) and workbench (plain HTML,
+                      CSS and canvas JavaScript; no build step)
 reports/              research reports
 tests/                unit tests (pytest)
 ```

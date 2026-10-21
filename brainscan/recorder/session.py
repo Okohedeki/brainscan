@@ -18,6 +18,7 @@ model's prediction *of* that token, made at position pos-1:
 from __future__ import annotations
 
 import bisect
+import contextlib
 import math
 import re
 import threading
@@ -27,6 +28,7 @@ from dataclasses import dataclass, field
 
 import torch
 
+from .anatomy import Anatomy
 from .capture import MODES, PHASES, Intervention, LayerTap, predict
 from .chat import (THINK_CLOSE, THINK_OPEN, common_prefix, parse_tool_calls, render, split_reasoning,
                    to_template_messages)
@@ -150,6 +152,8 @@ class Recorder:
         self.edits = EditStack(subject)
         use_graphs = settings.graph_decode and DecodeGraphs.available(subject)
         self.graphs = DecodeGraphs(subject, self.tap) if use_graphs else None
+        self.anatomy = (Anatomy(subject, store.root / "anatomy", settings.anatomy_clusters)
+                        if settings.anatomy else None)
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}
@@ -306,10 +310,13 @@ class Recorder:
             self.perf["busy"] = True
             try:
                 self.release_memory(below_gb=2.0)
-                with torch.no_grad():
+                with torch.no_grad(), self._anatomy_recording():
                     return self._generate(p, on_text, on_reasoning)
             finally:
                 self.perf["busy"] = False
+
+    def _anatomy_recording(self):
+        return self.anatomy.recording() if self.anatomy is not None else contextlib.nullcontext()
 
     def _record(self, run, req, pos, tok, role, msg, phase, pred, k, norm, proj) -> dict:
         r = {"t": len(run.tape), "req": req, "pos": int(pos), "tok": int(tok), "text": self.s.token_str(int(tok)),
@@ -403,6 +410,7 @@ class Recorder:
                       "already_recorded": record_from, "interventions": active})
 
         new_records: list[dict] = []
+        anat_msgs: list[dict] = []  # sent after the prompt's token records, which the UI needs first
         pending = None
         t0 = time.perf_counter()
         timing = {"prefill_forward": 0.0, "prefill_readout": 0.0, "decode_forward": 0.0, "decode_readout": 0.0}
@@ -422,8 +430,14 @@ class Recorder:
             self._kv = out.past_key_values
             resid = self.tap.stack()
             logits = out.logits[0]
-            new_records += self._prefill_records(run, req, rendered, cs, chunk, resid, logits, pending,
-                                                 record_from, new_from)
+            recs = self._prefill_records(run, req, rendered, cs, chunk, resid, logits, pending,
+                                         record_from, new_from)
+            new_records += recs
+            if self.anatomy is not None:
+                codes = self.anatomy.read_chunk(len(chunk))
+                if recs:
+                    anat_msgs.append(self.anatomy.add(run.id, [r["t"] for r in recs],
+                                                      codes[-len(recs):].cpu().numpy()))
             pending = (resid[:, -1, :].clone(), logits[-1].float().clone())
             del out, resid, logits
             lap("prefill_readout", tick)
@@ -431,6 +445,8 @@ class Recorder:
         prefill_s = time.perf_counter() - t0
         for i in range(0, len(new_records), 256):
             self.publish({"k": "toks", "run": run.id, "items": [compact(r) for r in new_records[i:i + 256]]})
+        for msg in anat_msgs:
+            self.publish(msg)
 
         for i in range(seen, len(p.messages)):
             first = rendered.first_token_of(i)
@@ -477,6 +493,8 @@ class Recorder:
             rec = self._record(run, req, st["pos"], st["tok"], st["role"], msg_idx, "gen", pred, 0, norm, proj)
             new_records.append(rec)
             self.publish({"k": "toks", "run": run.id, "items": [compact(rec)]})
+            if "anat" in host:
+                self.publish(self.anatomy.add(run.id, [rec["t"]], host["anat"].numpy()[None]))
             if "state" not in host:  # a stop token: nothing was fed to the model
                 return
             gen_states.append((rec["t"], host["state"].to(torch.float16)))
@@ -519,6 +537,8 @@ class Recorder:
             if not is_stop:
                 dev |= {"norm": own.float().norm(dim=-1), "state": own,
                         "proj": self.directions.project(own[:, None, :], host=False)}
+                if self.anatomy is not None:
+                    dev["anat"] = self.anatomy.read_step()
                 if p.temperature <= 0:  # the next greedy pick comes back with this step's copies
                     dev["next"] = pending[1].argmax()
             host = to_host(dev)
@@ -597,6 +617,8 @@ class Recorder:
         if weight_edits:
             run.meta.setdefault("weight_edits", []).append({"req": req, "edits": weight_edits})
         self.store.write_tokens(run.id, req, new_records)
+        if self.anatomy is not None:
+            self.anatomy.flush(self.store, run.id, req)
         self.store.write_meta(run.id, run.meta)
         n_new = len(ids) - start
         self.perf.update(prefill_tok_s=round(n_new / prefill_s, 1) if prefill_s > 0 else None,
@@ -648,6 +670,8 @@ class Recorder:
             t0 = time.perf_counter()
             try:
                 self.edits.apply()
+                if self.anatomy is not None:
+                    self.anatomy.refresh()
             finally:
                 self.release_memory()
             summary = self.edits.summary() | {"seconds": round(time.perf_counter() - t0, 2)}
@@ -657,6 +681,8 @@ class Recorder:
     def revert_weight_edits(self) -> dict:
         with self.lock:
             self.edits.revert()
+            if self.anatomy is not None:
+                self.anatomy.refresh()
             self.release_memory()
             summary = self.edits.summary()
         self.publish({"k": "workbench", "summary": summary})
