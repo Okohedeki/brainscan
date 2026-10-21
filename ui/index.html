@@ -4,13 +4,22 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>Brainscan</title>
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400;500;600&display=swap">
   <link rel="stylesheet" href="/ui/style.css">
 </head>
 <body>
   <header class="topbar">
     <div class="brand">
-      <span class="live-dot" id="live-dot" title="Live feed"></span>
+      <svg class="logo" viewBox="0 0 32 32" width="26" height="26" aria-hidden="true">
+        <defs><linearGradient id="lg" x1="0" y1="0" x2="1" y2="1"><stop offset="0" stop-color="var(--accent)"/><stop offset="1" stop-color="var(--accent-2)"/></linearGradient></defs>
+        <rect x="1" y="1" width="30" height="30" rx="9" fill="url(#lg)"/>
+        <path d="M8 21 L14 11 L19 18 L24 9" fill="none" stroke="#fff" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+        <circle cx="8" cy="21" r="2.3" fill="#fff"/><circle cx="14" cy="11" r="2.3" fill="#fff"/><circle cx="19" cy="18" r="2.3" fill="#fff"/><circle cx="24" cy="9" r="2.3" fill="#fff"/>
+      </svg>
       <span class="wordmark">Brainscan</span>
+      <span class="live-dot" id="live-dot" title="Live feed"></span>
     </div>
     <nav class="tabs" role="tablist" aria-label="View">
       <button role="tab" data-view="scanner" aria-selected="true" class="active">Scanner</button>
@@ -27,7 +36,9 @@
       <span class="stat" id="stat-vram" title="GPU memory in use">VRAM –</span>
       <span class="stat" id="stat-disk" title="Recording storage used / budget">Disk –</span>
     </div>
-    <button class="icon-btn" id="theme-toggle" aria-label="Switch light or dark theme" title="Theme">◐</button>
+    <button class="icon-btn" id="theme-toggle" aria-label="Switch light or dark theme" title="Theme">
+      <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zm0 1.5v10a5 5 0 0 1 0-10z" fill="currentColor"/></svg>
+    </button>
   </header>
 
   <main class="layout" id="view-scanner">
@@ -102,58 +113,80 @@
     </div>
   </main>
 
-  <main class="anatomy" id="view-weights" hidden>
-    <section class="panel an-map" aria-labelledby="h-map">
-      <div class="panel-head">
-        <h2 id="h-map">Weight map</h2>
-        <div class="toolbar">
-          <label>Color
-            <select id="an-mode" aria-label="What the map colors show">
-              <option value="rel">activity vs. its run average</option>
-              <option value="abs">activity, absolute</option>
-              <option value="norm">weight size (no run needed)</option>
-            </select>
-          </label>
-          <label class="check" title="Units that were well above their average in the last few tokens keep a fading outline">
-            <input type="checkbox" id="an-trail" checked> Trail</label>
-          <label class="check"><input type="checkbox" id="an-follow" checked> Follow live</label>
-          <button type="button" id="an-play" title="Step through the run token by token">▶ Replay</button>
+  <main class="gv" id="view-weights" hidden>
+    <div class="gv-stage" id="gv-stage">
+      <canvas id="gv-canvas" aria-label="Weight graph: layers left to right along the residual stream, attention heads above it and MLP neuron clusters below, glowing by activity at the current token. Scroll to zoom, drag to pan, click a node to open it."></canvas>
+      <div class="gv-tip tooltip" id="gv-tip" hidden></div>
+
+      <div class="gv-bar glass" role="toolbar" aria-label="Graph controls">
+        <div class="seg" id="gv-mode" role="group" aria-label="Node color">
+          <button type="button" data-mode="rel" aria-pressed="true" title="Each unit against its own average over the run">Activity</button>
+          <button type="button" data-mode="abs" aria-pressed="false" title="Activity on one log scale for all units">Absolute</button>
+          <button type="button" data-mode="norm" aria-pressed="false" title="Size of each unit's output weights; no run needed">Weights</button>
         </div>
+        <span class="sep" aria-hidden="true"></span>
+        <div class="seg" id="gv-edges" role="group" aria-label="Edges">
+          <button type="button" data-edges="circuit" aria-pressed="true" title="Composition edges between units that are active at this token">Circuit</button>
+          <button type="button" data-edges="selected" aria-pressed="false" title="Edges of the unit under the cursor">Hover</button>
+          <button type="button" data-edges="off" aria-pressed="false">Off</button>
+        </div>
+        <span class="sep" aria-hidden="true"></span>
+        <button type="button" class="tbtn" id="gv-trail" aria-pressed="true" title="Outline units that were hit in the last few tokens">Trail</button>
       </div>
-      <div class="an-readout" id="an-readout" role="status"></div>
-      <div class="canvas-wrap" id="an-map-wrap">
-        <canvas id="an-map" aria-label="Weight map: one row per layer, attention heads then MLP neuron clusters, colored by activity at the current token"></canvas>
-        <div class="tooltip" id="an-tip" hidden></div>
-        <div class="overlay" id="an-overlay" hidden></div>
+
+      <div class="gv-zoom glass" role="group" aria-label="Zoom">
+        <button type="button" class="tbtn icon" id="gv-zoom-out" aria-label="Zoom out">−</button>
+        <span class="zoom-label" id="gv-zoom">100%</span>
+        <button type="button" class="tbtn icon" id="gv-zoom-in" aria-label="Zoom in">+</button>
+        <span class="sep" aria-hidden="true"></span>
+        <button type="button" class="tbtn" id="gv-fit" title="Fit the whole model (F)">Fit</button>
+        <button type="button" class="tbtn search" id="gv-search" title="Jump to a unit or parameter">
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M7 2a5 5 0 1 0 3.1 8.9l3 3 1-1-3-3A5 5 0 0 0 7 2zm0 1.5a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7z" fill="currentColor"/></svg>
+          Jump to <kbd>⌘K</kbd></button>
       </div>
-      <div class="legend" id="an-legend"></div>
-      <div class="trace-head">
-        <h3>Trace</h3>
-        <span class="muted small" id="an-trace-note"></span>
-        <button type="button" class="link" id="an-fit">Fit whole run</button>
+
+      <div class="gv-legend glass" id="gv-legend"></div>
+      <canvas class="gv-minimap glass" id="gv-minimap" aria-label="Minimap; click or drag to move the view"></canvas>
+
+      <aside class="gv-drawer glass" id="gv-drawer" hidden aria-labelledby="an-unit-where">
+        <header class="drawer-head">
+          <span class="eyebrow" id="an-unit-where"></span>
+          <button type="button" class="tbtn icon" id="gv-close" aria-label="Close">✕</button>
+        </header>
+        <div id="an-detail" class="drawer-body"></div>
+      </aside>
+
+      <div class="gv-overlay" id="an-overlay" hidden></div>
+    </div>
+
+    <section class="gv-dock glass" aria-label="Run timeline">
+      <div class="dock-row">
+        <div class="transport">
+          <button type="button" class="tbtn icon" id="an-prev" aria-label="Previous token">‹</button>
+          <button type="button" class="play" id="an-play" aria-label="Replay the run"></button>
+          <button type="button" class="tbtn icon" id="an-next" aria-label="Next token">›</button>
+        </div>
+        <button type="button" class="live-pill" id="an-follow" aria-pressed="true" title="Follow the newest token"><span class="dot"></span>Live</button>
+        <div class="an-readout" id="an-readout" role="status"></div>
+        <span class="dock-note" id="an-trace-note"></span>
+        <button type="button" class="link" id="an-fit">Fit timeline</button>
       </div>
-      <div class="canvas-wrap" id="an-trace-wrap">
-        <canvas id="an-trace" aria-label="Token trace: how many units were hit at each token, or the selected unit's activity"></canvas>
+      <div class="trace-wrap" id="an-trace-wrap">
+        <canvas id="an-trace" aria-label="Timeline: units hit per token, or the selected unit's activity. Click to move to a token."></canvas>
         <div class="tooltip" id="an-trace-tip" hidden></div>
       </div>
-      <details class="how">
-        <summary>How activity is measured</summary>
-        <p id="an-how" class="hint"></p>
-      </details>
-      <details class="params" id="an-params">
-        <summary>Browse every parameter</summary>
-        <input type="text" id="an-param-filter" placeholder="Filter, e.g. layers.12.mlp or embed" spellcheck="false" aria-label="Filter parameters">
-        <ul id="an-param-list"></ul>
-      </details>
     </section>
 
-    <section class="panel an-detail" aria-labelledby="h-unit">
-      <div class="panel-head"><h2 id="h-unit">Unit</h2><span class="muted small" id="an-unit-where"></span></div>
-      <div id="an-detail">
-        <p class="empty">Click a cell in the weight map to open that attention head or neuron cluster: its weights,
-          what it writes, and the tokens where it was most active.</p>
+    <div class="palette" id="gv-palette" hidden>
+      <div class="palette-box glass" role="dialog" aria-label="Jump to a unit or parameter">
+        <div class="palette-input">
+          <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M7 2a5 5 0 1 0 3.1 8.9l3 3 1-1-3-3A5 5 0 0 0 7 2zm0 1.5a3.5 3.5 0 1 1 0 7 3.5 3.5 0 0 1 0-7z" fill="currentColor"/></svg>
+          <input id="gv-q" placeholder="Jump to L12 c7, L3 h5, a token a unit writes, or a parameter" autocomplete="off" spellcheck="false" aria-label="Search units and parameters">
+        </div>
+        <ul id="gv-results" role="listbox"></ul>
+        <div class="palette-foot"><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>↵</kbd> open</span><span><kbd>esc</kbd> close</span></div>
       </div>
-    </section>
+    </div>
   </main>
 
   <main class="workbench" id="view-workbench" hidden>

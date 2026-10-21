@@ -168,6 +168,26 @@ def test_lesions_and_edited_units(subject, tmp_path):
     assert float(want[:, cluster].abs().max()) == 0 and float(want[:, head].abs().max()) == 0
 
 
+def test_edges_find_a_planted_connection(subject, tmp_path):
+    an = Anatomy(subject, tmp_path, clusters=8)
+    score = an.composition()
+    for lm in an.layers:  # only earlier units feed a unit; an MLP also reads its own layer's heads
+        heads, clusters = slice(lm.offset, lm.offset + lm.n_heads), slice(lm.offset + lm.n_heads, lm.offset + lm.n_units)
+        assert score[heads, lm.offset:].abs().sum() == 0
+        assert score[clusters, lm.offset + lm.n_heads:].abs().sum() == 0
+    assert 0.5 < float(score[score > 0].median()) < 2  # random weights compose at about chance
+    src = an.layers[0].offset + an.layers[0].n_heads + 3  # layer 0, cluster 3
+    f = an.write_factors()[src, 0]
+    lm = an.layers[2]
+    rows = (lm.assign == 5).nonzero().flatten()
+    with torch.no_grad():  # make layer 2 cluster 5's gate rows read exactly that cluster's main output
+        lm.readers[0][1].weight[rows] = 0.5 * f / f.norm()
+    planted = an.composition()
+    tgt = lm.offset + lm.n_heads + 5
+    assert int(planted[tgt].argmax()) == src and planted[tgt, src] > 4
+    assert Anatomy(subject, tmp_path, clusters=8).edges["up"].shape == (an.n_units, 16)  # cached edges load
+
+
 def test_recordings_round_trip(subject, tmp_path):
     an = Anatomy(subject, tmp_path / "anatomy", clusters=8)
     store = RunStore(tmp_path / "data", 1)

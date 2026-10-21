@@ -448,6 +448,11 @@ async def get_edited_units():
     return {"edited": _anatomy(rec).edited_units(rec.edits), "edits_version": rec.edits.version}
 
 
+@app.get("/brainscan/anatomy/edges")
+async def get_edges():
+    return _anatomy(recorder()).describe_edges()
+
+
 @app.get("/brainscan/anatomy/params")
 async def get_params():
     return _anatomy(recorder()).param_list()

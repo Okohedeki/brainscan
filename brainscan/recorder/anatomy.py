@@ -16,6 +16,13 @@ Each token stores one byte per unit on a log2 scale from 2^-16 to 2^16, eight st
 The probe hooks the inputs of the output projections, so it also runs inside the decode CUDA
 graphs: a single-token forward writes into one fixed buffer, which every graph replay refreshes.
 
+Edges between units come from the weights too: unit B composes with an earlier unit A when B's
+input weights, after the norm in front of B's block, read A's main output directions. The score is
+||R_B F_A^T|| / (||R_B|| ||F_A||) for B's reader rows R_B and A's top output directions F_A (scaled
+by their singular values), times sqrt(d_model) so a random direction scores about 1 ("x chance").
+This is the composition score of Elhage et al. (2021) restricted to each unit's top directions. It
+is the same for every token; the UI weights it by the units' activity at the current token.
+
 The same module serves the weights themselves: any parameter or unit slice, binned to a requested
 resolution (mean, RMS or largest-magnitude value per bin), with summary statistics.
 """
@@ -43,6 +50,12 @@ VERSION = 1                  # bump to rebuild cached cluster maps
 POOL_BLOCK = 1 << 24         # fp32 elements per work block when binning a matrix
 LABEL_CHUNK = 128            # directions per unembedding pass when labelling units
 MAX_NEURON_ROWS = 256        # neurons listed, with labels, in a cluster's detail
+EDGE_FACTORS = 4             # top output directions per unit used for edges
+EDGES_KEPT = 16              # strongest incoming and outgoing edges kept per unit
+EDGE_ROWS = 4096             # reader rows per matmul when scoring edges
+EDGE_VERSION = 1
+ATTN_NORMS = ("input_layernorm", "ln_1", "attention_norm", "norm1")
+MLP_NORMS = ("pre_feedforward_layernorm", "post_attention_layernorm", "ln_2", "ffn_norm", "norm2")
 
 MEASURES = {
     "head": "Norm of what the head writes into the residual stream at this token, ||W_O[:, h] x_h||.",
@@ -52,6 +65,9 @@ MEASURES = {
                 "k-means on the original down_proj columns), largest total weight first.",
     "labels": "Tokens the unit's main write direction pushes up (+) and down (−) through the final norm and "
               "unembedding. Weight-based, not measured on text.",
+    "edges": "Weight-based composition: how strongly a unit's input weights (after the norm before its block) read "
+             "an earlier unit's top output directions, relative to a random direction (1× = chance). The same for "
+             "every token, computed from the original weights; not a measured causal effect.",
 }
 
 
@@ -161,6 +177,7 @@ class LayerMap:
     index: int
     type: str
     offset: int = 0
+    block: nn.Module | None = None
     attn: nn.Module | None = None
     mlp: nn.Module | None = None
     heads: tuple | None = None                   # (output projection, number of heads, head dim)
@@ -195,7 +212,7 @@ class Anatomy:
         d = subject.d_model
         self.layers: list[LayerMap] = []
         for i, block in enumerate(subject.layers):
-            lm = LayerMap(i, types[i] if i < len(types) else "attention")
+            lm = LayerMap(i, types[i] if i < len(types) else "attention", block=block)
             lm.attn, lm.mlp = _child(block, ATTN_NAMES), _child(block, MLP_NAMES)
             lm.heads = attention_heads(lm.attn, d, cfg)
             downs = residual_linears(lm.mlp, d, "out")
@@ -212,6 +229,11 @@ class Anatomy:
         self._stats: OrderedDict = OrderedDict()
         self._stream = None
         self._load_or_build()
+        self.edges: dict | None = None
+        try:
+            self._load_or_build_edges()
+        except Exception as exc:  # edges are an extra; the map works without them
+            print(f"[brainscan] unit edges unavailable: {type(exc).__name__}: {exc}", flush=True)
         self._prepare_probe()
 
     def _name(self, module: nn.Module) -> str:
@@ -309,9 +331,16 @@ class Anatomy:
             out += [([self.s.token_str(i) for i in a], [self.s.token_str(i) for i in b]) for a, b in zip(up, down)]
         return out
 
+    def _matrix_ref(self, module) -> dict | None:
+        w = getattr(module, "weight", None)
+        return None if w is None or id(w) not in self._names else {"name": self._names[id(w)], "shape": list(w.shape)}
+
     def describe(self) -> dict:
+        model = self.s.model
         return {"key": self.key, "model": self.s.name, "n_layers": len(self.layers), "d_model": self.s.d_model,
                 "k": self.k, "n_units": self.n_units, "build_seconds": self.build_seconds,
+                "embed": self._matrix_ref(model.get_input_embeddings()),
+                "unembed": self._matrix_ref(model.get_output_embeddings()),
                 "encoding": {"lo": ENC_LO, "steps": ENC_STEPS}, "measures": MEASURES,
                 "layers": [{"layer": lm.index, "type": lm.type, "offset": lm.offset, "heads": lm.n_heads,
                             "head_dim": lm.heads[2] if lm.heads else 0, "clusters": lm.n_clusters,
@@ -347,6 +376,128 @@ class Anatomy:
                     idx = torch.tensor(e.index if isinstance(e.index, list) else [e.index], device=lm.assign.device)
                     out.update(lm.offset + lm.n_heads + int(c) for c in lm.assign[idx].unique())
         return sorted(out)
+
+    # ---- edges -------------------------------------------------------------------------
+
+    def _load_or_build_edges(self) -> None:
+        path = self.dir / f"edges-k{self.k}.safetensors"
+        key = f"{self.key}-{EDGE_VERSION}-{EDGE_FACTORS}"
+        if path.exists():
+            with contextlib.suppress(Exception):
+                t = load_file(str(path))
+                if bytes(t["key"].tolist()).decode() == key:
+                    self._set_edges(t["score"].float(), float(t["seconds"][0]))
+                    return
+        t0 = time.perf_counter()
+        score = self.composition()
+        seconds = round(time.perf_counter() - t0, 2)
+        self.dir.mkdir(parents=True, exist_ok=True)
+        save_file({"score": score.half(), "key": torch.tensor(list(key.encode()), dtype=torch.uint8),
+                   "seconds": torch.tensor([seconds])}, str(path))
+        self._set_edges(score, seconds)
+
+    def _set_edges(self, score: torch.Tensor, seconds: float | None) -> None:
+        """Keep each unit's strongest incoming and outgoing edges. score[b, a] scores a -> b."""
+        k = min(EDGES_KEPT, score.shape[0] - 1)
+        up_x, up = score.topk(k, dim=1)
+        down_x, down = score.T.topk(k, dim=1)
+        nz = score[score > 0]
+        sample = nz[torch.randperm(nz.numel())[:1_000_000]] if nz.numel() else torch.ones(1)
+        self.edges = {"k": k, "up": up.int(), "up_x": up_x, "down": down.int(), "down_x": down_x,
+                      "p50": float(sample.median()), "p99": float(sample.quantile(0.99)), "seconds": seconds}
+
+    def describe_edges(self) -> dict:
+        e = self.edges
+        if e is None:
+            return {"available": False, "measure": MEASURES["edges"]}
+
+        def r(t):
+            return [round(x, 2) for x in t.flatten().tolist()]
+        return {"available": True, "k": e["k"], "measure": MEASURES["edges"], "p50": round(e["p50"], 3),
+                "p99": round(e["p99"], 3), "seconds": e["seconds"],
+                "up": e["up"].flatten().tolist(), "up_x": r(e["up_x"]),
+                "down": e["down"].flatten().tolist(), "down_x": r(e["down_x"])}
+
+    def _norm_gain(self, lm: LayerMap, names) -> torch.Tensor:
+        """Per-dimension gain of the norm in front of a block: what it multiplies a unit-RMS vector by."""
+        d, dev = self.s.d_model, self.s.device
+        norm = _child(lm.block, names) if lm.block is not None else None
+        if norm is None:
+            return torch.ones(d, device=dev)
+        if isinstance(norm, nn.LayerNorm):
+            return norm.weight.detach().float() if norm.weight is not None else torch.ones(d, device=dev)
+        p = next(norm.parameters(), None)
+        return norm(torch.ones(1, d, device=dev, dtype=p.dtype if p is not None else torch.float32)).float()[0]
+
+    @torch.no_grad()
+    def write_factors(self, k: int = EDGE_FACTORS) -> torch.Tensor:
+        """(units, k, d): each unit's top output directions scaled by their singular values."""
+        d, dev = self.s.d_model, self.s.device
+        F = torch.zeros(self.n_units, k, d, device=dev)
+        for lm in self.layers:
+            if lm.heads:
+                o, H, hd = lm.heads
+                W = o.weight.detach().float().view(d, H, hd)
+                vecs = torch.linalg.eigh(torch.einsum("dhi,dhj->hij", W, W)).eigenvectors[..., -k:].flip(-1)
+                F[lm.offset:lm.offset + H, :vecs.shape[-1]] = torch.einsum("dhi,hik->hkd", W, vecs)
+            if lm.centroids is not None:
+                W = lm.down.weight.detach().float()
+                for c in range(lm.n_clusters):
+                    Wc = W[:, lm.assign == c]
+                    vecs = torch.linalg.eigh(Wc.T @ Wc).eigenvectors[:, -k:].flip(-1)
+                    F[lm.offset + lm.n_heads + c, :vecs.shape[1]] = (Wc @ vecs).T
+        return F
+
+    def _reader_blocks(self, lm: LayerMap) -> list[tuple[torch.Tensor, torch.Tensor, str]]:
+        """(weight, membership (layer units, rows), 'attn' or 'mlp') for each matrix that reads the
+        residual stream into one of this layer's units. Rows can belong to several heads (shared keys)."""
+        dev, blocks = self.s.device, []
+        if lm.heads:
+            by_module: dict[int, tuple] = {}
+            for h in range(lm.n_heads):
+                for _, _, _, module, a, b in self._head_readers(lm, h):
+                    by_module.setdefault(id(module), (module, []))[1].append((h, a, b))
+            for module, ranges in by_module.values():
+                M = torch.zeros(lm.n_units, module.out_features, device=dev)
+                for h, a, b in ranges:
+                    M[h, a:b] = 1
+                blocks.append((module.weight.detach(), M, "attn"))
+        if lm.centroids is not None:
+            for _, m in lm.readers:
+                M = torch.zeros(lm.n_units, m.out_features, device=dev)
+                M[lm.n_heads + lm.assign, torch.arange(m.out_features, device=dev)] = 1
+                blocks.append((m.weight.detach(), M, "mlp"))
+        return blocks
+
+    @torch.no_grad()
+    def composition(self) -> torch.Tensor:
+        """score[b, a] for every pair of units, a -> b; zero where a does not come before b."""
+        d, dev = self.s.d_model, self.s.device
+        F = self.write_factors()
+        k = F.shape[1]
+        fnorm2 = F.square().sum((1, 2))
+        score = torch.zeros(self.n_units, self.n_units)
+        for lm in self.layers:
+            n_src = lm.offset + lm.n_heads  # the most any unit of this layer can read from
+            if not lm.n_units or not n_src:
+                continue
+            gains = {"attn": self._norm_gain(lm, ATTN_NORMS), "mlp": self._norm_gain(lm, MLP_NORMS)}
+            comp = torch.zeros(lm.n_units, n_src, device=dev)
+            rnorm2 = torch.zeros(lm.n_units, device=dev)
+            for W, M, kind in self._reader_blocks(lm):
+                end = lm.offset if kind == "attn" else n_src  # MLPs also read this layer's heads
+                gain = gains[kind]
+                Fs = (F[:end] * gain).reshape(end * k, d).to(W.dtype) if end else None
+                for r in range(0, W.shape[0], EDGE_ROWS):
+                    Wc, Mc = W[r:r + EDGE_ROWS], M[:, r:r + EDGE_ROWS]
+                    rnorm2 += Mc @ (Wc.float() * gain).square().sum(1)
+                    if Fs is not None:
+                        E = (Wc @ Fs.T).float().square().view(Wc.shape[0], end, k).sum(-1)
+                        comp[:, :end] += Mc @ E
+            denom = rnorm2[:, None] * fnorm2[None, :n_src]
+            block = torch.where(denom > 0, (comp / denom.clamp_min(1e-30)).sqrt() * d ** 0.5, torch.zeros_like(comp))
+            score[lm.offset:lm.offset + lm.n_units, :n_src] = block.cpu()
+        return score
 
     # ---- the probe ---------------------------------------------------------------------
 

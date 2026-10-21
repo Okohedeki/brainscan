@@ -1,7 +1,9 @@
-// Brainscan weights: the model's weights as a map of units, one row per layer (attention heads, then
-// MLP neurons clustered by output direction), lit by how much each unit wrote into the residual
-// stream at the current token. A trace below follows the run token by token; clicking a unit opens
-// its weights, what it writes, and the tokens where it was most active.
+// Brainscan weights: the model as a live, zoomable graph. Nodes are units (attention heads and MLP
+// neuron clusters) laid out along the residual stream; they glow by how much they wrote into the
+// stream at the current token, and edges join units whose weights compose. A dock below follows the
+// run token by token; clicking a node opens its weights, what it writes, and when it was most active.
+
+import { WeightGraph } from "/ui/graph.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -21,7 +23,7 @@ async function api(path, opts) {
 const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body ?? {}) });
 
 const HIT_Z = 3;           // a unit counts as hit when it is this many SDs above its own run average
-const Z_FULL = 4;          // z at the top of the color ramp
+const Z_FULL = 4;          // z at full brightness
 const SD_FLOOR = 4;        // in bytes (half a doubling), so very steady units don't light up on noise
 const TRAIL_DECAY = 0.82;  // per token
 const ENC = { lo: -16, steps: 8 };
@@ -31,12 +33,13 @@ const A = {
   atlas: null, U: 0, layers: [], units: [], kind: null, layerOf: null, idxOf: null, normT: null, edited: new Set(),
   runId: null, loading: null, buffer: [], tok: [], view: [], events: [], meta: null, skipped: 0,
   rows: new Map(), buf: new Uint8Array(0), n: 0, sum: null, sq: null, hist: new Float64Array(256),
-  hitCache: new Map(), hitBase: 0,
-  cursor: null, follow: true, playing: null, selected: null, hover: null, trail: null, trailOn: true, mode: "rel",
+  hitCache: new Map(), hitBase: 0, heat: null, lastAnat: 0,
+  cursor: null, follow: true, playing: null, selected: null, trail: null, trailOn: true, mode: "rel", edgeMode: "circuit",
   colW: 4, scrollX: 0, fit: true, plotW: 600, traceHover: null,
-  visible: false, raf: 0, detail: null, detailMode: null, statsTimer: 0,
+  visible: false, raf: 0, detail: null, detailMode: null, statsTimer: 0, params: null,
 };
 const H = { base: null, tile: null, vals: null, stack: [], mode: "auto", drag: null, lo: 0, scale: 1, seq: 0 };
+let graph = null;
 
 // ---------------------------------------------------------------- colors
 let C = {};
@@ -49,22 +52,32 @@ function ramp(stops) {
   }
   return out;
 }
+const list = (name) => cssVar(name).split(",").map((s) => s.trim());
 function readColors() {
   const v = cssVar;
   C = {
+    dark: v("--scheme-dark") === "1",
     surface: v("--surface"), raised: v("--raised"), ink: v("--ink"), ink2: v("--ink-2"), muted: v("--muted"), grid: v("--grid"),
     axis: v("--axis"), focus: v("--focus"), serious: v("--serious"), critical: v("--critical"), good: v("--good"),
     noData: v("--no-data"), s1: v("--series-1"), s2: v("--series-2"),
     roles: { system: v("--role-system"), user: v("--role-user"), assistant: v("--role-assistant"), reasoning: v("--role-reasoning"), tool: v("--role-tool"), template: v("--role-template") },
-    rampStops: v("--ramp").split(",").map((s) => s.trim()),
+    rampStops: list("--ramp"),
     neg: hexToRgb(v("--div-neg")), pos: hexToRgb(v("--div-pos")), mid: hexToRgb(v("--surface")),
+    // graph
+    nodeNoData: v("--node-nodata"), gridDot: v("--grid-dot"), podFill: v("--pod-fill"), podStroke: v("--pod-stroke"),
+    busA: v("--bus-a"), busB: v("--bus-b"), busFlow: v("--bus-flow"), writeEdge: v("--write-edge"),
+    edgeIn: v("--edge-in"), edgeOut: v("--edge-out"), edgeCircuit: v("--edge-circuit"), edgeCircuitHot: v("--edge-circuit-hot"),
+    glow: v("--glow"), chipBg: v("--chip-bg"), cardBg: v("--card-bg"), headRing: v("--head-ring"), trail: v("--trail"),
+    edited: v("--serious"), hoverRing: v("--hover-ring"), selectRing: v("--select-ring"), selectHalo: v("--select-halo"),
   };
   C.ramp = ramp(C.rampStops);
-  C.rampCss = C.ramp.map(([r, g, b]) => `rgb(${r},${g},${b})`);
+  C.graphStops = list("--graph-ramp");
+  C.graphRamp = ramp(C.graphStops).map(([r, g, b]) => `rgb(${r},${g},${b})`);
   C.div = Array.from({ length: 256 }, (_, i) => {
     const x = i / 127.5 - 1, end = x < 0 ? C.neg : C.pos, f = Math.abs(x);
     return [0, 1, 2].map((k) => Math.round(C.mid[k] + (end[k] - C.mid[k]) * f));
   });
+  graph?.setColors(C);
 }
 
 // ---------------------------------------------------------------- half floats and bytes from the server
@@ -79,7 +92,7 @@ const HALF = (() => {
 function b64Bytes(b64) { const bin = atob(b64), out = new Uint8Array(bin.length); for (let i = 0; i < bin.length; i++) out[i] = bin.charCodeAt(i); return out; }
 function b64Halves(b64) { const u8 = b64Bytes(b64), u16 = new Uint16Array(u8.buffer, 0, u8.length >> 1); return Float32Array.from(u16, (h) => HALF[h]); }
 
-// ---------------------------------------------------------------- the unit map (atlas)
+// ---------------------------------------------------------------- the unit map and its edges
 async function loadAtlas() {
   try {
     const atlas = await api("/brainscan/anatomy");
@@ -95,11 +108,14 @@ async function loadAtlas() {
       for (const u of A.units) if (A.kind[u.g] === k) A.normT[u.g] = hi > lo ? (Math.log(Math.max(u.norm, 1e-9)) - lo) / (hi - lo) : 0.5;
     }
     A.edited = new Set(atlas.edited || []);
-    A.trail = new Float32Array(A.U);
-    $("#an-how").innerHTML = `<b>Attention heads.</b> ${esc(atlas.measures.head)} <b>MLP clusters.</b> ${esc(atlas.measures.clusters)} ${esc(atlas.measures.cluster)}
-      Colors compare each unit with its own average over the run, on a log scale (z of log activity, standard deviation floored at half a doubling); a unit counts as hit at z ≥ ${HIT_Z}.
-      Every weight takes part in every token, so this shows how much each group wrote, not an on/off firing. <b>Labels.</b> ${esc(atlas.measures.labels)}`;
+    A.trail = new Float32Array(A.U); A.heat = new Float32Array(A.U).fill(NaN);
+    graph.setAtlas(atlas);
+    pushState();
     renderLegend();
+    api("/brainscan/anatomy/edges").then((e) => {
+      if (e.available) { e.up = Int32Array.from(e.up); e.down = Int32Array.from(e.down); e.up_x = Float32Array.from(e.up_x); e.down_x = Float32Array.from(e.down_x); }
+      A.edges = e; graph.setEdges(e); renderLegend();
+    }).catch(() => {});
     return true;
   } catch (err) {
     A.atlasError = err;
@@ -109,7 +125,8 @@ async function loadAtlas() {
 
 async function refreshEdited() {
   try { A.edited = new Set((await api("/brainscan/anatomy/edited")).edited); } catch { /* recorder busy */ }
-  schedule();
+  graph.thumbs.clear();
+  pushState();
 }
 
 // ---------------------------------------------------------------- run data
@@ -190,7 +207,7 @@ async function openRun(id) {
   stopPlay();
   resetRunData();
   schedule();
-  if (!id) { A.loading = null; renderReadout(); return; }
+  if (!id) { A.loading = null; setCursor(null); return; }
   try {
     const [run, tape, bin] = await Promise.all([
       api(`/brainscan/runs/${encodeURIComponent(id)}`),
@@ -215,8 +232,7 @@ async function openRun(id) {
       buffered.forEach(handle);
     }
   }
-  const last = lastRecorded();
-  setCursor(last, "jump");
+  setCursor(lastRecorded(), "jump");
   if (A.selected != null) renderRunStats();
 }
 
@@ -240,6 +256,7 @@ function handle(msg) {
     case "anat": {
       if (msg.run !== A.runId || !A.atlas || msg.u !== A.U) break;
       addSlice(msg.t, b64Bytes(msg.b64));
+      A.lastAnat = performance.now();
       if (A.follow && !A.playing) setCursor(msg.t[msg.t.length - 1], msg.t.length === 1 ? "step" : "jump");
       else schedule();
       if (A.selected != null) throttledRunStats();
@@ -264,7 +281,26 @@ function connect() {
   ws.onmessage = (ev) => { for (const msg of JSON.parse(ev.data)) handle(msg); };
 }
 
-// ---------------------------------------------------------------- cursor, trail, replay
+// ---------------------------------------------------------------- cursor, heat, trail, replay
+function computeHeat() {
+  const h = A.heat; if (!h) return;
+  const row = rowOf(A.cursor);
+  if (A.mode === "norm") { h.set(A.normT); return; }
+  if (row == null) { h.fill(NaN); return; }
+  for (let g = 0; g < A.U; g++) {
+    const c = codeAt(row, g);
+    h[g] = A.mode === "abs" ? clamp((c - A.absLo) / (A.absHi - A.absLo), 0, 1) : clamp(zOf(g, c) / Z_FULL, 0, 1);
+  }
+}
+
+function pushState() {
+  if (!graph || !A.atlas) return;
+  computeHeat();
+  graph.setState({ heat: A.heat, trail: A.trail, trailOn: A.trailOn, mode: A.mode, normT: A.normT, selected: A.selected,
+    edited: A.edited, edgeMode: A.edgeMode, live: isLive(), visible: A.visible });
+}
+const isLive = () => A.follow && performance.now() - A.lastAnat < 2500;
+
 function setCursor(t, how = "jump") {
   A.cursor = t;
   const row = rowOf(t);
@@ -279,19 +315,21 @@ function setCursor(t, how = "jump") {
     const i = viewIndex(t), x = i * A.colW;
     if (x < A.scrollX || x > A.scrollX + A.plotW - A.colW) A.scrollX = x - A.plotW * 0.8;
   }
+  pushState();
   renderReadout();
   schedule();
 }
 
 function setFollow(on) {
-  A.follow = on; $("#an-follow").checked = on;
+  A.follow = on;
+  $("#an-follow").setAttribute("aria-pressed", String(on));
   if (on) { stopPlay(); setCursor(lastRecorded(), "jump"); }
   renderReadout();
 }
 
 function stopPlay() {
   if (A.playing) { clearInterval(A.playing); A.playing = null; }
-  $("#an-play").textContent = "▶ Replay";
+  const b = $("#an-play"); b.innerHTML = ICON.play; b.setAttribute("aria-label", "Replay the run");
 }
 
 function togglePlay() {
@@ -301,241 +339,98 @@ function togglePlay() {
   setFollow(false);
   let i = A.cursor != null ? seq.indexOf(A.cursor) : -1;
   if (i < 0 || i >= seq.length - 1) { i = 0; setCursor(seq[0], "jump"); }
-  $("#an-play").textContent = "⏸ Pause";
+  const b = $("#an-play"); b.innerHTML = ICON.pause; b.setAttribute("aria-label", "Pause");
   A.playing = setInterval(() => {
     i++;
     if (i >= seq.length) { stopPlay(); return; }
     setCursor(seq[i], "step");
-  }, 45);
+  }, 55);
+}
+
+function step(d) {
+  if (A.cursor == null || !A.view.length) return;
+  const i = viewIndex(A.cursor) + d;
+  if (i >= 0 && i < A.view.length) { setFollow(false); stopPlay(); setCursor(A.view[i], "step"); }
 }
 
 function renderReadout() {
   const el = $("#an-readout");
   if (!A.atlas) { el.textContent = ""; return; }
-  if (A.mode === "norm") { el.innerHTML = `<span>Showing weight size: the Frobenius norm of each unit's output weights, log scale, within heads and within clusters.</span>`; return; }
+  $("#an-follow").classList.toggle("streaming", isLive());
+  if (A.mode === "norm") { el.innerHTML = `<span class="muted">Weight size: each unit's output-weight norm, log scale. No run needed.</span>`; return; }
   const t = A.cursor, rec = t != null ? A.tok[t] : null;
   if (rec == null) {
-    const why = !A.runId ? `No run yet. Point a harness at <code>${esc(location.origin)}/v1</code> and the map lights up as tokens are recorded.`
+    const why = !A.runId ? `No run yet. Point any harness at <code>${esc(location.origin)}/v1</code>; the graph lights up as tokens arrive.`
       : A.skipped ? "This run was recorded with a different unit map (another model or cluster count)."
-        : A.view.length ? "This run has no weight activity: it was recorded before the Weights tab existed. New requests record it."
+        : A.view.length ? "No weight activity in this run: it was recorded before the Weights view existed. New requests record it."
           : "No tokens in this run yet.";
-    el.innerHTML = `<span class="muted">${why} “Weight size” colors the map from the weights alone.</span>`;
+    el.innerHTML = `<span class="muted">${why}</span>`;
     return;
   }
   const hits = hitCount(t);
-  const live = A.meta && !A.meta.outcome && !A.follow ? ` <button type="button" class="link" id="an-live">Back to live</button>` : "";
-  el.innerHTML = `<span class="tok">${esc(visTok(rec.tx))}</span><span>t${t} · ${esc(rec.r)} · ${esc(rec.ph)}</span>` +
-    (hits == null ? `<span class="muted">no activity stored for this token</span>` : `<span><b>${hits}</b> of ${A.U} units ≥ ${HIT_Z}σ above their run average</span>`) + live;
-  const btn = $("#an-live"); if (btn) btn.onclick = () => setFollow(true);
+  el.innerHTML = `<span class="tok-chip">${esc(visTok(rec.tx))}</span><span class="meta">t${t} · ${esc(rec.r)}</span>` +
+    (hits == null ? `<span class="muted">no activity stored for this token</span>` : `<span class="hits"><b>${hits}</b> units hit</span>`);
 }
 
-// ---------------------------------------------------------------- drawing
-function schedule() { if (!A.raf && A.visible) A.raf = requestAnimationFrame(draw); }
-function draw() { A.raf = 0; drawMap(); drawTrace(); overlay(); }
+// ---------------------------------------------------------------- dock trace
+function schedule() { if (!A.raf && A.visible) A.raf = requestAnimationFrame(() => { A.raf = 0; drawTrace(); overlay(); }); }
 
-function sizeCanvas(cv, H) {
+function sizeCanvas(cv, Hh) {
   const dpr = window.devicePixelRatio || 1, W = cv.clientWidth;
-  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(H * dpr)) {
-    cv.width = Math.round(W * dpr); cv.height = Math.round(H * dpr); cv.style.height = `${H}px`;
+  if (cv.width !== Math.round(W * dpr) || cv.height !== Math.round(Hh * dpr)) {
+    cv.width = Math.round(W * dpr); cv.height = Math.round(Hh * dpr); cv.style.height = `${Hh}px`;
   }
   const ctx = cv.getContext("2d");
   ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
   return { ctx, W };
 }
 
-function mapLayout(W) {
-  const L = A.layers.length;
-  const maxH = Math.max(1, ...A.layers.map((l) => l.heads)), maxK = Math.max(1, ...A.layers.map((l) => l.clusters));
-  const gutter = 62, gap = 12, totalsW = 46, top = 22;
-  const cw = Math.max(1.5, (W - gutter - 2 * gap - totalsW - 4) / (maxH + maxK));
-  const rh = clamp(Math.floor(600 / L), 6, 16);
-  const x0 = gutter, x1 = gutter + maxH * cw + gap, xT = x1 + maxK * cw + gap;
-  return { L, maxH, maxK, gutter, gap, top, cw, rh, x0, x1, xT, totalsW, headsW: maxH * cw, height: top + L * rh + 6 };
-}
-
-function cellRect(lay, g) {
-  const l = A.layers[A.layerOf[g]], i = A.idxOf[g], y = lay.top + (lay.L - 1 - l.layer) * lay.rh;
-  if (A.kind[g] === 0) { const w = lay.headsW / l.heads; return { x: lay.x0 + i * w, y, w, h: lay.rh }; }
-  return { x: lay.x1 + i * lay.cw, y, w: lay.cw, h: lay.rh };
-}
-
-function heat(g, row) {
-  if (A.mode === "norm") return A.normT[g];
-  if (row == null) return null;
-  const c = codeAt(row, g);
-  if (A.mode === "abs") return clamp((c - A.absLo) / (A.absHi - A.absLo), 0, 1);
-  return clamp(zOf(g, c) / Z_FULL, 0, 1);
-}
-
-function drawMap() {
-  const cv = $("#an-map");
-  if (!A.atlas) { sizeCanvas(cv, 200).ctx.clearRect(0, 0, cv.clientWidth, 200); return; }
-  const lay = mapLayout(cv.clientWidth), { ctx, W } = sizeCanvas(cv, lay.height);
-  A.lay = lay;
-  ctx.fillStyle = C.surface; ctx.fillRect(0, 0, W, lay.height);
-  ctx.font = "11px system-ui, sans-serif"; ctx.textBaseline = "middle"; ctx.fillStyle = C.ink2; ctx.textAlign = "left";
-  ctx.fillText("attention heads", lay.x0, 9);
-  ctx.fillText("MLP neuron clusters · largest first", lay.x1, 9);
-  ctx.fillText("layer Σ", lay.xT, 9);
-  const row = A.mode === "norm" ? null : rowOf(A.cursor);
-  const gapPx = lay.cw >= 4 ? 1 : 0, vgap = lay.rh >= 8 ? 1 : 0;
-  // layer labels
-  ctx.font = "10px system-ui, sans-serif"; ctx.textAlign = "right";
-  const every = lay.rh >= 11 ? 1 : lay.rh >= 7 ? 2 : 4;
-  for (const l of A.layers) {
-    if (l.layer % every && l.layer !== A.layers.length - 1) continue;
-    const y = lay.top + (lay.L - 1 - l.layer) * lay.rh + lay.rh / 2;
-    const tag = l.type === "linear_attention" ? "lin" : l.type === "full_attention" ? "full" : "";
-    ctx.fillStyle = C.ink2; ctx.fillText(`L${l.layer}`, lay.gutter - 26, y);
-    ctx.fillStyle = C.muted; ctx.fillText(tag, lay.gutter - 4, y);
-  }
-  // cells
-  for (let g = 0; g < A.U; g++) {
-    const r = cellRect(lay, g), v = heat(g, row);
-    ctx.fillStyle = v == null ? C.noData : C.rampCss[Math.round(v * 255)];
-    ctx.fillRect(r.x, r.y, Math.max(1, r.w - gapPx), r.h - vgap);
-  }
-  // trail: units that were hotter in the last few tokens than they are now
-  if (A.trailOn && row != null && A.mode !== "norm") {
-    ctx.strokeStyle = C.s2; ctx.lineWidth = 1.5;
-    for (let g = 0; g < A.U; g++) {
-      const fade = A.trail[g] - heat(g, row);
-      if (fade < 0.2) continue;
-      const r = cellRect(lay, g);
-      ctx.globalAlpha = clamp(fade, 0.2, 1);
-      ctx.strokeRect(r.x + 0.75, r.y + 0.75, Math.max(1, r.w - gapPx - 1.5), r.h - vgap - 1.5);
-    }
-    ctx.globalAlpha = 1;
-  }
-  // edited by the workbench
-  if (A.edited.size) {
-    ctx.fillStyle = C.serious;
-    for (const g of A.edited) {
-      const r = cellRect(lay, g), s = Math.min(6, r.w - gapPx, r.h - vgap);
-      ctx.beginPath(); ctx.moveTo(r.x + r.w - gapPx - s, r.y); ctx.lineTo(r.x + r.w - gapPx, r.y); ctx.lineTo(r.x + r.w - gapPx, r.y + s); ctx.fill();
-    }
-  }
-  // layer totals at the cursor: summed head write norms and summed cluster write mass
-  if (row != null) {
-    const tot = layerTotals(row), maxA = Math.max(...tot.map((x) => x[0]), 1e-9), maxM = Math.max(...tot.map((x) => x[1]), 1e-9);
-    for (const l of A.layers) {
-      const y = lay.top + (lay.L - 1 - l.layer) * lay.rh, half = (lay.rh - vgap) / 2;
-      ctx.fillStyle = C.s1; ctx.fillRect(lay.xT, y, lay.totalsW * tot[l.layer][0] / maxA, Math.max(1, half - 0.5));
-      ctx.fillStyle = C.s2; ctx.fillRect(lay.xT, y + half, lay.totalsW * tot[l.layer][1] / maxM, Math.max(1, half - 0.5));
-    }
-  }
-  const outline = (g, color, w) => { if (g == null) return; const r = cellRect(lay, g); ctx.strokeStyle = color; ctx.lineWidth = w; ctx.strokeRect(r.x - 1, r.y - 1, r.w - gapPx + 2, r.h - vgap + 2); };
-  outline(A.hover, C.ink2, 1);
-  outline(A.selected, C.focus, 2);
-}
-
-function layerTotals(row) {
-  const tot = A.layers.map(() => [0, 0]);
-  for (let g = 0; g < A.U; g++) tot[A.layerOf[g]][A.kind[g]] += value(codeAt(row, g));
-  return tot;
-}
-
-function mapHit(mx, my) {
-  const lay = A.lay; if (!lay || my < lay.top) return null;
-  const li = lay.L - 1 - Math.floor((my - lay.top) / lay.rh);
-  const l = A.layers[li]; if (!l) return null;
-  if (mx >= lay.x0 && mx < lay.x0 + lay.headsW && l.heads) return { g: l.offset + Math.floor((mx - lay.x0) / (lay.headsW / l.heads)), layer: li };
-  if (mx >= lay.x1 && mx < lay.x1 + l.clusters * lay.cw) return { g: l.offset + l.heads + Math.floor((mx - lay.x1) / lay.cw), layer: li };
-  if (mx >= lay.xT) return { totals: true, layer: li };
-  return null;
-}
-
-function unitName(g) { const u = A.units[g]; return `L${u.layer} · ${u.kind === "head" ? "head" : "cluster"} ${u.i}`; }
-
-function showMapTip(hit, mx, my) {
-  const tip = $("#an-tip");
-  if (!hit) { tip.hidden = true; return; }
-  const row = rowOf(A.cursor);
-  let html;
-  if (hit.totals) {
-    if (row == null) { tip.hidden = true; return; }
-    const t = layerTotals(row)[hit.layer];
-    html = `<div><b>Layer ${hit.layer}</b> at t${A.cursor}</div><div class="row"><span><i class="sw" style="background:${C.s1}"></i>heads, Σ write norm</span><span>${num(t[0])}</span></div><div class="row"><span><i class="sw" style="background:${C.s2}"></i>MLP, Σ write mass</span><span>${num(t[1])}</span></div>`;
-  } else {
-    const u = A.units[hit.g], L = A.layers[u.layer];
-    const what = u.kind === "head" ? `${L.type === "linear_attention" ? "linear-attention" : "attention"} head · ${u.size} dims` : `${u.size} neurons`;
-    html = `<div><b>${unitName(hit.g)}</b> <span class="muted">${what}</span></div>`;
-    if (row != null) {
-      const c = codeAt(row, hit.g), z = zOf(hit.g, c);
-      html += `<div class="row"><span>${u.kind === "head" ? "write norm" : "write mass"}</span><span>${num(value(c))}</span></div><div class="row"><span>vs. its run average</span><span>${z >= 0 ? "+" : ""}${z.toFixed(1)}σ</span></div>`;
-    }
-    html += `<div class="row"><span>‖output weights‖</span><span>${num(u.norm)}</span></div>`;
-    if (u.pos) html += `<div class="muted">pushes up: ${u.pos.map((s) => esc(visTok(s))).join(" ")}</div><div class="muted">pushes down: ${u.neg.map((s) => esc(visTok(s))).join(" ")}</div>`;
-    if (A.edited.has(hit.g)) html += `<div class="muted">▲ changed by an applied workbench edit</div>`;
-  }
-  placeTip(tip, $("#an-map-wrap"), html, mx, my);
-}
-
-function placeTip(tip, wrap, html, mx, my) {
-  tip.innerHTML = html; tip.hidden = false;
-  const box = wrap.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
-  tip.style.left = `${clamp(mx + 14, 4, box.width - w - 4)}px`;
-  tip.style.top = `${my + 14 + h > box.height ? Math.max(4, my - h - 10) : my + 14}px`;
-}
-
-// ---- trace
-const TG = 70;
+const TG = 12;
 function viewIndex(t) {
   let lo = 0, hi = A.view.length;
   while (lo < hi) { const m = (lo + hi) >> 1; if (A.view[m] < t) lo = m + 1; else hi = m; }
   return Math.min(lo, Math.max(0, A.view.length - 1));
 }
-
-function traceLayout() { return { ev: [2, 14], roles: [20, 4], bars: [28, 70], ruler: [102, 16], height: 120 }; }
+function traceLayout() { return { ev: [4, 10], bars: [18, 46], roles: [66, 3], ruler: [72, 14], height: 88 }; }
 
 function drawTrace() {
   const cv = $("#an-trace"), lay = traceLayout(), { ctx, W } = sizeCanvas(cv, lay.height);
-  ctx.fillStyle = C.surface; ctx.fillRect(0, 0, W, lay.height);
-  A.plotW = Math.max(50, W - TG - 10);
+  ctx.clearRect(0, 0, W, lay.height);
+  A.plotW = Math.max(50, W - 2 * TG);
   const n = A.view.length;
   if (A.fit) { A.colW = Math.max(0.05, A.plotW / Math.max(1, n)); A.scrollX = 0; }
   A.scrollX = clamp(A.scrollX, 0, Math.max(0, n * A.colW - A.plotW));
   const cw = A.colW, i0 = Math.max(0, Math.floor(A.scrollX / cw)), i1 = Math.min(n, Math.ceil((A.scrollX + A.plotW) / cw) + 1);
   const X = (i) => TG + i * cw - A.scrollX;
-  // gutter
-  ctx.font = "11px system-ui, sans-serif"; ctx.textBaseline = "middle"; ctx.textAlign = "left"; ctx.fillStyle = C.ink2;
-  ctx.fillText("events", 8, lay.ev[0] + 7);
-  ctx.fillText(A.selected != null ? unitName(A.selected).replace(" · ", " ") : "units hit", 8, lay.bars[0] + 10);
-  ctx.fillStyle = C.muted; ctx.font = "10px system-ui, sans-serif";
-  ctx.fillText(A.selected != null ? `z, 0–6 · ≥${HIT_Z} marked` : `≥${HIT_Z}σ, per token`, 8, lay.bars[0] + 24);
+  $("#an-trace-note").textContent = A.selected != null ? `${unitName(A.selected)} · z per token, hits ≥ ${HIT_Z}σ marked` : `units hit per token (≥ ${HIT_Z}σ above their run average)`;
   if (!n) return;
   ctx.save(); ctx.beginPath(); ctx.rect(TG, 0, A.plotW, lay.height); ctx.clip();
   const gap = cw >= 4 ? 1 : 0;
-  // roles
   for (let i = i0; i < i1; i++) { const r = A.tok[A.view[i]]; ctx.fillStyle = C.roles[r.r] || C.roles.template; ctx.fillRect(X(i), lay.roles[0], Math.max(cw - gap, 0.6), lay.roles[1]); }
-  // bars
   const [by, bh] = lay.bars, sel = A.selected;
   let maxHits = 1;
-  if (sel == null) for (let i = i0; i < i1; i++) { const h = hitCount(A.view[i]); if (h != null && h > maxHits) maxHits = h; }
-  A.maxHits = maxHits;
-  ctx.fillStyle = C.grid; ctx.fillRect(TG, by + bh, A.plotW, 1);
+  if (sel == null) for (let i = i0; i < i1; i++) { const hh = hitCount(A.view[i]); if (hh != null && hh > maxHits) maxHits = hh; }
   for (let i = i0; i < i1; i++) {
     const t = A.view[i], row = rowOf(t), x = X(i), w = Math.max(cw - gap, 0.6);
-    if (row == null) { ctx.fillStyle = C.noData; ctx.fillRect(x, by + bh - 3, w, 3); continue; }
+    if (row == null) { ctx.fillStyle = C.noData; ctx.fillRect(x, by + bh - 2, w, 2); continue; }
     if (sel != null) {
-      const z = zOf(sel, codeAt(row, sel)), h = clamp(z, 0, 6) / 6 * bh;
-      ctx.fillStyle = z >= HIT_Z ? C.s2 : C.s1;
-      ctx.fillRect(x, by + bh - h, w, h);
-      if (z >= HIT_Z) { ctx.fillRect(x, by - 4, Math.max(w, 2), 3); }
+      const z = zOf(sel, codeAt(row, sel)), hh = clamp(z, 0, 6) / 6 * bh;
+      ctx.fillStyle = z >= HIT_Z ? C.edgeCircuitHot : C.s1;
+      ctx.globalAlpha = z >= HIT_Z ? 1 : 0.65;
+      ctx.fillRect(x, by + bh - hh, w, hh);
     } else {
-      const h = (hitCount(t) / maxHits) * bh;
-      ctx.fillStyle = C.ink2; ctx.globalAlpha = 0.75; ctx.fillRect(x, by + bh - h, w, h); ctx.globalAlpha = 1;
+      const hh = (hitCount(t) / maxHits) * bh;
+      ctx.fillStyle = C.graphRamp[Math.round(clamp(hitCount(t) / maxHits, 0.15, 1) * 255)];
+      ctx.fillRect(x, by + bh - hh, w, hh);
     }
   }
-  if (sel != null) { ctx.strokeStyle = C.axis; ctx.setLineDash([3, 3]); const y = by + bh - (HIT_Z / 6) * bh; ctx.beginPath(); ctx.moveTo(TG, y + 0.5); ctx.lineTo(TG + A.plotW, y + 0.5); ctx.stroke(); ctx.setLineDash([]); }
-  // events
+  ctx.globalAlpha = 1;
   for (const e of A.events) {
-    const look = eventTone(e); if (!look) continue;
+    const tone = eventTone(e); if (!tone) continue;
     const x = X(viewIndex(e.t)) + cw / 2; if (x < TG - 4 || x > TG + A.plotW + 4) continue;
-    ctx.fillStyle = look; ctx.beginPath(); ctx.arc(x, lay.ev[0] + 7, 3.5, 0, Math.PI * 2); ctx.fill();
+    ctx.fillStyle = tone; ctx.beginPath(); ctx.arc(x, lay.ev[0] + 4, 3, 0, Math.PI * 2); ctx.fill();
   }
-  // ruler
-  ctx.font = "10px ui-monospace, Consolas, monospace"; ctx.textBaseline = "top"; ctx.fillStyle = C.muted;
+  ctx.font = "10px 'JetBrains Mono', ui-monospace, monospace"; ctx.textBaseline = "top"; ctx.fillStyle = C.muted;
   const [uy] = lay.ruler;
   if (cw >= 22) {
     for (let i = i0; i < i1; i++) {
@@ -544,16 +439,15 @@ function drawTrace() {
       ctx.save(); ctx.beginPath(); ctx.rect(X(i), uy, cw - 2, 14); ctx.clip(); ctx.fillText(visTok(r.tx), X(i) + 1, uy + 2); ctx.restore();
     }
   } else {
-    const step = niceStep(Math.ceil(70 / cw));
-    for (let i = Math.ceil(i0 / step) * step; i < i1; i += step) { ctx.fillRect(X(i), uy, 1, 4); ctx.fillText(String(A.view[i]), X(i) + 3, uy + 3); }
+    const stepN = niceStep(Math.ceil(80 / cw));
+    for (let i = Math.ceil(i0 / stepN) * stepN; i < i1; i += stepN) ctx.fillText(`t${A.view[i]}`, X(i) + 2, uy + 2);
   }
-  // cursor and hover
   const mark = (t, color, w) => {
     if (t == null) return; const i = viewIndex(t); if (A.view[i] !== t) return;
-    ctx.fillStyle = color; ctx.fillRect(X(i) + cw / 2 - w / 2, lay.roles[0] - 2, w, lay.bars[0] + lay.bars[1] - lay.roles[0] + 4);
+    ctx.fillStyle = color; ctx.fillRect(X(i) + cw / 2 - w / 2, 0, w, lay.roles[0] + lay.roles[1] + 1);
   };
   if (A.traceHover != null) mark(A.traceHover, C.ink2, 1);
-  mark(A.cursor, C.focus, 2);
+  mark(A.cursor, C.selectRing, 2);
   ctx.restore();
 }
 function niceStep(raw) { const p = 10 ** Math.floor(Math.log10(raw)); return [1, 2, 5, 10].map((m) => m * p).find((s) => s >= raw); }
@@ -577,6 +471,13 @@ function traceHit(mx) {
   return i >= 0 && i < A.view.length ? A.view[i] : null;
 }
 
+function placeTip(tip, wrap, html, mx, my) {
+  tip.innerHTML = html; tip.hidden = false;
+  const box = wrap.getBoundingClientRect(), w = tip.offsetWidth, h = tip.offsetHeight;
+  tip.style.left = `${clamp(mx + 14, 4, box.width - w - 4)}px`;
+  tip.style.top = `${my + 14 + h > box.height ? Math.max(4, my - h - 10) : my + 14}px`;
+}
+
 function showTraceTip(t, mx, my) {
   const tip = $("#an-trace-tip");
   if (t == null) { tip.hidden = true; return; }
@@ -587,7 +488,8 @@ function showTraceTip(t, mx, my) {
   else html += `<div class="row"><span>units ≥ ${HIT_Z}σ</span><span>${hitCount(t)}</span></div>`;
   const near = A.events.filter((e) => eventTone(e) && Math.abs(viewIndex(e.t) - viewIndex(t)) * A.colW < 6);
   for (const e of near.slice(0, 3)) html += `<div class="muted">${esc(e.type.replace("_", " "))}${e.data?.name ? ` · ${esc(e.data.name)}` : ""}</div>`;
-  placeTip(tip, $("#an-trace-wrap"), html, mx, my);
+  const wrap = $("#an-trace-wrap"), box = wrap.getBoundingClientRect();
+  placeTip(tip, wrap, html, mx, Math.min(my, box.height - 4));
 }
 
 function overlay() {
@@ -595,32 +497,76 @@ function overlay() {
   let html = null;
   if (!A.atlas) {
     const err = A.atlasError;
-    html = err?.status === 404 ? `<b>Weight anatomy is off.</b><div class="empty">Start the recorder without <code>BRAINSCAN_ANATOMY=0</code>.</div>`
-      : err && err.status !== 503 ? `<b>Could not load the weight map</b><div class="empty">${esc(err.message)}</div>`
-        : `<b>Loading the weight map…</b><div class="empty">The first start on a model groups its MLP neurons once and caches the result.</div>`;
+    html = err?.status === 404 ? `<b>Weight anatomy is off</b><span>Start the recorder without <code>BRAINSCAN_ANATOMY=0</code>.</span>`
+      : err && err.status !== 503 ? `<b>Could not load the weight graph</b><span>${esc(err.message)}</span>`
+        : `<div class="spinner"></div><b>Mapping the weights…</b><span>The first start on a model clusters its MLP neurons and scores unit-to-unit edges once, then caches them.</span>`;
   }
   ov.hidden = html == null;
   if (html) ov.innerHTML = html;
 }
 
-function renderLegend() {
-  const grad = `<span class="grad" style="background:linear-gradient(90deg, ${C.rampStops.join(",")})"></span>`;
-  const scale = A.mode === "rel" ? `${grad}at its run average or below → ${Z_FULL}σ above (log activity)`
-    : A.mode === "abs" ? `${grad}activity, log scale (2nd → 99.5th percentile of the run)` : `${grad}output-weight norm, log scale`;
-  $("#an-legend").innerHTML = [
-    `<span class="item">${scale}</span>`,
-    A.mode !== "norm" ? `<span class="item"><span class="box outline" style="border-color:${C.s2}"></span>trail: hit in the last few tokens</span>` : "",
-    `<span class="item"><span class="tri" style="border-top-color:${C.serious}"></span>changed by an applied workbench edit</span>`,
-    `<span class="item"><span class="line" style="background:${C.s1}"></span><span class="line" style="background:${C.s2}"></span>layer Σ: heads, MLP</span>`,
-  ].join("");
+// ---------------------------------------------------------------- graph hover tooltip
+function unitName(g) { const u = A.units[g]; return `L${u.layer} · ${u.kind === "head" ? "head" : "cluster"} ${u.i}`; }
+
+function graphTip(hit, mx, my) {
+  const tip = $("#gv-tip");
+  if (!hit || hit.g == null) {
+    if (hit?.end) { placeTip(tip, $("#gv-stage"), `<div><b>${hit.end === "embed" ? "Token embedding" : "Unembedding"}</b></div><div class="muted">Click to open the matrix.</div>`, mx, my); return; }
+    tip.hidden = true; return;
+  }
+  const g = hit.g, u = A.units[g], L = A.layers[u.layer], row = rowOf(A.cursor);
+  const what = u.kind === "head" ? `${L.type === "linear_attention" ? "linear-attention" : "attention"} head · ${u.size} dims` : `MLP cluster · ${u.size} neurons`;
+  let html = `<div class="tip-title">${unitName(g)}</div><div class="muted">${what}</div>`;
+  if (row != null && A.mode !== "norm") {
+    const c = codeAt(row, g), z = zOf(g, c);
+    html += `<div class="row"><span>${u.kind === "head" ? "write norm" : "write mass"}</span><span>${num(value(c))}</span></div><div class="row"><span>vs. its run average</span><span>${z >= 0 ? "+" : ""}${z.toFixed(1)}σ</span></div>`;
+  }
+  html += `<div class="row"><span>‖output weights‖</span><span>${num(u.norm)}</span></div>`;
+  if (u.pos) html += `<div class="toks"><span class="muted">↑</span> ${u.pos.map((s) => `<code>${esc(visTok(s))}</code>`).join(" ")}</div><div class="toks"><span class="muted">↓</span> ${u.neg.map((s) => `<code>${esc(visTok(s))}</code>`).join(" ")}</div>`;
+  if (A.edges?.available) {
+    const k = A.edges.k, a = A.edges.up[g * k], x = A.edges.up_x[g * k];
+    if (x > 0) html += `<div class="row"><span>strongest input</span><span>${unitName(a)} · ${x.toFixed(1)}×</span></div>`;
+  }
+  if (A.edited.has(g)) html += `<div class="warn-line">Changed by an applied workbench edit</div>`;
+  placeTip(tip, $("#gv-stage"), html, mx, my);
 }
 
-// ---------------------------------------------------------------- unit detail
+// ---------------------------------------------------------------- legend and toolbar
+function renderLegend() {
+  const g = `linear-gradient(90deg, ${(C.graphStops || []).join(",")})`;
+  const scale = A.mode === "rel" ? "at or below its run average → 4σ above" : A.mode === "abs" ? "activity, log scale" : "output-weight norm, log scale";
+  const e = A.edges;
+  $("#gv-legend").innerHTML = `
+    <div class="lg-row"><span class="lg-grad" style="background:${g}"></span><span>${scale}</span></div>
+    ${A.edgeMode !== "off" ? `<div class="lg-row"><span class="lg-line" style="background:${C.edgeCircuit}"></span><span>${A.selected != null ? `<span style="color:${C.edgeIn}">inputs</span> · <span style="color:${C.edgeOut}">outputs</span> of the selected unit` : A.edgeMode === "circuit" ? "composition between units active now" : "edges of the unit under the cursor"}</span></div>` : ""}
+    <div class="lg-row"><span class="lg-ring" style="border-color:${C.trail}"></span><span>hit in the last few tokens</span><span class="lg-dot" style="background:${C.edited}"></span><span>edited</span></div>
+    <details><summary>How to read this</summary>
+      <p><b>Nodes.</b> Attention heads sit above the residual stream, MLP neuron clusters below; one column per layer. ${esc(A.atlas?.measures?.head || "")} ${esc(A.atlas?.measures?.cluster || "")} ${esc(A.atlas?.measures?.clusters || "")}</p>
+      <p><b>Color.</b> Each unit against its own average over the run, on a log scale; a unit counts as hit at ${HIT_Z}σ. Every weight takes part in every token, so this is how much a unit wrote, not an on/off firing.</p>
+      <p><b>Edges.</b> ${esc(e?.measure || "")}${e?.available ? ` Median ${e.p50}×, 99th percentile ${e.p99}×.` : ""}</p>
+      <p><b>Labels.</b> ${esc(A.atlas?.measures?.labels || "")}</p>
+    </details>`;
+}
+
+function setSeg(group, attr, value) {
+  document.querySelectorAll(`${group} [data-${attr}]`).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset[attr] === value)));
+}
+
+function updateZoomLabel() { const z = $("#gv-zoom"); if (z && graph) z.textContent = `${graph.zoomPercent()}%`; }
+
+// ---------------------------------------------------------------- detail drawer
+function openDrawer(on) {
+  $("#gv-drawer").hidden = !on;
+  $("#gv-stage").classList.toggle("drawer-open", on);
+}
+
 async function selectUnit(g, keepView = false) {
+  if (g == null) { A.selected = null; A.detailMode = null; openDrawer(false); pushState(); renderLegend(); schedule(); return; }
   A.selected = g; A.detailMode = "unit";
-  schedule();
+  pushState(); renderLegend(); schedule();
+  openDrawer(true);
   $("#an-unit-where").textContent = unitName(g);
-  if (!keepView) $("#an-detail").innerHTML = `<p class="empty">Reading ${esc(unitName(g))}…</p>`;
+  if (!keepView) $("#an-detail").innerHTML = `<div class="skeleton"></div><div class="skeleton short"></div><div class="skeleton tall"></div>`;
   try {
     const d = await api(`/brainscan/anatomy/units/${g}`);
     if (A.selected !== g) return;
@@ -638,35 +584,50 @@ async function selectUnit(g, keepView = false) {
 function renderDetail() {
   const d = A.detail, cluster = d.kind === "cluster";
   const layerType = d.layer_type === "linear_attention" ? "linear-attention layer" : d.layer_type === "full_attention" ? "full-attention layer" : "";
-  const size = cluster ? `${d.size} neurons` : `${d.size} dims per head`;
-  const chips = (list) => (list || []).map((s) => `<span class="chip">${esc(visTok(s))}</span>`).join("");
-  const mtabs = d.matrices.map((m) => `<button type="button" role="tab" data-key="${esc(m.key)}" title="${esc(m.desc)}">${esc(m.title)} <span class="muted">${m.shape[0]}×${m.shape[1]}</span></button>`).join("");
+  const size = cluster ? `${d.size} neurons` : `${d.size} dims`;
+  const chips = (arr) => (arr || []).map((s) => `<span class="chip">${esc(visTok(s))}</span>`).join("");
+  const mtabs = d.matrices.map((m) => `<button type="button" role="tab" data-key="${esc(m.key)}" title="${esc(m.desc)}">${esc(m.title.replace("Input weights · ", ""))} <span class="dim">${m.shape[0]}×${m.shape[1]}</span></button>`).join("");
+  const e = A.edges, edgeRows = (dir) => {
+    if (!e?.available) return "";
+    const k = e.k, ids = dir === "in" ? e.up : e.down, xs = dir === "in" ? e.up_x : e.down_x, out = [];
+    for (let j = 0; j < Math.min(k, 6); j++) { const o = ids[d.g * k + j], x = xs[d.g * k + j]; if (x > 0) out.push(`<li data-g="${o}"><span>${unitName(o)}</span><span class="bar"><i style="width:${clamp(x / (e.p99 * 1.4), 0.04, 1) * 100}%"></i></span><span class="x">${x.toFixed(1)}×</span></li>`); }
+    return out.join("") || `<li class="muted">none</li>`;
+  };
   $("#an-detail").innerHTML = `
-    <div class="an-head">
-      <div><div class="an-title">${esc(d.title)}</div>
-        <div class="facts"><span>${size}</span>${layerType ? `<span>${layerType}</span>` : ""}<span>‖output weights‖ <b>${num(d.norm)}</b></span>
-          <span title="Participation ratio of the squared singular values of the output weights">effective rank <b>${d.effective_rank}</b></span>
-          ${d.edited ? `<span class="badge serious">changed by an applied edit</span>` : ""}</div></div>
-      <div class="an-actions">
-        <button type="button" id="an-lesion" title="Adds an edit that zeroes this unit's output weights to the Workbench stack. Nothing changes until you apply the stack.">Lesion in Workbench</button>
+    <div class="d-hero">
+      <div class="d-kicker">${cluster ? "MLP neuron cluster" : "Attention head"}${layerType ? ` · ${layerType}` : ""}</div>
+      <div class="d-title">${esc(d.title)}</div>
+      <div class="d-stats">
+        <div><span>size</span><b>${size}</b></div>
+        <div><span>‖output‖</span><b>${num(d.norm)}</b></div>
+        <div title="Participation ratio of the squared singular values of the output weights"><span>eff. rank</span><b>${d.effective_rank}</b></div>
       </div>
+      ${d.edited ? `<div class="pill warn">Changed by an applied edit</div>` : ""}
+      <div class="d-actions">
+        <button type="button" id="an-lesion" class="btn" title="Adds an edit that zeroes this unit's output weights to the Workbench stack. Nothing changes until you apply the stack.">Lesion in Workbench</button>
+        <button type="button" id="an-focus" class="btn ghost">Center in graph</button>
+      </div>
+      <div class="wb-msg" id="an-lesion-msg" role="status"></div>
     </div>
-    <div class="wb-msg" id="an-lesion-msg" role="status"></div>
-    <h3>In this run</h3>
-    <div id="an-run-stats"></div>
-    <h3>What it writes</h3>
-    <div class="chips"><span class="lbl">pushes up</span>${chips(d.pos_now)}</div>
-    <div class="chips"><span class="lbl">pushes down</span>${chips(d.neg_now)}</div>
-    <p class="hint">${cluster ? "The cluster's sign-aligned mean output direction" : "The head's top output direction (largest singular vector)"} read through the final norm and the
-      unembedding, on the current weights. Its sign is arbitrary for a head, so "up" and "down" can swap. This is read from the weights, not measured on text.</p>
-    <h3>Weights</h3>
-    <div class="mtabs" role="tablist" aria-label="Weight matrix">${mtabs}</div>
-    ${heatSection()}
-    ${cluster ? `<h3>Neurons <span class="muted small">${d.neurons.length < d.n_neurons ? `largest ${d.neurons.length} of ${d.n_neurons} by output-weight norm` : `${d.n_neurons}`}</span></h3>
+    <section class="d-sec"><h4>In this run</h4><div id="an-run-stats"></div></section>
+    <section class="d-sec"><h4>What it writes</h4>
+      <div class="chips"><span class="lbl">pushes up</span>${chips(d.pos_now)}</div>
+      <div class="chips"><span class="lbl">pushes down</span>${chips(d.neg_now)}</div>
+      <p class="hint">${cluster ? "The cluster's sign-aligned mean output direction" : "The head's top output direction (its largest singular vector; the sign is arbitrary, so up and down can swap)"} read through the final norm and unembedding, on the current weights. Read from the weights, not measured on text.</p>
+    </section>
+    ${e?.available ? `<section class="d-sec"><h4>Connections <span class="dim">weight-based composition, × chance</span></h4>
+      <div class="conn"><div><div class="conn-h" style="--c:${C.edgeIn}">Reads from</div><ul class="conn-list">${edgeRows("in")}</ul></div>
+      <div><div class="conn-h" style="--c:${C.edgeOut}">Read by</div><ul class="conn-list">${edgeRows("out")}</ul></div></div></section>` : ""}
+    <section class="d-sec"><h4>Weights</h4>
+      <div class="mtabs" role="tablist" aria-label="Weight matrix">${mtabs}</div>
+      ${heatSection()}</section>
+    ${cluster ? `<section class="d-sec"><h4>Neurons <span class="dim">${d.neurons.length < d.n_neurons ? `largest ${d.neurons.length} of ${d.n_neurons}` : d.n_neurons}</span></h4>
     <div class="ntable-wrap"><table class="ntable"><thead><tr><th>neuron</th><th>‖w‖</th><th title="|cosine| between the neuron's output weights and the cluster direction">fit</th><th>pushes up</th></tr></thead><tbody>
     ${d.neurons.map((n) => `<tr data-row="${n.row}" title="Show this neuron's weights"><td>${n.n}</td><td>${num(n.norm)}</td><td>${n.cos.toFixed(2)}</td><td class="t">${n.top.map((s) => esc(visTok(s))).join(" ")}</td></tr>`).join("")}
-    </tbody></table></div>` : ""}`;
+    </tbody></table></div></section>` : ""}`;
   $("#an-lesion").onclick = lesion;
+  $("#an-focus").onclick = () => graph.flyTo(d.g, Math.max(graph.target.s, 2.6));
+  document.querySelectorAll("#an-detail .conn-list li[data-g]").forEach((li) => { li.onclick = () => { const g = Number(li.dataset.g); selectUnit(g); graph.flyTo(g, Math.max(graph.target.s, 1.6)); }; });
   document.querySelectorAll("#an-detail .mtabs button").forEach((b) => { b.onclick = () => openView({ unit: d.g, matrix: b.dataset.key }); });
   document.querySelectorAll("#an-detail .ntable tbody tr").forEach((tr) => {
     tr.onclick = () => { const r = Number(tr.dataset.row); openView({ unit: d.g, matrix: H.base?.matrix || "writes" }, [r, r + 1, 0, H.tile?.cols || 1e9], true); };
@@ -678,12 +639,12 @@ function renderDetail() {
 function heatSection() {
   return `<p class="hint" id="an-view-desc"></p>
     <div class="heat-tools">
-      <label>Bins show <select id="an-heat-mode" aria-label="What each bin shows when it holds many weights">
-        <option value="auto">RMS (signed value when 1 weight per bin)</option><option value="mean">mean</option><option value="absmax">largest magnitude</option></select></label>
-      <button type="button" id="an-zoom-out" disabled>Zoom out</button>
-      <button type="button" id="an-zoom-reset" disabled>Reset</button>
-      <span class="crumb" id="an-crumb"></span>
+      <select id="an-heat-mode" aria-label="What each bin shows when it holds many weights">
+        <option value="auto">RMS per bin</option><option value="mean">mean per bin</option><option value="absmax">largest magnitude</option></select>
+      <button type="button" class="btn sm" id="an-zoom-out" disabled>Zoom out</button>
+      <button type="button" class="btn sm" id="an-zoom-reset" disabled>Reset</button>
     </div>
+    <div class="crumb" id="an-crumb"></div>
     <div class="heat-wrap" id="an-heat-wrap"><canvas id="an-heat" aria-label="Weight heatmap; drag to zoom into a region"></canvas><div class="tooltip" id="an-heat-tip" hidden></div></div>
     <div class="legend" id="an-heat-legend"></div>
     <div class="mini-charts"><div id="an-hist"></div><div id="an-spec"></div></div>
@@ -709,10 +670,9 @@ function renderRunStats() {
     const i = viewIndex(t), part = (a, b) => A.view.slice(Math.max(0, a), Math.max(0, b)).map((u) => esc(visTok(A.tok[u].tx))).join("");
     return `${part(i - 6, i)}<b>${esc(visTok(A.tok[t].tx))}</b>${part(i + 1, i + 4)}`;
   };
-  box.innerHTML = `<div class="facts"><span>average ${A.kind[g] === 0 ? "write norm" : "write mass"} <b>${num(sumV / Math.max(1, scored.length))}</b></span><span>peak <b>${num(peak)}</b></span>
-      <span>hit (≥ ${HIT_Z}σ) at <b>${hits}</b> of ${scored.length} tokens</span></div>
-    <ul class="toplist">${picked.map(([z, t]) => `<li data-t="${t}"><span class="muted">t${t}</span><span class="ctx">${ctx(t)}</span><span>${z >= 0 ? "+" : ""}${z.toFixed(1)}σ</span></li>`).join("")}</ul>
-    <p class="hint">The trace under the map now shows this unit; orange marks are its hits. Click a row to jump there.</p>`;
+  box.innerHTML = `<div class="d-stats small"><div><span>average</span><b>${num(sumV / Math.max(1, scored.length))}</b></div><div><span>peak</span><b>${num(peak)}</b></div>
+      <div><span>hit at</span><b>${hits} / ${scored.length}</b></div></div>
+    <ul class="toplist">${picked.map(([z, t]) => `<li data-t="${t}"><span class="dim">t${t}</span><span class="ctx">${ctx(t)}</span><span class="z">${z >= 0 ? "+" : ""}${z.toFixed(1)}σ</span></li>`).join("")}</ul>`;
   box.querySelectorAll("li[data-t]").forEach((li) => { li.onclick = () => { setFollow(false); stopPlay(); setCursor(Number(li.dataset.t), "jump"); }; });
 }
 
@@ -727,33 +687,27 @@ async function lesion(ev) {
   try {
     const e = await post(`/brainscan/anatomy/units/${g}/lesion`, { factor: 0 });
     msg.className = "wb-msg ok";
-    msg.innerHTML = `Added “${esc(e.summary)}” to the Workbench stack. Apply it in the Workbench tab, then compare or record with it; recordings made while it is applied are tagged.`;
+    msg.innerHTML = `Added “${esc(e.summary)}” to the Workbench stack. Apply it there; recordings made while it is applied are tagged.`;
   } catch (err) { msg.className = "wb-msg error"; msg.textContent = err.message; }
   ev.target.disabled = false;
 }
 
-// ---------------------------------------------------------------- parameter browser
-async function loadParams() {
-  if (A.params) return;
-  try { A.params = await api("/brainscan/anatomy/params"); } catch (err) { $("#an-param-list").innerHTML = `<li>${esc(err.message)}</li>`; return; }
-  renderParams();
-}
-function renderParams() {
-  const q = $("#an-param-filter").value.trim().toLowerCase();
-  const hits = (A.params || []).filter((p) => !q || p.name.toLowerCase().includes(q));
-  $("#an-param-list").innerHTML = hits.slice(0, 200).map((p) => `<li data-name="${esc(p.name)}"><span>${esc(p.name)}</span><span class="muted">${p.shape.join("×")}</span></li>`).join("") +
-    (hits.length > 200 ? `<li class="muted">${hits.length - 200} more; narrow the filter</li>` : "") + (hits.length ? "" : `<li class="muted">No match</li>`);
-  $("#an-param-list").querySelectorAll("li[data-name]").forEach((li) => { li.onclick = () => openParam(li.dataset.name); });
-}
 function openParam(name) {
-  A.detailMode = "param"; A.selected = null; A.detail = null; schedule();
+  A.detailMode = "param"; A.selected = null; A.detail = null; pushState(); renderLegend(); schedule();
+  openDrawer(true);
   const p = (A.params || []).find((x) => x.name === name);
-  $("#an-unit-where").textContent = "parameter";
-  $("#an-detail").innerHTML = `<div class="an-head"><div><div class="an-title mono">${esc(name)}</div>
-    <div class="facts"><span>${p ? p.shape.join(" × ") : ""}</span><span>${p ? `${p.numel.toLocaleString()} weights` : ""}</span><span>${p ? esc(p.dtype) : ""}</span></div></div></div>
-    <h3>Weights</h3>${heatSection()}`;
+  $("#an-unit-where").textContent = "Parameter";
+  $("#an-detail").innerHTML = `<div class="d-hero"><div class="d-kicker">Parameter</div><div class="d-title mono">${esc(name)}</div>
+    ${p ? `<div class="d-stats"><div><span>shape</span><b>${p.shape.join(" × ")}</b></div><div><span>weights</span><b>${p.numel.toLocaleString()}</b></div><div><span>dtype</span><b>${esc(p.dtype)}</b></div></div>` : ""}</div>
+    <section class="d-sec"><h4>Weights</h4>${heatSection()}</section>`;
   wireHeat();
   openView({ param: name });
+}
+
+async function openEnd(which) {
+  await loadParams();
+  const name = which === "embed" ? A.atlas.embed?.name : A.atlas.unembed?.name;
+  if (name) openParam(name);
 }
 
 // ---------------------------------------------------------------- heatmap of weights
@@ -767,7 +721,7 @@ function wireHeat() {
   cv.onpointermove = (ev) => {
     const p = heatPoint(ev);
     if (H.drag) { H.drag.b = p || H.drag.b; drawHeat(); return; }
-    heatTip(p, ev);
+    heatTip(p);
   };
   cv.onpointerleave = () => { $("#an-heat-tip").hidden = true; };
   cv.onpointerup = () => {
@@ -829,11 +783,11 @@ async function loadTile(win) {
   } catch (err) { $("#an-crumb").textContent = err.message; }
 }
 
-const HEAT = { left: 34, bottom: 34, top: 4 };
+const HEAT = { left: 30, bottom: 32, top: 2 };
 function heatGeometry() {
   const t = H.tile, cv = $("#an-heat"), W = cv.clientWidth;
-  const plotW = W - HEAT.left - 4;
-  const rowsShown = t.h, plotH = clamp(rowsShown * Math.max(1, Math.floor(plotW / Math.max(t.w, 1))), 120, 320);
+  const plotW = W - HEAT.left - 2;
+  const plotH = clamp(t.h * Math.max(1, Math.floor(plotW / Math.max(t.w, 1))), 110, 300);
   return { W, plotW, plotH, height: HEAT.top + plotH + HEAT.bottom, x0: HEAT.left, y0: HEAT.top, cw: plotW / t.w, rh: plotH / t.h };
 }
 
@@ -848,7 +802,7 @@ function heatPoint(ev) {
 function drawHeat() {
   const t = H.tile, cv = $("#an-heat"); if (!t || !cv) return;
   const g = heatGeometry(), { ctx, W } = sizeCanvas(cv, g.height);
-  ctx.fillStyle = C.surface; ctx.fillRect(0, 0, W, g.height);
+  ctx.clearRect(0, 0, W, g.height);
   // the weights, one pixel per bin, scaled up without smoothing: RMS on the sequential ramp, signed
   // values on a diverging one with zero at the surface color
   const img = new ImageData(t.w, t.h), px = img.data, signed = t.mode !== "rms", inv = 1 / (H.scale - H.lo);
@@ -859,23 +813,29 @@ function drawHeat() {
   }
   const off = new OffscreenCanvas(t.w, t.h); off.getContext("2d").putImageData(img, 0, 0);
   ctx.imageSmoothingEnabled = false;
-  ctx.drawImage(off, g.x0, g.y0, g.plotW, g.plotH);
-  ctx.strokeStyle = C.axis; ctx.lineWidth = 1; ctx.strokeRect(g.x0 - 0.5, g.y0 - 0.5, g.plotW + 1, g.plotH + 1);
+  ctx.save(); roundRectPath(ctx, g.x0, g.y0, g.plotW, g.plotH, 8); ctx.clip();
+  ctx.drawImage(off, g.x0, g.y0, g.plotW, g.plotH); ctx.restore();
+  ctx.strokeStyle = C.axis; ctx.lineWidth = 1; roundRectPath(ctx, g.x0 - 0.5, g.y0 - 0.5, g.plotW + 1, g.plotH + 1, 8); ctx.stroke();
   // RMS of each row bin (left) and column bin (below): outlier rows and residual dims stand out
   const rmax = Math.max(...t.row_rms, 1e-12), cmax = Math.max(...t.col_rms, 1e-12);
-  ctx.fillStyle = C.s1;
+  ctx.fillStyle = C.edgeIn;
   t.row_rms.forEach((v, i) => { const w = (v / rmax) * (HEAT.left - 8); ctx.fillRect(HEAT.left - 4 - w, g.y0 + i * g.rh, w, Math.max(g.rh - (g.rh > 3 ? 0.5 : 0), 0.5)); });
-  const cy = g.y0 + g.plotH + 4, ch = 18;
-  t.col_rms.forEach((v, j) => { const h = (v / cmax) * ch; ctx.fillRect(g.x0 + j * g.cw, cy + ch - h, Math.max(g.cw - (g.cw > 3 ? 0.5 : 0), 0.5), h); });
-  ctx.fillStyle = C.muted; ctx.font = "10px system-ui, sans-serif"; ctx.textBaseline = "top"; ctx.textAlign = "left";
+  const cy = g.y0 + g.plotH + 4, ch = 16;
+  ctx.fillStyle = C.edgeOut;
+  t.col_rms.forEach((v, j) => { const hh = (v / cmax) * ch; ctx.fillRect(g.x0 + j * g.cw, cy + ch - hh, Math.max(g.cw - (g.cw > 3 ? 0.5 : 0), 0.5), hh); });
+  ctx.fillStyle = C.muted; ctx.font = "10px Inter, system-ui, sans-serif"; ctx.textBaseline = "top"; ctx.textAlign = "left";
   ctx.fillText(`${t.cols_label} ${t.window[2]}–${t.window[3] - 1} · RMS per column`, g.x0, cy + ch + 2);
-  // drag rectangle
   if (H.drag && H.drag.a && H.drag.b) {
     const a = H.drag.a, b = H.drag.b;
     const x = g.x0 + Math.min(a.j, b.j) * g.cw, y = g.y0 + Math.min(a.i, b.i) * g.rh;
-    ctx.strokeStyle = C.focus; ctx.lineWidth = 2;
+    ctx.strokeStyle = C.selectRing; ctx.lineWidth = 2;
     ctx.strokeRect(x, y, (Math.abs(a.j - b.j) + 1) * g.cw, (Math.abs(a.i - b.i) + 1) * g.rh);
   }
+}
+
+function roundRectPath(ctx, x, y, w, h, r) {
+  ctx.beginPath(); ctx.moveTo(x + r, y); ctx.arcTo(x + w, y, x + w, y + h, r); ctx.arcTo(x + w, y + h, x, y + h, r);
+  ctx.arcTo(x, y + h, x, y, r); ctx.arcTo(x, y, x + w, y, r); ctx.closePath();
 }
 
 function binRange(t, i, j) {
@@ -889,7 +849,7 @@ function rowName(r) {
   return `${H.tile.rows_label === "head dims" ? "head dim" : "row"} ${r}`;
 }
 
-function heatTip(p, ev) {
+function heatTip(p) {
   const tip = $("#an-heat-tip");
   if (!p) { tip.hidden = true; return; }
   const t = H.tile, b = binRange(t, p.i, p.j), v = H.vals[p.i * t.w + p.j];
@@ -907,47 +867,123 @@ function renderHeatInfo() {
   $("#an-crumb").textContent = `${t.rows_label} ${r0}–${r1 - 1} × ${t.cols_label} ${c0}–${c1 - 1}` + (t.exact ? " · one weight per pixel" : ` · ${t.bh}×${t.bw} weights per bin`);
   const grad = t.mode === "rms" ? `linear-gradient(90deg, ${C.rampStops.join(",")})` : `linear-gradient(90deg, rgb(${C.neg}), rgb(${C.mid}), rgb(${C.pos}))`;
   $("#an-heat-legend").innerHTML = `<span class="item"><span class="grad" style="background:${grad}"></span>${t.mode === "rms" ? `${num(H.lo, 4)} → ${num(H.scale, 4)}` : `−${num(H.scale, 4)} → +${num(H.scale, 4)}`}
-    (${t.mode === "value" ? "each weight" : t.mode === "rms" ? "RMS per bin" : t.mode === "absmax" ? "largest magnitude per bin" : "mean per bin"};
-    ${t.mode === "rms" ? "0.5th to 99.5th percentile" : "99.5th percentile of |value|"} of this view, values outside saturate)</span>`;
-  $("#an-stats").innerHTML = `<span>${t.rows} × ${t.cols} = <b>${s.n.toLocaleString()}</b> weights</span><span>‖W‖ <b>${num(s.norm)}</b></span>
+    <span class="dim">${t.mode === "value" ? "each weight" : t.mode === "rms" ? "RMS per bin" : t.mode === "absmax" ? "largest magnitude per bin" : "mean per bin"},
+    ${t.mode === "rms" ? "0.5th–99.5th percentile" : "99.5th percentile of |value|"}; values outside saturate</span></span>`;
+  $("#an-stats").innerHTML = `<span><b>${s.n.toLocaleString()}</b> weights</span><span>‖W‖ <b>${num(s.norm)}</b></span>
     <span>mean <b>${num(s.mean, 5)}</b></span><span>std <b>${num(s.std, 5)}</b></span><span>|max| <b>${num(s.absmax, 4)}</b></span>${s.zeros ? `<span>zeros <b>${s.zeros.toLocaleString()}</b></span>` : ""}`;
   $("#an-hist").innerHTML = histogramSvg(s);
   $("#an-spec").innerHTML = A.detailMode === "unit" && A.detail ? spectrumSvg(A.detail) : "";
 }
 
 function histogramSvg(s) {
-  const w = 260, h = 74, n = s.hist.length, max = Math.max(...s.hist, 1), bw = (w - 8) / n;
-  const bars = s.hist.map((c, i) => { const bh = c ? Math.max(1, (Math.log1p(c) / Math.log1p(max)) * (h - 26)) : 0; return `<rect x="${4 + i * bw}" y="${h - 16 - bh}" width="${Math.max(bw - 0.5, 0.5)}" height="${bh}" fill="${C.s1}"/>`; }).join("");
+  const w = 190, h = 70, n = s.hist.length, max = Math.max(...s.hist, 1), bw = (w - 8) / n;
+  const bars = s.hist.map((c, i) => { const bh = c ? Math.max(1, (Math.log1p(c) / Math.log1p(max)) * (h - 26)) : 0; return `<rect x="${4 + i * bw}" y="${h - 16 - bh}" width="${Math.max(bw - 0.5, 0.5)}" height="${bh}" rx="0.5" fill="${C.edgeIn}"/>`; }).join("");
   return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="Histogram of all weight values in this view">
-    <text x="4" y="10" font-size="10" fill="${C.ink2}">value histogram (log counts)</text>${bars}
+    <text x="4" y="10" font-size="10" fill="${C.ink2}">values (log counts)</text>${bars}
     <line x1="${w / 2}" x2="${w / 2}" y1="14" y2="${h - 16}" stroke="${C.axis}" stroke-dasharray="2 2"/>
     <text x="4" y="${h - 3}" font-size="9" fill="${C.muted}">${num(s.range[0], 3)}</text><text x="${w - 4}" y="${h - 3}" font-size="9" fill="${C.muted}" text-anchor="end">${num(s.range[1], 3)}</text></svg>`;
 }
 
 function spectrumSvg(d) {
   const sv = d.spectrum || []; if (!sv.length) return "";
-  const w = 260, h = 74, max = sv[0] || 1, bw = (w - 8) / sv.length;
-  const bars = sv.map((v, i) => { const bh = Math.max(0.5, (v / max) * (h - 26)); return `<rect x="${4 + i * bw}" y="${h - 16 - bh}" width="${Math.max(bw - 0.5, 0.5)}" height="${bh}" fill="${C.s2}"/>`; }).join("");
+  const w = 190, h = 70, max = sv[0] || 1, bw = (w - 8) / sv.length;
+  const bars = sv.map((v, i) => { const bh = Math.max(0.5, (v / max) * (h - 26)); return `<rect x="${4 + i * bw}" y="${h - 16 - bh}" width="${Math.max(bw - 0.5, 0.5)}" height="${bh}" rx="0.5" fill="${C.edgeOut}"/>`; }).join("");
   return `<svg width="${w}" height="${h}" viewBox="0 0 ${w} ${h}" role="img" aria-label="Singular values of the output weights">
-    <text x="4" y="10" font-size="10" fill="${C.ink2}">singular values of the output weights</text>${bars}
-    <text x="4" y="${h - 3}" font-size="9" fill="${C.muted}">top ${sv.length} · effective rank ${d.effective_rank}</text></svg>`;
+    <text x="4" y="10" font-size="10" fill="${C.ink2}">singular values</text>${bars}
+    <text x="4" y="${h - 3}" font-size="9" fill="${C.muted}">top ${sv.length} · eff. rank ${d.effective_rank}</text></svg>`;
 }
+
+// ---------------------------------------------------------------- weight thumbnails on cards
+const thumbQueue = [], thumbPending = new Set();
+let thumbActive = 0;
+function needThumb(g, level) {
+  const key = `${g}:${level}`;
+  if (thumbPending.has(key)) return;
+  thumbPending.add(key); thumbQueue.push([g, level, key]);
+  pumpThumbs();
+}
+function pumpThumbs() {
+  while (thumbActive < 3 && thumbQueue.length) {
+    const [g, level, key] = thumbQueue.pop();  // newest first: what is on screen now
+    thumbActive++;
+    post("/brainscan/anatomy/tile", { unit: g, matrix: "writes", mode: "rms", h: level ? 48 : 16, w: level ? 160 : 56 })
+      .then(async (t) => {
+        const v = b64Halves(t.data), sorted = Array.from(v).sort((a, b) => a - b);
+        const lo = sorted[Math.floor(sorted.length * 0.01)], hi = sorted[Math.floor(sorted.length * 0.99)] || lo + 1e-6;
+        const img = new ImageData(t.w, t.h);
+        for (let k = 0; k < v.length; k++) { const c = C.ramp[Math.round(clamp((v[k] - lo) / (hi - lo), 0, 1) * 255)]; img.data.set([c[0], c[1], c[2], 255], 4 * k); }
+        graph.setThumb(key, await createImageBitmap(img));
+      })
+      .catch(() => {})
+      .finally(() => { thumbActive--; pumpThumbs(); });
+  }
+  if (thumbQueue.length > 40) { for (const [, , key] of thumbQueue.splice(0, thumbQueue.length - 40)) thumbPending.delete(key); }
+}
+
+// ---------------------------------------------------------------- jump-to palette (⌘K)
+async function loadParams() {
+  if (A.params) return;
+  try { A.params = await api("/brainscan/anatomy/params"); } catch { A.params = []; }
+}
+const P = { items: [], active: 0 };
+const bare = (s) => (s || "").replace(/^[\sĠ▁·]+/, "").toLowerCase();
+function openPalette() {
+  if (!A.atlas) return;
+  $("#gv-palette").hidden = false;
+  const q = $("#gv-q"); q.value = ""; q.focus();
+  loadParams().then(searchPalette);
+  searchPalette();
+}
+function closePalette() { $("#gv-palette").hidden = true; }
+function searchPalette() {
+  const q = $("#gv-q").value.trim().toLowerCase(), items = [];
+  const m = q.match(/^l?\s*(\d+)\s*[\s.:·-]?\s*(h|head|c|cluster)?\s*(\d+)?$/);
+  if (m && A.layers[Number(m[1])]) {
+    const l = A.layers[Number(m[1])], kind = m[2] ? m[2][0] : null, idx = m[3] != null ? Number(m[3]) : null;
+    for (let i = 0; i < l.heads + l.clusters && items.length < 10; i++) {
+      const g = l.offset + i, u = A.units[g], k = u.kind === "head" ? "h" : "c";
+      if ((kind && kind !== k) || (idx != null && u.i !== idx)) continue;
+      items.push({ type: "unit", g });
+    }
+  } else if (q) {
+    for (const u of A.units) {
+      if (items.length >= 10) break;
+      if ([...(u.pos || []), ...(u.neg || [])].some((s) => bare(s) === q || (q.length >= 3 && bare(s).startsWith(q)))) items.push({ type: "unit", g: u.g });
+    }
+  }
+  for (const p of A.params || []) {
+    if (items.length >= 18) break;
+    if (q && p.name.toLowerCase().includes(q)) items.push({ type: "param", name: p.name, shape: p.shape });
+  }
+  if (!q) items.push(...["embed", "unembed"].map((w) => ({ type: "end", end: w })));
+  P.items = items; P.active = 0;
+  renderPalette();
+}
+function renderPalette() {
+  $("#gv-results").innerHTML = P.items.map((it, i) => {
+    const on = i === P.active ? " class=\"on\"" : "";
+    if (it.type === "unit") { const u = A.units[it.g]; return `<li${on} data-i="${i}" role="option"><span class="kind">${u.kind === "head" ? "head" : "cluster"}</span><b>${unitName(it.g)}</b><span class="dim">${(u.pos || []).slice(0, 3).map((s) => esc(visTok(s))).join(" ")}</span></li>`; }
+    if (it.type === "param") return `<li${on} data-i="${i}" role="option"><span class="kind">param</span><b class="mono">${esc(it.name)}</b><span class="dim">${it.shape.join("×")}</span></li>`;
+    return `<li${on} data-i="${i}" role="option"><span class="kind">matrix</span><b>${it.end === "embed" ? "Token embedding" : "Unembedding"}</b><span class="dim">${(A.atlas[it.end]?.shape || []).join("×")}</span></li>`;
+  }).join("") || `<li class="none">No match. Try “L12 c7”, “L3 h5”, a token, or a parameter name.</li>`;
+  $("#gv-results").querySelectorAll("li[data-i]").forEach((li) => { li.onclick = () => choose(Number(li.dataset.i)); });
+}
+function choose(i) {
+  const it = P.items[i]; if (!it) return;
+  closePalette();
+  if (it.type === "unit") { selectUnit(it.g); graph.flyTo(it.g, Math.max(graph.target.s, 2.6)); }
+  else if (it.type === "param") openParam(it.name);
+  else openEnd(it.end);
+}
+
+// ---------------------------------------------------------------- icons
+const ICON = {
+  play: `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2.5v11l9-5.5z" fill="currentColor"/></svg>`,
+  pause: `<svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 2.5h3v11H4zM9 2.5h3v11H9z" fill="currentColor"/></svg>`,
+};
 
 // ---------------------------------------------------------------- input wiring
 function setupInput() {
-  const cv = $("#an-map");
-  cv.addEventListener("pointermove", (ev) => {
-    const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top, hit = mapHit(mx, my);
-    const g = hit && !hit.totals ? hit.g : null;
-    if (g !== A.hover) { A.hover = g; schedule(); }
-    showMapTip(hit, mx, my);
-  });
-  cv.addEventListener("pointerleave", () => { A.hover = null; $("#an-tip").hidden = true; schedule(); });
-  cv.addEventListener("click", (ev) => {
-    const r = cv.getBoundingClientRect(), hit = mapHit(ev.clientX - r.left, ev.clientY - r.top);
-    if (hit && !hit.totals) selectUnit(hit.g);
-  });
-
   const tr = $("#an-trace");
   let drag = null;
   tr.tabIndex = 0;
@@ -980,24 +1016,48 @@ function setupInput() {
     A.scrollX = anchor * A.colW - (mx - TG);
     schedule();
   }, { passive: false });
-  tr.addEventListener("keydown", (ev) => {
-    if (A.cursor == null || !["ArrowLeft", "ArrowRight"].includes(ev.key)) return;
-    ev.preventDefault();
-    const i = viewIndex(A.cursor) + (ev.key === "ArrowRight" ? 1 : -1);
-    if (i >= 0 && i < A.view.length) { setFollow(false); stopPlay(); setCursor(A.view[i], "step"); }
-  });
   $("#an-fit").onclick = () => { A.fit = true; schedule(); };
-  $("#an-mode").onchange = (ev) => { A.mode = ev.target.value; renderLegend(); renderReadout(); schedule(); };
-  $("#an-trail").onchange = (ev) => { A.trailOn = ev.target.checked; schedule(); };
-  $("#an-follow").onchange = (ev) => setFollow(ev.target.checked);
+  document.querySelectorAll("#gv-mode [data-mode]").forEach((b) => { b.onclick = () => { A.mode = b.dataset.mode; setSeg("#gv-mode", "mode", A.mode); pushState(); renderLegend(); renderReadout(); }; });
+  document.querySelectorAll("#gv-edges [data-edges]").forEach((b) => { b.onclick = () => { A.edgeMode = b.dataset.edges; setSeg("#gv-edges", "edges", A.edgeMode); pushState(); renderLegend(); }; });
+  $("#gv-trail").onclick = () => { A.trailOn = !A.trailOn; $("#gv-trail").setAttribute("aria-pressed", String(A.trailOn)); pushState(); };
+  $("#gv-fit").onclick = () => graph.fit();
+  $("#gv-zoom-in").onclick = () => graph.zoomAt(graph.W / 2, graph.H / 2, 1.6);
+  $("#gv-zoom-out").onclick = () => graph.zoomAt(graph.W / 2, graph.H / 2, 1 / 1.6);
+  $("#gv-search").onclick = openPalette;
+  $("#gv-close").onclick = () => selectUnit(null);
+  $("#an-follow").onclick = () => setFollow(!A.follow);
   $("#an-play").onclick = togglePlay;
-  $("#an-params").addEventListener("toggle", (ev) => { if (ev.target.open) loadParams(); });
-  $("#an-param-filter").oninput = renderParams;
+  $("#an-prev").onclick = () => step(-1);
+  $("#an-next").onclick = () => step(1);
+  $("#gv-q").addEventListener("input", searchPalette);
+  $("#gv-q").addEventListener("keydown", (ev) => {
+    if (ev.key === "ArrowDown") { P.active = Math.min(P.items.length - 1, P.active + 1); renderPalette(); ev.preventDefault(); }
+    if (ev.key === "ArrowUp") { P.active = Math.max(0, P.active - 1); renderPalette(); ev.preventDefault(); }
+    if (ev.key === "Enter") { choose(P.active); ev.preventDefault(); }
+    if (ev.key === "Escape") closePalette();
+  });
+  $("#gv-palette").addEventListener("pointerdown", (ev) => { if (ev.target.id === "gv-palette") closePalette(); });
+  document.addEventListener("keydown", (ev) => {
+    if (!A.visible) return;
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
+    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); openPalette(); return; }
+    if (typing) return;
+    if (ev.key === "/") { ev.preventDefault(); openPalette(); }
+    else if (ev.key === "Escape") { if (!$("#gv-palette").hidden) closePalette(); else selectUnit(null); }
+    else if (ev.key === "f" || ev.key === "F") graph.fit();
+    else if (ev.key === "+" || ev.key === "=") graph.zoomAt(graph.W / 2, graph.H / 2, 1.6);
+    else if (ev.key === "-") graph.zoomAt(graph.W / 2, graph.H / 2, 1 / 1.6);
+    else if (ev.key === " ") { ev.preventDefault(); togglePlay(); }
+    else if (ev.key === "ArrowLeft") step(-1);
+    else if (ev.key === "ArrowRight") step(1);
+  });
   new ResizeObserver(() => { schedule(); if (H.tile && $("#an-heat")) drawHeat(); }).observe($("#view-weights"));
+  setInterval(() => { if (A.visible) { $("#an-follow").classList.toggle("streaming", isLive()); graph.setState({ live: isLive() }); } }, 1000);
 }
 
 async function activate() {
   readColors();
+  graph.setState({ visible: true });
   if (!A.atlas) {
     schedule();
     const ok = await loadAtlas();
@@ -1006,18 +1066,29 @@ async function activate() {
   const id = $("#run-select").value || null;
   if (id !== A.runId) await openRun(id);
   else { renderReadout(); schedule(); }
+  graph.invalidate();
 }
 
 function boot() {
   readColors();
+  graph = new WeightGraph($("#gv-canvas"), $("#gv-minimap"), {
+    onSelect: (g) => selectUnit(g),
+    onHover: (hit, mx, my) => graphTip(hit, mx, my),
+    onEnd: (which) => openEnd(which),
+    needThumb,
+    onFrame: updateZoomLabel,
+  });
+  graph.setColors(C);
   setupInput();
+  stopPlay();
   document.addEventListener("brainscan:view", (ev) => {
     A.visible = ev.detail === "weights";
+    graph.setState({ visible: A.visible });
     if (A.visible) activate(); else stopPlay();
   });
-  // A hidden tab catches up in activate(), so switching runs in the Scanner costs nothing here.
+  // A hidden view catches up in activate(), so switching runs in the Scanner costs nothing here.
   document.addEventListener("brainscan:run", (ev) => { if (A.atlas && A.visible && ev.detail !== A.runId) openRun(ev.detail); });
-  const recolor = () => { readColors(); renderLegend(); schedule(); if (H.tile && $("#an-heat")) { drawHeat(); renderHeatInfo(); } };
+  const recolor = () => { readColors(); renderLegend(); schedule(); graph.thumbs.clear(); if (H.tile && $("#an-heat")) { drawHeat(); renderHeatInfo(); } };
   $("#theme-toggle").addEventListener("click", recolor);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", recolor);
   connect();
