@@ -123,6 +123,7 @@
           <button type="button" data-mode="rel" aria-pressed="true" title="Each unit against its own average over the run">Activity</button>
           <button type="button" data-mode="abs" aria-pressed="false" title="Activity on one log scale for all units">Absolute</button>
           <button type="button" data-mode="norm" aria-pressed="false" title="Size of each unit's output weights; no run needed">Weights</button>
+          <button type="button" data-mode="attr" aria-pressed="false" title="What each unit did to the next token: pushed it up or pulled it down (A)">Attribution</button>
         </div>
         <span class="sep" aria-hidden="true"></span>
         <div class="seg" id="gv-edges" role="group" aria-label="Edges">
@@ -132,7 +133,39 @@
         </div>
         <span class="sep" aria-hidden="true"></span>
         <button type="button" class="tbtn" id="gv-trail" aria-pressed="true" title="Outline units that were hit in the last few tokens">Trail</button>
+        <span class="sep" aria-hidden="true"></span>
+        <button type="button" class="tbtn" id="gv-paths-btn" aria-pressed="false" title="Trace the strongest routes through the graph (P)">
+          <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="3" cy="3.5" r="1.6"/><circle cx="13" cy="12.5" r="1.6"/><path d="M4.6 3.5c4.2 0 2.6 9 6.8 9"/></g></svg>
+          Paths</button>
+        <span class="selchip" id="gv-selchip" hidden>
+          <span id="gv-selcount"></span>
+          <button type="button" class="link" id="gv-selpaths" title="Find paths from the selected units">paths</button>
+          <button type="button" class="tbtn icon" id="gv-selclear" aria-label="Clear selection (Esc)">✕</button>
+        </span>
       </div>
+
+      <aside class="gv-paths glass" id="gv-paths" hidden aria-labelledby="gv-paths-title">
+        <header class="drawer-head">
+          <span class="eyebrow" id="gv-paths-title">Path explorer</span>
+          <button type="button" class="tbtn icon" id="gv-paths-close" aria-label="Close path explorer">✕</button>
+        </header>
+        <div class="paths-body">
+          <div class="seg wide" id="gv-path-mode" role="group" aria-label="Path search">
+            <button type="button" data-pm="down" aria-pressed="true" title="Routes out of the selection">Downstream</button>
+            <button type="button" data-pm="up" aria-pressed="false" title="Routes into the selection">Upstream</button>
+            <button type="button" data-pm="between" aria-pressed="false" title="Routes from one selected unit to another">Between</button>
+            <button type="button" data-pm="explain" aria-pressed="false" title="The circuit behind the next token">Next token</button>
+          </div>
+          <p class="hint" id="gv-path-hint"></p>
+          <div class="path-knobs">
+            <label>Hops <input type="range" id="gv-path-hops" min="1" max="6" step="1"><b id="gv-path-hops-v"></b></label>
+            <label>Branches <input type="range" id="gv-path-branch" min="1" max="8" step="1"><b id="gv-path-branch-v"></b></label>
+            <label class="check" title="Favor units that were active at the current token"><input type="checkbox" id="gv-path-activity"> Weight by activity at this token</label>
+          </div>
+          <div class="path-head" id="gv-path-head"></div>
+          <ul class="path-list" id="gv-path-list"></ul>
+        </div>
+      </aside>
 
       <div class="gv-zoom glass" role="group" aria-label="Zoom">
         <button type="button" class="tbtn icon" id="gv-zoom-out" aria-label="Zoom out">−</button>

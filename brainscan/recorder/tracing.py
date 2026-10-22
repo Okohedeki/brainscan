@@ -310,9 +310,13 @@ class Tracer:
         cn = self._neuron_contrib(lm, cap.mlp_in[lm.index], self._direction(cap, tid))[idx]
         wn = lm.wnorm[idx] if lm.wnorm is not None else lm.down.weight.float()[:, idx].norm(dim=0)
         rows = sorted(zip(idx.tolist(), a.tolist(), cn.tolist(), wn.tolist()), key=lambda r: -abs(r[2]))
+        # Gated MLP activations are almost never exactly zero, so "active" counts the neurons that
+        # carry 90% of the cluster's write (sum of |activation| x output-weight norm).
+        write = torch.sort(a.float().abs() * wn.float(), descending=True).values.cumsum(0)
+        carry = int((write < 0.9 * write[-1]).sum()) + 1 if len(write) and write[-1] > 0 else 0
         return {"unit": int(g), "layer": lm.index, "cluster": i, "token": self.s.token_str(cap.ids[-1]),
                 "target": {"id": tid, "text": self.s.token_str(tid)},
-                "contrib": round(float(cn.sum()), 4), "active": int((a.abs() > 1e-3).sum()),
+                "contrib": round(float(cn.sum()), 4), "active": carry,
                 "neurons": [{"n": n, "act": round(x, 4), "write": round(abs(x) * w, 4), "contrib": round(c, 4)}
                             for n, x, c, w in rows]}
 

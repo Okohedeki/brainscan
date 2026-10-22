@@ -86,6 +86,11 @@ def test_neurons_add_up_to_their_cluster(traced):
     assert nn["contrib"] == pytest.approx(out["contrib"][g], abs=1e-3)
     assert len(nn["neurons"]) == an.units[g]["size"]
     assert abs(nn["neurons"][0]["contrib"]) >= abs(nn["neurons"][-1]["contrib"])  # sorted by impact
+    # "active" is the fewest neurons carrying 90% of the cluster's write.
+    writes = sorted((n["write"] for n in nn["neurons"]), reverse=True)
+    assert 1 <= nn["active"] <= len(writes)
+    assert sum(writes[:nn["active"]]) >= 0.9 * sum(writes) - 1e-3
+    assert nn["active"] == 1 or sum(writes[:nn["active"] - 1]) < 0.9 * sum(writes) + 1e-3
     with pytest.raises(ValueError):
         rec.tracer.neurons(run.id, t, 0)  # unit 0 is a head
 

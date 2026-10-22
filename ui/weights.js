@@ -4,6 +4,7 @@
 // run token by token; clicking a node opens its weights, what it writes, and when it was most active.
 
 import { WeightGraph } from "/ui/graph.js";
+import { explainPaths, findPaths } from "/ui/paths.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -37,6 +38,13 @@ const A = {
   cursor: null, follow: true, playing: null, selected: null, trail: null, trailOn: true, mode: "rel", edgeMode: "circuit",
   colW: 4, scrollX: 0, fit: true, plotW: 600, traceHover: null,
   visible: false, raf: 0, detail: null, detailMode: null, statsTimer: 0, params: null,
+  // tracing
+  sel: new Set(),                    // multi-selected units
+  attr: null, attrN: null,           // per-unit attribution of the next token at the cursor (raw, scaled to [-1, 1])
+  attrInfo: null, attrTarget: null, attrSeq: 0, attrTimer: 0,
+  paths: [], pathMode: "down", pathHops: 3, pathBranch: 4, pathActivity: true, pathsOpen: false,
+  expanded: new Map(),               // cluster g -> Float32Array neuron activity in [-1, 1] at the cursor
+  tokenTimer: 0, tokenSeq: 0,
 };
 const H = { base: null, tile: null, vals: null, stack: [], mode: "auto", drag: null, lo: 0, scale: 1, seq: 0 };
 let graph = null;
@@ -69,10 +77,14 @@ function readColors() {
     edgeIn: v("--edge-in"), edgeOut: v("--edge-out"), edgeCircuit: v("--edge-circuit"), edgeCircuitHot: v("--edge-circuit-hot"),
     glow: v("--glow"), chipBg: v("--chip-bg"), cardBg: v("--card-bg"), headRing: v("--head-ring"), trail: v("--trail"),
     edited: v("--serious"), hoverRing: v("--hover-ring"), selectRing: v("--select-ring"), selectHalo: v("--select-halo"),
+    path: v("--path"), pathFocus: v("--path-focus"), multiSelect: v("--multi-select"), multiSelectFill: v("--multi-select-fill"),
   };
   C.ramp = ramp(C.rampStops);
   C.graphStops = list("--graph-ramp");
   C.graphRamp = ramp(C.graphStops).map(([r, g, b]) => `rgb(${r},${g},${b})`);
+  // Attribution: pushes the next token down (cool) -> no effect (idle node color) -> pushes it up (warm).
+  C.attrStops = [v("--div-neg"), C.graphStops[0], v("--div-pos")];
+  C.attrRamp = ramp(C.attrStops).map(([r, g, b]) => `rgb(${r},${g},${b})`);
   C.div = Array.from({ length: 256 }, (_, i) => {
     const x = i / 127.5 - 1, end = x < 0 ? C.neg : C.pos, f = Math.abs(x);
     return [0, 1, 2].map((k) => Math.round(C.mid[k] + (end[k] - C.mid[k]) * f));
@@ -142,6 +154,9 @@ function resetRunData() {
   A.sum = new Float64Array(A.U); A.sq = new Float64Array(A.U); A.hist = new Float64Array(256);
   A.hitCache = new Map(); A.hitBase = 0; A.cursor = null; A.skipped = 0; A.statN = -1; A.meta = null;
   if (A.trail) A.trail.fill(0);
+  // Token-level tracing belongs to the old run; the selection and path settings carry over.
+  A.attr = null; A.attrN = null; A.attrInfo = null; A.attrTarget = null; A.attrSeq++; clearTimeout(A.attrTimer);
+  A.expanded.clear();
 }
 
 function ensureRows(n) {
@@ -294,6 +309,11 @@ function computeHeat() {
   const h = A.heat; if (!h) return;
   const row = rowOf(A.cursor);
   if (A.mode === "norm") { h.set(A.normT); return; }
+  if (A.mode === "attr") {  // glow by how strongly a unit moved the next token either way
+    if (A.attrN && A.attrInfo?.t === A.cursor) for (let g = 0; g < A.U; g++) h[g] = Math.abs(A.attrN[g]);
+    else h.fill(NaN);
+    return;
+  }
   if (row == null) { h.fill(NaN); return; }
   for (let g = 0; g < A.U; g++) {
     const c = codeAt(row, g);
@@ -301,11 +321,19 @@ function computeHeat() {
   }
 }
 
+/** Activity of a unit at the cursor in [0, 1] (vs. its run average), whatever the color mode shows. */
+function activityAt(g) {
+  const row = rowOf(A.cursor);
+  return row == null ? 0 : clamp(zOf(g, codeAt(row, g)) / Z_FULL, 0, 1);
+}
+
 function pushState() {
   if (!graph || !A.atlas) return;
   computeHeat();
-  graph.setState({ heat: A.heat, trail: A.trail, trailOn: A.trailOn, mode: A.mode, normT: A.normT, selected: A.selected,
-    edited: A.edited, edgeMode: A.edgeMode, live: isLive(), visible: A.visible });
+  const signed = A.mode === "attr" && A.attrN && A.attrInfo?.t === A.cursor ? A.attrN : null;
+  graph.setState({ heat: A.heat, trail: A.trail, trailOn: A.trailOn && A.mode !== "attr", mode: A.mode, normT: A.normT,
+    selected: A.selected, edited: A.edited, edgeMode: A.edgeMode, live: isLive(), visible: A.visible,
+    signed, selection: A.sel, paths: A.paths, expanded: A.expanded });
 }
 const isLive = () => A.follow && performance.now() - A.lastAnat < 2500;
 
@@ -323,9 +351,11 @@ function setCursor(t, how = "jump") {
     const i = viewIndex(t), x = i * A.colW;
     if (x < A.scrollX || x > A.scrollX + A.plotW - A.colW) A.scrollX = x - A.plotW * 0.8;
   }
+  if (A.attrInfo?.t !== t) A.attrTarget = null;  // a new token explains its own next token by default
   pushState();
   renderReadout();
   schedule();
+  scheduleTokenWork();
 }
 
 function setFollow(on) {
@@ -338,6 +368,7 @@ function setFollow(on) {
 function stopPlay() {
   if (A.playing) { clearInterval(A.playing); A.playing = null; }
   const b = $("#an-play"); b.innerHTML = ICON.play; b.setAttribute("aria-label", "Replay the run");
+  scheduleTokenWork();  // tracing waits for replay to stop
 }
 
 function togglePlay() {
@@ -376,9 +407,301 @@ function renderReadout() {
     return;
   }
   const hits = hitCount(t);
-  el.innerHTML = `<span class="tok-chip">${esc(visTok(rec.tx))}</span><span class="meta">t${t} · ${esc(rec.r)}</span>` +
-    (hits == null ? `<span class="muted">no activity stored for this token</span>` : `<span class="hits"><b>${hits}</b> units hit</span>`);
+  let html = `<span class="tok-chip">${esc(visTok(rec.tx))}</span><span class="meta">t${t} · ${esc(rec.r)}</span>`;
+  if (A.mode !== "attr") {
+    html += hits == null ? `<span class="muted">no activity stored for this token</span>` : `<span class="hits"><b>${hits}</b> units hit</span>`;
+    html += `<button type="button" class="link" id="an-explain-btn" title="Color the graph by what each unit did to the next token">Explain next token</button>`;
+  } else {
+    const info = A.attrInfo;
+    if (A.playing) html += `<span class="muted">Pause to trace this token</span>`;
+    else if (!info || info.t !== t || info.loading) html += `<span class="muted">Tracing the next token…</span>`;
+    else if (info.busy) html += `<span class="muted">The model is generating; tracing when it pauses…</span>`;
+    else if (info.error) html += `<span class="warn-text">${esc(info.error)}</span>`;
+    else {
+      html += `<span class="arrow">→</span><span class="tok-chip target">${esc(visTok(info.target.text))}</span>
+        <span class="meta">p ${info.target.prob.toFixed(3)} · logit ${info.target.logit.toFixed(2)}</span>
+        <span class="alts">${info.alternatives.filter((a) => a.id !== info.target.id).slice(0, 4).map((a) =>
+          `<button type="button" class="alt" data-id="${a.id}" title="Explain this candidate instead (p ${a.prob.toFixed(3)})">${esc(visTok(a.text))}</button>`).join("")}</span>`;
+      if (!info.weights_match) html += `<span class="warn-text" title="Tracing uses the current weights">weights differ from the recording</span>`;
+    }
+  }
+  el.innerHTML = html;
+  $("#an-explain-btn")?.addEventListener("click", () => setMode("attr"));
+  el.querySelectorAll(".alt[data-id]").forEach((b) => { b.onclick = () => { A.attrTarget = b.dataset.id; loadExplain(); }; });
 }
+
+// ---------------------------------------------------------------- tracing: attribution, selection, paths
+function setMode(mode) {
+  A.mode = mode;
+  setSeg("#gv-mode", "mode", mode);
+  pushState(); renderLegend(); renderReadout();
+  if (mode === "attr") loadExplain();
+}
+
+/** Once the cursor settles: refresh the attribution, the open unit's token details and expanded clusters. */
+function scheduleTokenWork() {
+  clearTimeout(A.tokenTimer);
+  if (A.playing || A.cursor == null || !A.runId) return;
+  A.tokenTimer = setTimeout(() => {
+    if (A.mode === "attr") loadExplain();
+    if (A.detailMode === "unit" && A.selected != null) renderTokenSection();
+    refreshExpanded();
+    if (A.pathsOpen && (A.pathMode === "explain" || A.pathActivity)) runPathSearch(false);
+  }, 260);
+}
+
+const tokenUrl = (t) => `/brainscan/runs/${encodeURIComponent(A.runId)}/tokens/${t}`;
+const fetchExplain = (t, target) => api(`${tokenUrl(t)}/explain${target != null ? `?target=${encodeURIComponent(target)}` : ""}`);
+
+async function loadExplain() {
+  const t = A.cursor, seq = ++A.attrSeq, target = A.attrTarget;
+  clearTimeout(A.attrTimer);
+  if (t == null || !A.runId) return;
+  A.attrInfo = { loading: true, t };
+  renderReadout();
+  try {
+    const ex = await fetchExplain(t, target);
+    if (seq !== A.attrSeq) return;
+    A.attr = Float32Array.from(ex.contrib);
+    let m = 1e-9;
+    for (const x of A.attr) m = Math.max(m, Math.abs(x));
+    A.attrN = A.attr.map((x) => Math.sign(x) * Math.sqrt(Math.abs(x) / m));  // sqrt: mid-sized effects stay visible
+    A.attrInfo = { ...ex, t, max: m };
+  } catch (err) {
+    if (seq !== A.attrSeq) return;
+    A.attrInfo = err.status === 409 ? { busy: true, t } : { error: err.message, t };
+    if (err.status === 409) A.attrTimer = setTimeout(() => { if (A.cursor === t) loadExplain(); }, 1500);
+  }
+  pushState(); renderReadout(); renderLegend();
+  if (A.pathsOpen && A.pathMode === "explain") runPathSearch(false);
+}
+
+const shortName = (g) => { const u = A.units[g]; return `L${u.layer} ${u.kind === "head" ? "h" : "c"}${u.i}`; };
+
+function toggleSelect(g) { if (A.sel.has(g)) A.sel.delete(g); else A.sel.add(g); afterSelection(); }
+function boxSelect(units, remove) { for (const g of units) { if (remove) A.sel.delete(g); else A.sel.add(g); } afterSelection(); }
+function clearSelection() { A.sel.clear(); afterSelection(); }
+function afterSelection() {
+  pushState(); renderSelChip();
+  if (A.pathsOpen && A.pathMode !== "explain") runPathSearch(false);
+}
+function renderSelChip() {
+  const n = A.sel.size;
+  $("#gv-selchip").hidden = !n;
+  if (n) $("#gv-selcount").textContent = `${n} selected`;
+}
+
+const PATH_MODES = {
+  down: "Strongest routes out of the selected units into later layers. Each hop is a unit whose inputs read the previous unit's outputs.",
+  up: "Strongest routes into the selected units from earlier layers: what feeds them.",
+  between: "Routes that start at one selected unit and end at another, through any units in between.",
+  explain: "The circuit behind the next token: the units that pushed it up the most, and the active units feeding them.",
+};
+
+function openPaths(mode) {
+  A.pathsOpen = true;
+  if (mode) A.pathMode = mode;
+  else if (A.mode === "attr" && !pathSources().length) A.pathMode = "explain";  // nothing selected: explain the token
+  $("#gv-paths").hidden = false;
+  $("#gv-stage").classList.add("paths-open");
+  $("#gv-paths-btn").setAttribute("aria-pressed", "true");
+  renderPathControls();
+  runPathSearch(true);
+}
+function closePaths() {
+  A.pathsOpen = false; A.paths = [];
+  $("#gv-paths").hidden = true;
+  $("#gv-stage").classList.remove("paths-open");
+  $("#gv-paths-btn").setAttribute("aria-pressed", "false");
+  pathsChanged();
+}
+function renderPathControls() {
+  setSeg("#gv-path-mode", "pm", A.pathMode);
+  $("#gv-path-hint").textContent = PATH_MODES[A.pathMode];
+  $("#gv-path-hops").value = A.pathHops; $("#gv-path-hops-v").textContent = A.pathHops;
+  $("#gv-path-branch").value = A.pathBranch; $("#gv-path-branch-v").textContent = A.pathBranch;
+  $("#gv-path-activity").checked = A.pathActivity;
+}
+
+function pathSources() {
+  const s = [...A.sel];
+  if (!s.length && A.selected != null) s.push(A.selected);
+  return s;
+}
+
+function pathsChanged() { pushState(); renderLegend(); }
+
+function pathMessage(text) {
+  A.paths = []; pathsChanged();
+  $("#gv-path-head").innerHTML = "";
+  $("#gv-path-list").innerHTML = `<li class="empty">${text}</li>`;
+}
+
+function runPathSearch(frame) {
+  if (!A.pathsOpen) return;
+  const e = A.edges;
+  if (!e?.available) { pathMessage("Edges are not available for this model yet."); return; }
+  const weight = A.pathActivity && rowOf(A.cursor) != null ? (g) => 0.15 + 0.85 * activityAt(g) : null;
+  const opts = { hops: A.pathHops, branch: A.pathBranch, weight, limit: 60 };
+  let found;
+  if (A.pathMode === "explain") {
+    if (!A.runId || A.cursor == null) { pathMessage("Pick a token on the timeline first."); return; }
+    if (!A.attr || A.attrInfo?.t !== A.cursor || A.attrInfo?.loading) {
+      pathMessage("Tracing the next token…");
+      if (!A.attrInfo?.loading || A.attrInfo?.t !== A.cursor) loadExplain();
+      return;
+    }
+    found = explainPaths(e, A.attr, opts);
+  } else {
+    const src = pathSources();
+    if (!src.length) { pathMessage("Select units first: click one, shift-click to add more, or shift-drag a box on the graph."); return; }
+    if (A.pathMode === "between") {
+      if (src.length < 2) { pathMessage("Select at least two units in different layers to find the routes between them."); return; }
+      found = findPaths(e, src, { ...opts, dir: "down", targets: new Set(src), hops: Math.max(A.pathHops, 2), beam: 256 });
+    } else {
+      found = findPaths(e, src, { ...opts, dir: A.pathMode });
+    }
+  }
+  if (!found.length) { pathMessage("No path above chance strength from here. Try more hops, more branches, or turn off activity weighting."); return; }
+  A.paths = found.map((p, i) => ({ ...p, on: i < 12, focus: false }));
+  pathsChanged();
+  renderPathList();
+  if (frame) frameShownPaths();
+}
+
+function frameShownPaths() {
+  const units = [...new Set(A.paths.filter((p) => p.on).flatMap((p) => p.units))];
+  if (units.length) graph.fitUnits(units);
+}
+
+function renderPathList() {
+  const shown = A.paths.filter((p) => p.on).length, max = Math.max(...A.paths.map((p) => p.score), 1e-9);
+  $("#gv-path-head").innerHTML = `<span><b>${A.paths.length}</b> paths · ${shown} shown</span>
+    <span class="path-actions">
+      <button type="button" class="link" data-act="all">Select all</button>
+      <button type="button" class="link" data-act="none">None</button>
+      <button type="button" class="link" data-act="frame">Frame</button>
+      <button type="button" class="link" data-act="select" title="Add the units on the shown paths to the selection">Select units</button>
+      <button type="button" class="link" data-act="copy" title="Copy the shown paths as JSON">Copy</button>
+    </span>`;
+  $("#gv-path-list").innerHTML = A.paths.map((p, i) => {
+    const chips = p.units.map((g) => `<span class="pchip ${A.units[g].kind}">${shortName(g)}</span>`).join(`<span class="parrow">→</span>`);
+    const extra = p.root != null && A.attr ? `<span class="pattr">${A.attr[p.root] >= 0 ? "+" : ""}${A.attr[p.root].toFixed(2)}</span>` : "";
+    return `<li data-i="${i}" class="${p.on ? "on" : ""}${p.focus ? " focus" : ""}">
+      <input type="checkbox" ${p.on ? "checked" : ""} aria-label="Show path ${i + 1}">
+      <span class="ptext">${chips}</span>
+      <span class="pscore">${extra}<span class="pbar"><i style="width:${Math.max(4, (p.score / max) * 100).toFixed(0)}%"></i></span></span></li>`;
+  }).join("");
+  $("#gv-path-head").querySelectorAll("[data-act]").forEach((b) => { b.onclick = () => pathAction(b.dataset.act); });
+  $("#gv-path-list").querySelectorAll("li[data-i]").forEach((li) => {
+    const p = A.paths[Number(li.dataset.i)];
+    li.querySelector("input").onchange = (ev) => { p.on = ev.target.checked; li.classList.toggle("on", p.on); pathsChanged(); renderPathHeadCount(); };
+    li.onmouseenter = () => { p.focus = true; pushState(); };
+    li.onmouseleave = () => { p.focus = false; pushState(); };
+    li.querySelector(".ptext").onclick = () => { p.on = true; li.querySelector("input").checked = true; li.classList.add("on"); graph.fitUnits(p.units); pushState(); };
+  });
+}
+function renderPathHeadCount() {
+  const span = $("#gv-path-head span");
+  if (span) span.innerHTML = `<b>${A.paths.length}</b> paths · ${A.paths.filter((p) => p.on).length} shown`;
+}
+
+function pathAction(act) {
+  const shown = A.paths.filter((p) => p.on);
+  if (act === "all" || act === "none") { for (const p of A.paths) p.on = act === "all"; renderPathList(); pathsChanged(); }
+  else if (act === "frame") frameShownPaths();
+  else if (act === "select") { for (const p of shown) for (const g of p.units) A.sel.add(g); pushState(); renderSelChip(); }
+  else if (act === "copy") {
+    const data = shown.map((p) => ({ path: p.units.map(shortName), units: p.units, score: +p.score.toFixed(5),
+      edges_x_chance: p.xs.map((x) => +x.toFixed(3)), ...(p.root != null && A.attr ? { attribution: +A.attr[p.root].toFixed(4) } : {}) }));
+    navigator.clipboard?.writeText(JSON.stringify({ run: A.runId, token: A.cursor, mode: A.pathMode, paths: data }, null, 2));
+  }
+}
+
+// ---------------------------------------------------------------- tracing: one unit at the cursor token
+const dbar = (x) => {
+  const v = clamp(Number.isFinite(x) ? x : 0, -1, 1);
+  return `<span class="dbar"><i class="${v >= 0 ? "pos" : "neg"}" style="left:${v >= 0 ? 50 : 50 + v * 50}%;width:${Math.abs(v) * 50}%"></i></span>`;
+};
+
+async function renderTokenSection() {
+  const box = $("#an-token-sec");
+  if (!box || A.selected == null || A.detailMode !== "unit") return;
+  const g = A.selected, t = A.cursor, seq = ++A.tokenSeq, u = A.units[g];
+  if (t == null || !A.runId) { box.innerHTML = `<p class="empty">Pick a token on the timeline to see what this unit did there.</p>`; return; }
+  if (!box.innerHTML.trim()) box.innerHTML = `<div class="skeleton short"></div>`;
+  try {
+    const [ex, more] = await Promise.all([
+      fetchExplain(t, A.mode === "attr" ? A.attrTarget : null),
+      api(`${tokenUrl(t)}/${u.kind === "cluster" ? "neurons" : "attention"}?unit=${g}`),
+    ]);
+    if (seq !== A.tokenSeq || A.selected !== g) return;
+    const c = ex.contrib[g], rank = 1 + ex.contrib.filter((x) => Math.abs(x) > Math.abs(c)).length;
+    box.innerHTML = `<div class="tok-line"><span class="tok-chip">${esc(visTok(ex.token))}</span><span class="arrow">→</span>
+        <span class="tok-chip target">${esc(visTok(ex.target.text))}</span>
+        <span class="attr-val ${c >= 0 ? "pos" : "neg"}">${c >= 0 ? "+" : ""}${c.toFixed(3)} logits</span></div>
+      <p class="hint">${c >= 0 ? "Pushed" : "Pulled"} the model's next token ${c >= 0 ? "toward" : "away from"} this candidate, by its direct write. #${rank} of ${A.U} units by size of effect.</p>
+      ${u.kind === "cluster" ? neuronsHtml(g, more) : attentionHtml(more)}`;
+    box.querySelector("#an-expand")?.addEventListener("click", () => toggleExpand(g));
+    box.querySelectorAll("[data-t]").forEach((el) => {
+      const tt = Number(el.dataset.t);
+      if (tt >= 0) el.onclick = () => { setFollow(false); stopPlay(); setCursor(tt, "jump"); };
+    });
+  } catch (err) {
+    if (seq !== A.tokenSeq) return;
+    box.innerHTML = `<p class="empty">${err.status === 409 ? "The model is generating; this fills in when it pauses." : esc(err.message)}</p>`;
+    if (err.status === 409) setTimeout(() => { if (A.selected === g && A.cursor === t) renderTokenSection(); }, 1500);
+  }
+}
+
+function neuronsHtml(g, nn) {
+  let ma = 1e-9, mc = 1e-9;
+  for (const n of nn.neurons) { ma = Math.max(ma, Math.abs(n.act)); mc = Math.max(mc, Math.abs(n.contrib)); }
+  const rows = nn.neurons.slice(0, 24).map((n) => `<li><span class="mono">${n.n}</span>${dbar(n.act / ma)}${dbar(n.contrib / mc)}
+      <span class="v ${n.contrib >= 0 ? "pos" : "neg"}">${n.contrib >= 0 ? "+" : ""}${n.contrib.toFixed(3)}</span></li>`).join("");
+  return `<div class="facts"><span title="Fewest neurons that make up 90% of the cluster's write at this token"><b>${nn.active}</b> of ${nn.neurons.length} neurons carry 90% of its write</span>
+      <span>cluster effect <b>${nn.contrib >= 0 ? "+" : ""}${nn.contrib.toFixed(3)}</b></span></div>
+    <div class="nn-head"><span>neuron</span><span>activation</span><span>effect on next token</span><span></span></div>
+    <ul class="nn-list">${rows}</ul>
+    <button type="button" class="btn sm" id="an-expand">${A.expanded.has(g) ? "Collapse in graph" : "Expand neurons in graph"}</button>`;
+}
+
+function attentionHtml(at) {
+  if (!at.available) return `<p class="hint">${esc(at.reason)}</p>`;
+  const w = at.weights, max = Math.max(...w, 1e-9), start = Math.max(0, w.length - 160);
+  const strip = w.slice(start).map((x, i) => {
+    const p = start + i;
+    return `<span class="att${p === at.pos ? " self" : ""}" style="--a:${(x / max).toFixed(3)}" data-t="${at.t_of[p]}" title="position ${p} · weight ${x.toFixed(4)}">${esc(visTok(at.tokens[p]))}</span>`;
+  }).join("");
+  const top = at.top.slice(0, 8).map(([p, x]) => `<li data-t="${at.t_of[p]}"><span class="mono">${esc(visTok(at.tokens[p]))}</span>
+      <span class="pbar"><i style="width:${((x / max) * 100).toFixed(0)}%"></i></span><span class="v">${(x * 100).toFixed(1)}%</span></li>`).join("");
+  return `<p class="hint">Where this head looked from this token: darker means more attention.${start ? ` Showing the last 160 of ${w.length} tokens.` : ""} Click a token to jump there.</p>
+    <div class="att-strip">${strip}</div>
+    <h5>Most attended</h5><ul class="att-top">${top}</ul>`;
+}
+
+async function loadExpanded(g) {
+  const t = A.cursor;
+  if (t == null || !A.runId) return;
+  const nn = await api(`${tokenUrl(t)}/neurons?unit=${g}`);
+  if (A.cursor !== t || !A.expanded.has(g)) return;  // moved on, or collapsed meanwhile
+  const byId = [...nn.neurons].sort((a, b) => a.n - b.n);
+  let m = 1e-9;
+  for (const n of byId) m = Math.max(m, Math.abs(n.act));
+  A.expanded.set(g, Float32Array.from(byId, (n) => Math.sign(n.act) * Math.sqrt(Math.abs(n.act) / m)));
+  pushState();
+}
+
+async function toggleExpand(g) {
+  if (A.expanded.has(g)) { A.expanded.delete(g); pushState(); renderTokenSection(); return; }
+  if (A.expanded.size >= 8) A.expanded.delete(A.expanded.keys().next().value);
+  A.expanded.set(g, new Float32Array(A.units[g].size).fill(NaN));
+  try { await loadExpanded(g); } catch { /* the grid stays empty until the next token */ }
+  graph.flyTo(g, 6);
+  renderTokenSection();
+}
+
+function refreshExpanded() { for (const g of A.expanded.keys()) loadExpanded(g).catch(() => {}); }
 
 // ---------------------------------------------------------------- dock trace
 function schedule() { if (!A.raf && A.visible) A.raf = requestAnimationFrame(() => { A.raf = 0; drawTrace(); overlay(); }); }
@@ -541,16 +864,24 @@ function graphTip(hit, mx, my) {
 
 // ---------------------------------------------------------------- legend and toolbar
 function renderLegend() {
-  const g = `linear-gradient(90deg, ${(C.graphStops || []).join(",")})`;
-  const scale = A.mode === "rel" ? "at or below its run average → 4σ above" : A.mode === "abs" ? "activity, log scale" : "output-weight norm, log scale";
+  const attr = A.mode === "attr";
+  const g = `linear-gradient(90deg, ${((attr ? C.attrStops : C.graphStops) || []).join(",")})`;
+  const info = A.attrInfo;
+  const scale = attr
+    ? (info?.target ? `pulls <b>${esc(visTok(info.target.text))}</b> down ← · → pushes it up (√ scale, max ${(info.max ?? 0).toFixed(2)} logits)` : "effect on the next token")
+    : A.mode === "rel" ? "at or below its run average → 4σ above" : A.mode === "abs" ? "activity, log scale" : "output-weight norm, log scale";
   const e = A.edges;
   $("#gv-legend").innerHTML = `
     <div class="lg-row"><span class="lg-grad" style="background:${g}"></span><span>${scale}</span></div>
+    ${A.paths.some((p) => p.on) ? `<div class="lg-row"><span class="lg-line" style="background:${C.path}"></span><span>highlighted paths</span><span class="lg-ring" style="border-color:${C.multiSelect}"></span><span>selected</span></div>` : ""}
     ${A.edgeMode !== "off" ? `<div class="lg-row"><span class="lg-line" style="background:${C.edgeCircuit}"></span><span>${A.selected != null ? `<span style="color:${C.edgeIn}">inputs</span> · <span style="color:${C.edgeOut}">outputs</span> of the selected unit` : A.edgeMode === "circuit" ? "composition between units active now" : "edges of the unit under the cursor"}</span></div>` : ""}
     <div class="lg-row"><span class="lg-ring" style="border-color:${C.trail}"></span><span>hit in the last few tokens</span><span class="lg-dot" style="background:${C.edited}"></span><span>edited</span></div>
     <details><summary>How to read this</summary>
       <p><b>Nodes.</b> Attention heads sit above the residual stream, MLP neuron clusters below; one column per layer. ${esc(A.atlas?.measures?.head || "")} ${esc(A.atlas?.measures?.cluster || "")} ${esc(A.atlas?.measures?.clusters || "")}</p>
-      <p><b>Color.</b> Each unit against its own average over the run, on a log scale; a unit counts as hit at ${HIT_Z}σ. Every weight takes part in every token, so this is how much a unit wrote, not an on/off firing.</p>
+      <p><b>Color.</b> ${attr
+        ? "Attribution: how much each unit's write at this token moved the logit of the target token, read through the final norm (held at its recorded scale) and the unembedding. Orange pushed it up, blue pulled it down. The units plus the embedding add up to the logit exactly; this is the direct effect only, not effects routed through later layers."
+        : `Each unit against its own average over the run, on a log scale; a unit counts as hit at ${HIT_Z}σ. Every weight takes part in every token, so this is how much a unit wrote, not an on/off firing.`}</p>
+      <p><b>Selecting.</b> Click a unit to open it. Shift-click adds it to a selection; shift-drag a box to select many (alt-drag removes). Open <b>Paths</b> to trace routes from the selection, between units, or behind the next token.</p>
       <p><b>Edges.</b> ${esc(e?.measure || "")}${e?.available ? ` Median ${e.p50}×, 99th percentile ${e.p99}×.` : ""}</p>
       <p><b>Labels.</b> ${esc(A.atlas?.measures?.labels || "")}</p>
     </details>`;
@@ -617,6 +948,7 @@ function renderDetail() {
       </div>
       <div class="wb-msg" id="an-lesion-msg" role="status"></div>
     </div>
+    <section class="d-sec"><h4>At this token <span class="dim">neurons, attention, effect on the next token</span></h4><div id="an-token-sec"></div></section>
     <section class="d-sec"><h4>In this run</h4><div id="an-run-stats"></div></section>
     <section class="d-sec"><h4>What it writes</h4>
       <div class="chips"><span class="lbl">pushes up</span>${chips(d.pos_now)}</div>
@@ -635,6 +967,7 @@ function renderDetail() {
     </tbody></table></div></section>` : ""}`;
   $("#an-lesion").onclick = lesion;
   $("#an-focus").onclick = () => graph.flyTo(d.g, Math.max(graph.target.s, 2.6));
+  renderTokenSection();
   document.querySelectorAll("#an-detail .conn-list li[data-g]").forEach((li) => { li.onclick = () => { const g = Number(li.dataset.g); selectUnit(g); graph.flyTo(g, Math.max(graph.target.s, 1.6)); }; });
   document.querySelectorAll("#an-detail .mtabs button").forEach((b) => { b.onclick = () => openView({ unit: d.g, matrix: b.dataset.key }); });
   document.querySelectorAll("#an-detail .ntable tbody tr").forEach((tr) => {
@@ -1027,7 +1360,16 @@ function setupInput() {
     schedule();
   }, { passive: false });
   $("#an-fit").onclick = () => { A.fit = true; schedule(); };
-  document.querySelectorAll("#gv-mode [data-mode]").forEach((b) => { b.onclick = () => { A.mode = b.dataset.mode; setSeg("#gv-mode", "mode", A.mode); pushState(); renderLegend(); renderReadout(); }; });
+  document.querySelectorAll("#gv-mode [data-mode]").forEach((b) => { b.onclick = () => setMode(b.dataset.mode); });
+  $("#gv-paths-btn").onclick = () => (A.pathsOpen ? closePaths() : openPaths());
+  $("#gv-paths-close").onclick = closePaths;
+  $("#gv-selclear").onclick = clearSelection;
+  $("#gv-selpaths").onclick = () => openPaths(A.pathMode === "explain" ? "down" : A.pathMode);
+  document.querySelectorAll("#gv-path-mode [data-pm]").forEach((b) => { b.onclick = () => { A.pathMode = b.dataset.pm; renderPathControls(); runPathSearch(true); }; });
+  const pathInput = (id, key) => { $(id).oninput = (ev) => { A[key] = Number(ev.target.value); $(`${id}-v`).textContent = A[key]; runPathSearch(false); }; };
+  pathInput("#gv-path-hops", "pathHops");
+  pathInput("#gv-path-branch", "pathBranch");
+  $("#gv-path-activity").onchange = (ev) => { A.pathActivity = ev.target.checked; runPathSearch(false); };
   document.querySelectorAll("#gv-edges [data-edges]").forEach((b) => { b.onclick = () => { A.edgeMode = b.dataset.edges; setSeg("#gv-edges", "edges", A.edgeMode); pushState(); renderLegend(); }; });
   $("#gv-trail").onclick = () => { A.trailOn = !A.trailOn; $("#gv-trail").setAttribute("aria-pressed", String(A.trailOn)); pushState(); };
   $("#gv-fit").onclick = () => graph.fit();
@@ -1053,7 +1395,14 @@ function setupInput() {
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); openPalette(); return; }
     if (typing) return;
     if (ev.key === "/") { ev.preventDefault(); openPalette(); }
-    else if (ev.key === "Escape") { if (!$("#gv-palette").hidden) closePalette(); else selectUnit(null); }
+    else if (ev.key === "Escape") {
+      if (!$("#gv-palette").hidden) closePalette();
+      else if (A.sel.size) clearSelection();
+      else if (A.selected != null) selectUnit(null);
+      else if (A.pathsOpen) closePaths();
+    }
+    else if (ev.key === "p" || ev.key === "P") (A.pathsOpen ? closePaths() : openPaths());
+    else if (ev.key === "a" || ev.key === "A") setMode(A.mode === "attr" ? "rel" : "attr");
     else if (ev.key === "f" || ev.key === "F") graph.fit();
     else if (ev.key === "+" || ev.key === "=") graph.zoomAt(graph.W / 2, graph.H / 2, 1.6);
     else if (ev.key === "-") graph.zoomAt(graph.W / 2, graph.H / 2, 1 / 1.6);
@@ -1086,7 +1435,8 @@ async function activate() {
 function boot() {
   readColors();
   graph = new WeightGraph($("#gv-canvas"), $("#gv-minimap"), {
-    onSelect: (g) => selectUnit(g),
+    onSelect: (g, how) => (how?.shift ? (g != null && toggleSelect(g)) : selectUnit(g)),
+    onBoxSelect: (units, remove) => boxSelect(units, remove),
     onHover: (hit, mx, my) => graphTip(hit, mx, my),
     onEnd: (which) => openEnd(which),
     needThumb,
@@ -1102,6 +1452,7 @@ function boot() {
   });
   // A hidden view catches up in activate(), so switching runs in the Scanner costs nothing here.
   document.addEventListener("brainscan:run", (ev) => { if (A.atlas && A.visible && ev.detail !== A.runId) openRun(ev.detail); });
+  document.addEventListener("brainscan:focus-layer", (ev) => { if (A.atlas) graph.flyToLayer(Number(ev.detail)); });
   const recolor = () => { readColors(); renderLegend(); schedule(); resetThumbs(); if (H.tile && $("#an-heat")) { drawHeat(); renderHeatInfo(); } };
   $("#theme-toggle").addEventListener("click", recolor);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", recolor);

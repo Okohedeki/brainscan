@@ -34,6 +34,11 @@ export class WeightGraph {
     this.edges = null; this.edgeMode = "circuit"; this.drawnEdges = [];
     this.thumbs = new Map(); this.C = null; this.live = false;
     this.raf = 0; this.last = performance.now(); this.W = 1; this.H = 1; this.dpr = 1;
+    this.selection = new Set();   // multi-selected units (shift-click, box select)
+    this.paths = [];              // [{units: [g...], score, on, focus}] highlighted by the path explorer
+    this.signed = null;           // Float32Array in [-1, 1]: attribution mode colors nodes on a diverging ramp
+    this.expanded = new Map();    // cluster g -> Float32Array of its neurons' activity in [-1, 1]
+    this.box = null;              // live box-select rectangle in screen space
     this._input();
     new ResizeObserver(() => { const fitAgain = this.fitted; this._size(); if (fitAgain) this.fit(true); this.invalidate(); }).observe(canvas.parentElement);
   }
@@ -134,7 +139,7 @@ export class WeightGraph {
     this._draw(now);
     this._drawMinimap();
     this.cb.onFrame?.();
-    const animateEdges = this.drawnEdges.length && !reduceMotion() && this.visible !== false;
+    const animateEdges = (this.drawnEdges.length || this.paths.some((p) => p.on)) && !reduceMotion() && this.visible !== false;
     if (moving || animateEdges || (this.live && !reduceMotion())) this.invalidate();
   }
 
@@ -142,7 +147,9 @@ export class WeightGraph {
   _pickEdges() {
     this._edgesDirty = false;
     const out = [], e = this.edges;
-    if (!e || this.edgeMode === "off" || !this.x) { this.drawnEdges = out; return; }
+    // Highlighted paths replace the generic edges unless a single unit is open.
+    const pathsOn = this.paths.some((p) => p.on);
+    if (!e || this.edgeMode === "off" || !this.x || (pathsOn && this.selected == null)) { this.drawnEdges = out; return; }
     const k = e.k, norm = (x) => clamp(x / (e.p99 || 1), 0, 1.4);
     const sel = this.selected;
     if (sel != null) {
@@ -180,6 +187,33 @@ export class WeightGraph {
     const ramp = this.C.graphRamp;
     if (!(v >= 0)) return this.C.nodeNoData;
     return ramp[Math.round(clamp(v, 0, 1) * 255)];
+  }
+
+  _signedColor(v) {
+    if (!(v >= -1)) return this.C.nodeNoData;
+    return this.C.attrRamp[Math.round((clamp(v, -1, 1) + 1) * 127.5)];
+  }
+
+  _nodeColor(g, v) {
+    return this.signed ? this._signedColor(this.signed[g]) : this._heatColor(v);
+  }
+
+  /** Camera to frame a set of units (path explorer "show"). */
+  fitUnits(units) {
+    if (!units?.length || !this.x) return;
+    let x0 = Infinity, x1 = -Infinity, y0 = Infinity, y1 = -Infinity;
+    for (const g of units) { x0 = Math.min(x0, this.x[g]); x1 = Math.max(x1, this.x[g]); y0 = Math.min(y0, this.y[g]); y1 = Math.max(y1, this.y[g]); }
+    const pad = 70, s = clamp(Math.min(this.W / (x1 - x0 + 2 * pad), (this.H - 60) / (y1 - y0 + 2 * pad)), MIN_S, 3.2);
+    this.target = { x: (x0 + x1) / 2, y: (y0 + y1) / 2, s };
+    this.fitted = false;
+    this.invalidate();
+  }
+
+  flyToLayer(layer) {
+    const p = this.pods?.[layer]; if (!p) return;
+    this.target = { x: p.x, y: (this.bounds.y0 + this.bounds.y1) / 2, s: Math.max(this.target.s, 1.4) };
+    this.fitted = false;
+    this.invalidate();
   }
 
   _glowSprite() {
@@ -294,6 +328,37 @@ export class WeightGraph {
       }
     }
 
+    // highlighted paths (path explorer): amber curves unit to unit, the focused one brightest
+    const shownPaths = this.paths.filter((p) => p.on);
+    if (shownPaths.length) {
+      const maxScore = Math.max(...shownPaths.map((p) => p.score), 1e-9);
+      for (const p of shownPaths) {
+        const w = clamp(p.score / maxScore, 0.15, 1), focus = p.focus;
+        ctx.strokeStyle = focus ? C.pathFocus : C.path;
+        ctx.globalAlpha = focus ? 0.95 : 0.25 + 0.55 * w;
+        ctx.lineWidth = clamp((focus ? 2.6 : 1 + 2 * w) * Math.sqrt(s), 0.8, focus ? 7 : 5);
+        ctx.beginPath();
+        for (let i = 0; i + 1 < p.units.length; i++) {
+          const a = p.units[i], b = p.units[i + 1], x0 = X(this.x[a]), y0 = Y(this.y[a]), x3 = X(this.x[b]), y3 = Y(this.y[b]), dx = (x3 - x0) * 0.5;
+          ctx.moveTo(x0, y0); ctx.bezierCurveTo(x0 + dx, y0, x3 - dx, y3, x3, y3);
+        }
+        ctx.stroke();
+      }
+      ctx.globalAlpha = 1;
+      if (!reduceMotion()) {  // particles flow downstream along the strongest paths
+        ctx.fillStyle = C.pathFocus;
+        shownPaths.slice(0, 40).forEach((p, pi) => {
+          for (let i = 0; i + 1 < p.units.length; i++) {
+            const a = p.units[i], b = p.units[i + 1];
+            const t = (now * 0.00035 + i * 0.29 + pi * 0.17) % 1, [px, py] = bez(X(this.x[a]), Y(this.y[a]), X(this.x[b]), Y(this.y[b]), t);
+            ctx.globalAlpha = 0.85 * Math.sin(Math.PI * t);
+            ctx.beginPath(); ctx.arc(px, py, p.focus ? 2.8 : 1.8, 0, Math.PI * 2); ctx.fill();
+          }
+        });
+        ctx.globalAlpha = 1;
+      }
+    }
+
     // glow under hot nodes
     if (h && this.mode !== "norm") {
       const sprite = this._glowSprite();
@@ -316,7 +381,7 @@ export class WeightGraph {
         const v = this.mode === "norm" ? this.normT?.[g] : h ? h[g] : NaN;
         const rs = Math.max(this.r[g] * s, s < LOD.nodes ? 1.1 : 1.6);
         if (cards) { this._card(ctx, g, X(x), Y(y), v); continue; }
-        ctx.fillStyle = this._heatColor(v);
+        ctx.fillStyle = this._nodeColor(g, v);
         if (rs < 2.2) ctx.fillRect(X(x) - rs, Y(y) - rs, rs * 2, rs * 2);
         else { ctx.beginPath(); ctx.arc(X(x), Y(y), rs, 0, Math.PI * 2); ctx.fill(); }
         if (this.kind[g] === 0 && rs >= 4) { ctx.strokeStyle = C.headRing; ctx.lineWidth = 1; ctx.stroke(); }
@@ -352,10 +417,30 @@ export class WeightGraph {
       ctx.stroke();
     };
     ring(this.hover, C.hoverRing, 1.5, 3);
+    if (shownPaths.length) {  // units on highlighted paths
+      const onPath = new Set(shownPaths.flatMap((p) => p.units));
+      for (const g of onPath) if (inView(this.x[g], this.y[g], 20)) ring(g, C.path, 1.5, 2);
+    }
+    for (const g of this.selection) if (inView(this.x[g], this.y[g], 20)) ring(g, C.multiSelect, 2, 4);
     if (this.selected != null) { ring(this.selected, C.selectHalo, 6, 5); ring(this.selected, C.selectRing, 2, 3); }
 
     // labels
     this._labels(ctx, s, wx0, wx1);
+
+    if (this.box) {  // box-select rectangle
+      const b = this.box, x = Math.min(b.x0, b.x1), y = Math.min(b.y0, b.y1), w = Math.abs(b.x1 - b.x0), hh = Math.abs(b.y1 - b.y0);
+      ctx.fillStyle = C.multiSelectFill; ctx.fillRect(x, y, w, hh);
+      ctx.strokeStyle = C.multiSelect; ctx.lineWidth = 1.5; ctx.setLineDash([5, 4]); ctx.strokeRect(x, y, w, hh); ctx.setLineDash([]);
+    }
+  }
+
+  /** Units whose centers fall inside a screen-space rectangle. */
+  unitsIn(b) {
+    const [ax, ay] = this.toWorld(Math.min(b.x0, b.x1), Math.min(b.y0, b.y1));
+    const [bx, by] = this.toWorld(Math.max(b.x0, b.x1), Math.max(b.y0, b.y1));
+    const out = [];
+    for (let g = 0; g < this.U; g++) if (this.x[g] >= ax && this.x[g] <= bx && this.y[g] >= ay && this.y[g] <= by) out.push(g);
+    return out;
   }
 
   _cardSize() { return clamp(GAP * this.cam.s * 0.86, 40, 300); }
@@ -365,13 +450,24 @@ export class WeightGraph {
     if (x > this.W || y > this.H || x + w < 0 || y + hh < 0) return;
     const hot = v >= 0 ? v : 0;
     ctx.fillStyle = C.cardBg; roundRect(ctx, x, y, w, hh, 12); ctx.fill();
-    ctx.strokeStyle = v >= 0 ? this._heatColor(Math.max(0.25, hot)) : C.podStroke; ctx.lineWidth = 1 + 2 * hot; ctx.stroke();
+    ctx.strokeStyle = v >= 0 || this.signed ? this._nodeColor(g, Math.max(0.25, hot)) : C.podStroke; ctx.lineWidth = 1 + 2 * hot; ctx.stroke();
     const pad = Math.max(5, w * 0.05), level = this.cam.s >= LOD.cardsHi ? 1 : 0;
-    const key = `${g}:${level}`, img = this.thumbs.get(key) || this.thumbs.get(`${g}:0`);
-    const th = hh * 0.52;
-    if (img) { ctx.imageSmoothingEnabled = false; ctx.save(); roundRect(ctx, x + pad, y + pad, w - 2 * pad, th, 7); ctx.clip(); ctx.drawImage(img, x + pad, y + pad, w - 2 * pad, th); ctx.restore(); }
-    else { ctx.fillStyle = C.podFill; roundRect(ctx, x + pad, y + pad, w - 2 * pad, th, 7); ctx.fill(); }
-    if (!this.thumbs.has(key)) this.cb.needThumb?.(g, level);
+    const th = hh * 0.52, neurons = this.expanded.get(g);
+    if (neurons) {
+      // An expanded cluster shows every neuron as a cell: activity at the current token, signed.
+      const n = neurons.length, aw = w - 2 * pad, cols = Math.max(1, Math.ceil(Math.sqrt(n * aw / th))), rows = Math.ceil(n / cols);
+      const cw = aw / cols, ch = th / rows;
+      ctx.fillStyle = C.podFill; roundRect(ctx, x + pad, y + pad, aw, th, 7); ctx.fill();
+      for (let k = 0; k < n; k++) {
+        ctx.fillStyle = this._signedColor(neurons[k]);
+        ctx.fillRect(x + pad + (k % cols) * cw, y + pad + Math.floor(k / cols) * ch, Math.max(cw - 0.6, 0.6), Math.max(ch - 0.6, 0.6));
+      }
+    } else {
+      const key = `${g}:${level}`, img = this.thumbs.get(key) || this.thumbs.get(`${g}:0`);
+      if (img) { ctx.imageSmoothingEnabled = false; ctx.save(); roundRect(ctx, x + pad, y + pad, w - 2 * pad, th, 7); ctx.clip(); ctx.drawImage(img, x + pad, y + pad, w - 2 * pad, th); ctx.restore(); }
+      else { ctx.fillStyle = C.podFill; roundRect(ctx, x + pad, y + pad, w - 2 * pad, th, 7); ctx.fill(); }
+      if (!this.thumbs.has(key)) this.cb.needThumb?.(g, level);
+    }
     const fs = clamp(w * 0.085, 9, 15);
     ctx.textAlign = "left"; ctx.textBaseline = "alphabetic";
     ctx.fillStyle = C.ink; ctx.font = `600 ${fs}px Inter, system-ui, sans-serif`;
@@ -494,7 +590,9 @@ export class WeightGraph {
     const cv = this.cv;
     let drag = null;
     cv.addEventListener("pointerdown", (ev) => {
-      drag = { x: ev.clientX, y: ev.clientY, cx: this.target.x, cy: this.target.y, moved: false };
+      const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top;
+      // Shift-drag draws a selection box; a plain drag pans.
+      drag = { x: ev.clientX, y: ev.clientY, cx: this.target.x, cy: this.target.y, moved: false, box: ev.shiftKey, mx, my };
       cv.setPointerCapture(ev.pointerId);
     });
     cv.addEventListener("pointermove", (ev) => {
@@ -502,6 +600,10 @@ export class WeightGraph {
       if (drag) {
         const dx = ev.clientX - drag.x, dy = ev.clientY - drag.y;
         if (Math.abs(dx) + Math.abs(dy) > 3) drag.moved = true;
+        if (drag.moved && drag.box) {
+          this.box = { x0: drag.mx, y0: drag.my, x1: mx, y1: my };
+          cv.style.cursor = "crosshair"; this.cb.onHover?.(null); this.invalidate(); return;
+        }
         if (drag.moved) {
           this.target.x = drag.cx - dx / this.target.s; this.target.y = drag.cy - dy / this.target.s;
           this.cam.x = this.target.x; this.cam.y = this.target.y; this.fitted = false;
@@ -515,11 +617,17 @@ export class WeightGraph {
     });
     cv.addEventListener("pointerleave", () => { this.hover = null; this.cb.onHover?.(null); this.invalidate(); });
     cv.addEventListener("pointerup", (ev) => {
-      const moved = drag?.moved; drag = null; cv.style.cursor = "grab";
-      if (moved) return;
+      const d = drag; drag = null; cv.style.cursor = "grab";
+      if (d?.moved && d.box && this.box) {
+        const units = this.unitsIn(this.box);
+        this.box = null; this.invalidate();
+        this.cb.onBoxSelect?.(units, ev.altKey);
+        return;
+      }
+      if (d?.moved) return;
       const r = cv.getBoundingClientRect(), hit = this.hit(ev.clientX - r.left, ev.clientY - r.top);
       if (hit?.end) this.cb.onEnd?.(hit.end);
-      else this.cb.onSelect?.(hit ? hit.g : null);
+      else this.cb.onSelect?.(hit ? hit.g : null, { shift: ev.shiftKey || ev.metaKey || ev.ctrlKey });
     });
     cv.addEventListener("dblclick", (ev) => {
       const r = cv.getBoundingClientRect(), mx = ev.clientX - r.left, my = ev.clientY - r.top, hit = this.hit(mx, my);
