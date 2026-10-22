@@ -13,6 +13,9 @@ change the parameters themselves, the way "abliterated" models are made:
   scale          multiply a component's contribution by a factor: a layer's whole attention
                  or MLP block, one attention head (standard or linear attention), or one or
                  more MLP neurons. Factor 0 is a lesion.
+  units          scale a set of units together, as one edit: attention heads and groups of
+                 MLP neurons, each at its own layer. A knockout made permanent is one of these;
+                 it changes the same weights as the matching scale edits.
 
 Every parameter is copied to CPU before its first change. Applying the stack restores
 those copies and replays the enabled edits in order, so toggling, reordering and
@@ -32,7 +35,7 @@ from torch import nn
 ATTN_NAMES = ("self_attn", "linear_attn", "attn", "attention", "mixer")
 MLP_NAMES = ("mlp", "feed_forward", "ffn")
 WRITER_NAMES = {"o_proj", "out_proj", "down_proj", "c_proj", "dense_4h_to_h", "wo", "w2"}
-KINDS = ("orthogonalize", "scale")
+KINDS = ("orthogonalize", "scale", "units")
 ORTHO_TARGETS = ("embed", "attn_out", "mlp_out", "attn_in", "mlp_in", "unembed")
 SCALE_TARGETS = ("attn", "mlp", "head", "neuron")
 ROW_CHUNK = 16_384  # rows/columns per fp32 work block, keeps big matrices off the VRAM ceiling
@@ -139,10 +142,16 @@ class WeightEdit:
     index: int | list[int] | None = None  # scale: head number, or one or more neuron numbers
     enabled: bool = True
     note: str = ""
+    units: list[dict] | None = None    # units: [{layer, target: head|neuron, index, name, g}]
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
 
     def summary(self) -> str:
         where = f"L{layer_ranges(self.layers)}"
+        if self.kind == "units":
+            names = [u.get("name") or f"L{u['layer']} {u['target']}" for u in self.units]
+            shown = ", ".join(names[:4]) + (f" +{len(names) - 4} more" if len(names) > 4 else "")
+            verb = "knock out" if self.factor == 0 else f"scale ×{self.factor:g}"
+            return f"{verb} {len(names)} unit{'' if len(names) == 1 else 's'}: {shown}" + (f" ({self.note})" if self.note else "")
         if self.kind == "orthogonalize":
             return f"remove {self.direction} ×{self.strength:g} from {', '.join(self.targets)} @ {where}"
         if isinstance(self.index, list):
@@ -153,7 +162,10 @@ class WeightEdit:
 
     def describe(self) -> dict:
         return {"id": self.id, "kind": self.kind, "layers": layer_ranges(self.layers), "targets": self.targets,
-                "direction": self.direction, "strength": self.strength, "factor": self.factor, "index": self.index,
+                "direction": self.direction, "strength": self.strength, "factor": self.factor,
+                "index": None if self.kind == "units" else self.index,
+                "units": [{"g": u.get("g"), "name": u.get("name"), "layer": u["layer"], "target": u["target"]}
+                          for u in self.units] if self.units else None,
                 "enabled": self.enabled, "note": self.note, "summary": self.summary()}
 
 
@@ -171,8 +183,26 @@ class EditStack:
 
     def add(self, kind: str, layers="all", targets=None, direction: str | None = None,
             vector: torch.Tensor | None = None, strength: float = 1.0, factor: float = 0.0,
-            index: int | None = None, note: str = "") -> WeightEdit:
+            index: int | None = None, note: str = "", units: list[dict] | None = None) -> WeightEdit:
         n_layers = self.s.n_layers
+        if kind == "units":
+            entries = []
+            for u in units or []:
+                target, layer = u.get("target"), int(u.get("layer", -1))
+                if target not in ("head", "neuron") or u.get("index") is None:
+                    raise ValueError("each unit needs a target (head or neuron) and an index")
+                if not 0 <= layer < n_layers:
+                    raise ValueError(f"layer must be in 0..{n_layers - 1}")
+                idx = u["index"]
+                idx = sorted({int(i) for i in (idx if isinstance(idx, (list, tuple)) else [idx])}) if target == "neuron" else int(idx)
+                entries.append({"layer": layer, "target": target, "index": idx, "name": str(u.get("name") or ""), "g": u.get("g")})
+            if not entries:
+                raise ValueError("pick at least one unit")
+            edit = WeightEdit("units", sorted({e["layer"] for e in entries}), ["units"], factor=float(factor),
+                              note=note, units=entries)
+            self._plan(edit)  # validate against the architecture now
+            self.edits[edit.id] = edit
+            return edit
         if kind == "orthogonalize":
             targets = list(targets or ["embed", "attn_out", "mlp_out"])
             bad = [t for t in targets if t not in ORTHO_TARGETS]
@@ -246,8 +276,29 @@ class EditStack:
                             ops.append((lin.weight, lambda p, a=a: remove_from_rows(p, self._v(e), a)))
             return ops
 
-        target, f = e.targets[0], e.factor
         cfg = model.config.get_text_config()
+        if e.kind == "units":
+            for u in e.units:
+                attn, mlp = self._blocks(u["layer"])
+                if u["target"] == "head":
+                    heads = attention_heads(attn, d, cfg)
+                    if heads is None:
+                        raise ValueError(f"layer {u['layer']} has no attention output projection to split by head")
+                    _, n_heads, hd = heads
+                    if not 0 <= u["index"] < n_heads:
+                        raise ValueError(f"head must be in 0..{n_heads - 1} at layer {u['layer']}")
+                    ops.append((heads[0].weight, lambda p, s=u["index"] * hd, hd=hd, f=e.factor: p[:, s:s + hd].mul_(f)))
+                else:
+                    down = residual_linears(mlp, d, "out")
+                    if not down:
+                        raise ValueError(f"layer {u['layer']} has no dense MLP output projection")
+                    if not all(0 <= n < down[0].in_features for n in u["index"]):
+                        raise ValueError(f"neuron must be in 0..{down[0].in_features - 1}")
+                    cols = torch.tensor(u["index"], device=down[0].weight.device)
+                    ops.append((down[0].weight, lambda p, cols=cols, f=e.factor: p.index_copy_(1, cols, p.index_select(1, cols) * f)))
+            return ops
+
+        target, f = e.targets[0], e.factor
         for layer in e.layers:
             attn, mlp = self._blocks(layer)
             if target in ("attn", "mlp"):

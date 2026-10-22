@@ -589,6 +589,50 @@ async def compare_weight_edits(request: Request):
         raise HTTPException(400, str(exc)) from exc
 
 
+@app.post("/brainscan/workbench/replay")
+async def replay_chat(request: Request):
+    """Ask a recorded chat's last question again on the original and the edited weights."""
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(workbench.replay, recorder(), str(body.get("run") or ""),
+                                       int(body.get("max_tokens") or 256), body.get("template_kwargs") or None)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/brainscan/checks")
+async def get_checks():
+    return workbench.list_checks(recorder())
+
+
+@app.post("/brainscan/checks")
+async def post_check(request: Request):
+    """Save a behavior check: {run, t, target} from a traced word, or {prompt, expect, chat}."""
+    body = await request.json()
+    try:
+        return await asyncio.to_thread(workbench.add_check, recorder(), body)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/brainscan/checks/{cid}")
+async def delete_check(cid: str):
+    try:
+        return workbench.remove_check(recorder(), cid)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.post("/brainscan/checks/run")
+async def run_checks():
+    """Every saved check now and, with edits applied, on the original weights."""
+    return await asyncio.to_thread(workbench.run_checks, recorder())
+
+
 @app.post("/brainscan/workbench/export")
 async def export_edited_model(request: Request):
     body = await request.json()
@@ -651,6 +695,26 @@ async def lesion_unit(g: int, request: Request):
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
     return edit.describe()
+
+
+@app.post("/brainscan/anatomy/lesion")
+async def lesion_units(request: Request):
+    """One workbench edit that removes a set of units together (a knockout made permanent). With
+    apply true the stack is applied right away, so the weights change now."""
+    body = await request.json()
+    units = body.get("units")
+    if not isinstance(units, list) or not units:
+        raise HTTPException(400, "units must be a non-empty list of unit ids")
+    rec = recorder()
+    try:
+        spec = _anatomy(rec).lesion_units(units, float(body.get("factor", 0.0)), str(body.get("note") or ""))
+        edit = await asyncio.to_thread(rec.add_weight_edit, **spec)
+        summary = await asyncio.to_thread(rec.apply_weight_edits) if body.get("apply") else rec.edits.summary()
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return {"edit": edit.describe(), "workbench": summary}
 
 
 @app.post("/brainscan/anatomy/tile")

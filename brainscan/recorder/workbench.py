@@ -4,6 +4,11 @@ compare()  runs the same prompts on the original and the edited weights (greedy,
            runtime steering) and measures side effects on neutral reference text:
            mean KL(original || edited) of next-token distributions and perplexity.
            The refusal-phrase rate is a substring heuristic, labelled as such.
+replay()   asks a recorded chat's last question again on the original and the edited
+           weights (greedy), records the edited answer as its own run so it can be traced,
+           and finds the first token where the two answers part.
+checks     saved behavior checks per model: "after this context, this token", from a
+           traced word or typed as text, measured on the original and the edited weights.
 export()   writes the edited weights as a Hugging Face checkpoint plus a record of
            every edit, so a variant is never separated from how it was made.
 """
@@ -14,9 +19,12 @@ import json
 import math
 import shutil
 import time
+import uuid
 from pathlib import Path
 
 import torch
+
+from .chat import render
 
 REFUSAL_PHRASES = ("i can't", "i cannot", "i can not", "i won't", "i will not", "i'm sorry", "i am sorry",
                    "i'm unable", "i am unable", "i'm not able", "i am not able", "as an ai", "i must decline")
@@ -116,6 +124,178 @@ def _compare(recorder, s, prompts, max_tokens, refs, kwargs, t0) -> dict:
         "notes": "Greedy decoding with runtime steering off. Refusal rate is a substring match on the first "
                  "200 characters. KL and perplexity use neutral reference text, as a side-effect check.",
     }
+
+
+# ---- re-run a chat on the edited weights ----------------------------------------------------
+
+@torch.no_grad()
+def _greedy_ids(subject, ids: list[int], max_tokens: int) -> list[int]:
+    x = torch.tensor([ids], device=subject.device)
+    out = subject.model.generate(input_ids=x, attention_mask=torch.ones_like(x), max_new_tokens=max_tokens,
+                                 do_sample=False, eos_token_id=sorted(subject.stop_ids),
+                                 pad_token_id=subject.tokenizer.pad_token_id or subject.tokenizer.eos_token_id)
+    return out[0, len(ids):].tolist()
+
+
+def conversation(run) -> list[dict]:
+    """The run's conversation up to and including its last user message."""
+    msgs = [{"role": m["role"], "content": m["content"]} for m in sorted(run.messages, key=lambda m: (m["t"], m["i"]))
+            if m["role"] in ("system", "user", "assistant") and (m.get("content") or "").strip()]
+    last = max((i for i, m in enumerate(msgs) if m["role"] == "user"), default=None)
+    if last is None:
+        raise ValueError("this run has no user message to ask again")
+    return msgs[:last + 1]
+
+
+def replay(recorder, run_id: str, max_tokens: int = 256, template_kwargs: dict | None = None) -> dict:
+    from .session import GenParams  # session imports this module's neighbours; import late
+    if not recorder.edits.applied:
+        raise ValueError("no weight edits are applied; apply the stack first")
+    run = recorder.get_run(run_id)
+    if run is None:
+        raise KeyError(f"no run {run_id}")
+    s = recorder.s
+    messages = conversation(run)
+    kwargs = {**recorder.settings.template_kwargs(), **(template_kwargs or {})}
+    ids = render(s.tokenizer, messages, None, template_kwargs=kwargs).ids
+    t0 = time.perf_counter()
+    try:
+        with recorder.lock, recorder.tap.paused(), recorder.edits.suspended():
+            original = _greedy_ids(s, ids, max_tokens)  # not recorded: only its text and tokens are kept
+    finally:
+        recorder.release_memory()
+    res = recorder.generate(GenParams(messages=messages, max_tokens=max_tokens, temperature=0,
+                                      run_hint=f"{run_id}-edited", label="edited replay", template_kwargs=kwargs))
+    new = recorder.get_run(res.run_id)
+    gen = [r for r in new.tape if r["req"] == res.req and r["ph"] == "gen"]
+    edited = [r["tok"] for r in gen]
+    k = next((i for i, (a, b) in enumerate(zip(original, edited)) if a != b), None)
+    if k is None and len(original) != len(edited):
+        k = min(len(original), len(edited))
+    tok = lambda ids_, i: s.token_str(ids_[i]) if i < len(ids_) else "(end)"
+    return {
+        "prompt": messages[-1]["content"], "turns": len(messages),
+        "original": s.tokenizer.decode(original, skip_special_tokens=True).strip(),
+        "edited": (res.content or "").strip(), "edited_reasoning": res.reasoning or None,
+        "edited_run": res.run_id,
+        "first_diff": None if k is None else {
+            "index": k, "t": gen[k]["t"] if k < len(gen) else None,
+            "before": s.tokenizer.decode(original[:k], skip_special_tokens=True),
+            "original_token": tok(original, k), "edited_token": tok(edited, k)},
+        "edits": recorder.edits.active(), "seconds": round(time.perf_counter() - t0, 1),
+        "notes": "Greedy on both. The original answer is generated with the edits lifted and not recorded; "
+                 "the edited answer is recorded as its own run.",
+    }
+
+
+# ---- behavior checks -------------------------------------------------------------------------
+
+def _checks_path(recorder) -> Path:
+    return recorder.store.root / "checks" / f"{recorder.s.slug}.json"
+
+
+def list_checks(recorder) -> list[dict]:
+    path = _checks_path(recorder)
+    try:
+        return json.loads(path.read_text()) if path.exists() else []
+    except (OSError, ValueError):
+        return []
+
+
+def _save_checks(recorder, checks: list[dict]) -> None:
+    path = _checks_path(recorder)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(checks, indent=2))
+
+
+def add_check(recorder, body: dict) -> dict:
+    """A check from a traced word ({run, t, target}: after slot t of that run, token `target`) or
+    typed ({prompt, expect, chat}: after this text, the first token of `expect`)."""
+    s, tok = recorder.s, recorder.s.tokenizer
+    if body.get("run") is not None:
+        run = recorder.get_run(str(body["run"]))
+        if run is None:
+            raise KeyError(f"no run {body['run']}")
+        t, target = int(body["t"]), int(body["target"])
+        ids, _, _ = recorder.tracer.context(run, t)
+        context = tok.decode(ids[-12:], skip_special_tokens=False)
+        check = {"kind": "token", "run": run.id, "t": t, "target": target, "target_text": s.token_str(target),
+                 "context": context, "label": f"…{context[-60:]} → {s.token_str(target)}"}
+    else:
+        prompt, expect, chat = str(body.get("prompt") or ""), str(body.get("expect") or ""), bool(body.get("chat"))
+        if not prompt.strip() or not expect.strip():
+            raise ValueError("a check needs a prompt and the token you expect after it")
+        # "The capital of Australia is" => "Canberra" means the token " Canberra"
+        text = expect if chat or expect[:1].isspace() or prompt[-1:].isspace() else " " + expect
+        enc = tok.encode(text, add_special_tokens=False)
+        if not enc:
+            raise ValueError(f"{expect!r} does not tokenize to anything")
+        check = {"kind": "text", "prompt": prompt, "expect": expect, "chat": chat, "target": enc[0],
+                 "target_text": s.token_str(enc[0]), "label": f"{prompt[-60:]} → {s.token_str(enc[0])}"}
+    check["id"] = uuid.uuid4().hex[:8]
+    checks = list_checks(recorder)
+    checks.append(check)
+    _save_checks(recorder, checks)
+    return check
+
+
+def remove_check(recorder, cid: str) -> list[dict]:
+    checks = list_checks(recorder)
+    if not any(c["id"] == cid for c in checks):
+        raise KeyError(f"no check {cid}")
+    checks = [c for c in checks if c["id"] != cid]
+    _save_checks(recorder, checks)
+    return checks
+
+
+def _check_ids(s, c: dict) -> list[int]:
+    if c["chat"]:
+        return render(s.tokenizer, [{"role": "user", "content": c["prompt"]}], None,
+                      template_kwargs={"enable_thinking": False}).ids
+    return [s.sink_id] + s.tokenizer(c["prompt"], add_special_tokens=False).input_ids
+
+
+@torch.no_grad()
+def _next_token(s, ids: list[int], target: int) -> dict:
+    logits = s.model(input_ids=torch.tensor([ids], device=s.device), use_cache=False, logits_to_keep=1).logits[0, -1].float()
+    probs = torch.softmax(logits, -1)
+    top_p, top_i = probs.topk(3)
+    return {"prob": round(float(probs[target]), 5), "rank": int((logits > logits[target]).sum()) + 1,
+            "logit": round(float(logits[target]), 4),
+            "top": [{"text": s.token_str(int(i)), "prob": round(float(p), 5)} for p, i in zip(top_p.tolist(), top_i.tolist())]}
+
+
+def run_checks(recorder) -> dict:
+    """Every saved check, now and (with edits applied) on the original weights."""
+    from .tracing import Busy
+    s, checks, edited = recorder.s, list_checks(recorder), bool(recorder.edits.applied)
+    out = {c["id"]: {"id": c["id"], "kind": c["kind"], "label": c["label"], "target_text": c["target_text"],
+                     "now": None, "original": None, "error": None} for c in checks}
+    text = [c for c in checks if c["kind"] == "text"]
+    t0 = time.perf_counter()
+    try:
+        if text:
+            with recorder.lock, recorder.tap.paused():
+                for c in text:
+                    out[c["id"]]["now"] = _next_token(s, _check_ids(s, c), c["target"])
+                if edited:
+                    with recorder.edits.suspended():
+                        for c in text:
+                            out[c["id"]]["original"] = _next_token(s, _check_ids(s, c), c["target"])
+        for c in (c for c in checks if c["kind"] == "token"):
+            try:
+                for key, weights in (("now", "current"), ("original", "original")):
+                    if key == "original" and not edited:
+                        continue
+                    ex = recorder.tracer.explain(c["run"], c["t"], target=str(c["target"]), weights=weights)
+                    out[c["id"]][key] = {"prob": ex["target"]["prob"], "rank": ex["target"]["rank"], "logit": ex["logit"],
+                                         "top": [{"text": a["text"], "prob": a["prob"]} for a in ex["alternatives"][:3]]}
+            except (KeyError, ValueError, Busy) as exc:
+                out[c["id"]]["error"] = str(exc)
+    finally:
+        recorder.release_memory()
+    return {"checks": list(out.values()), "edited": edited, "edits": recorder.edits.active(),
+            "seconds": round(time.perf_counter() - t0, 2)}
 
 
 def export(recorder, path: str) -> dict:

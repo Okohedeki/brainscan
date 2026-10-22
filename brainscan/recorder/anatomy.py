@@ -363,6 +363,15 @@ class Anatomy:
             e = stack.edits.get(eid)
             if e is None:
                 continue
+            if e.kind == "units":
+                for u in e.units:
+                    lm = self.layers[u["layer"]]
+                    if u["target"] == "head" and u["index"] < lm.n_heads:
+                        out.add(lm.offset + u["index"])
+                    elif u["target"] == "neuron" and lm.assign is not None:
+                        idx = torch.tensor(u["index"], device=lm.assign.device)
+                        out.update(lm.offset + lm.n_heads + int(c) for c in lm.assign[idx].unique())
+                continue
             for layer in e.layers:
                 lm = self.layers[layer]
                 heads = range(lm.offset, lm.offset + lm.n_heads)
@@ -810,6 +819,19 @@ class Anatomy:
         idx = (lm.assign == i).nonzero().flatten().tolist()
         return {"kind": "scale", "layers": str(lm.index), "targets": ["neuron"], "index": idx, "factor": factor,
                 "note": f"L{lm.index} cluster {i}"}
+
+    def lesion_units(self, units, factor: float = 0.0, note: str = "") -> dict:
+        """Workbench edit arguments that scale a set of units together, as one edit (a knockout made
+        permanent): each head's slice of its output projection, each cluster's neurons."""
+        entries = []
+        for g in sorted({int(g) for g in units}):
+            lm, kind, i = self.locate(g)
+            if kind == "head":
+                entries.append({"layer": lm.index, "target": "head", "index": i, "name": f"L{lm.index} h{i}", "g": g})
+            else:
+                entries.append({"layer": lm.index, "target": "neuron", "name": f"L{lm.index} c{i}", "g": g,
+                                "index": (lm.assign == i).nonzero().flatten().tolist()})
+        return {"kind": "units", "units": entries, "factor": factor, "note": note}
 
     def param_list(self) -> list[dict]:
         return [{"name": n, "shape": list(p.shape), "dtype": str(p.dtype).replace("torch.", ""), "numel": p.numel()}
