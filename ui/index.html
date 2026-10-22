@@ -22,9 +22,9 @@
       <span class="live-dot" id="live-dot" title="Live feed"></span>
     </div>
     <nav class="tabs" role="tablist" aria-label="View">
-      <button role="tab" data-view="scanner" aria-selected="true" class="active">Scanner</button>
-      <button role="tab" data-view="weights" aria-selected="false">Weights</button>
-      <button role="tab" data-view="workbench" aria-selected="false">Workbench</button>
+      <button role="tab" data-view="scanner" aria-selected="true" class="active" title="Watch a run: transcript, per-token timeline, logit lens, steering"><span class="tab-n">1</span>Watch</button>
+      <button role="tab" data-view="weights" aria-selected="false" title="Trace a token through the model's heads and neuron clusters"><span class="tab-n">2</span>Trace</button>
+      <button role="tab" data-view="workbench" aria-selected="false" title="Tune the weights: find directions, edit, compare, export"><span class="tab-n">3</span>Tune</button>
     </nav>
     <div class="model-badge" id="model-badge">Starting…</div>
     <label class="run-pick">
@@ -36,6 +36,7 @@
       <span class="stat" id="stat-vram" title="GPU memory in use">VRAM –</span>
       <span class="stat" id="stat-disk" title="Recording storage used / budget">Disk –</span>
     </div>
+    <button class="icon-btn help" id="help-btn" aria-label="Guide: everything Brainscan can do" title="Guide (?)">?</button>
     <button class="icon-btn" id="theme-toggle" aria-label="Switch light or dark theme" title="Theme">
       <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zm0 1.5v10a5 5 0 0 1 0-10z" fill="currentColor"/></svg>
     </button>
@@ -331,11 +332,27 @@
     </section>
   </main>
 
+  <div class="guide" id="guide" hidden>
+    <div class="guide-box glass" role="dialog" aria-modal="true" aria-labelledby="guide-title">
+      <header class="guide-head">
+        <div>
+          <span class="eyebrow">Guide</span>
+          <h2 id="guide-title">Trace and tune open-weights models</h2>
+          <p class="hint">Record a model's internals while it works, follow any token through its heads and neurons,
+            then change the weights and measure what changed. Three steps, left to right in the tabs.</p>
+        </div>
+        <button type="button" class="tbtn icon" id="guide-close" aria-label="Close guide">✕</button>
+      </header>
+      <div id="guide-body"></div>
+    </div>
+  </div>
+
   <footer class="notice">
-    Brainscan shows functional measurements: logit-lens probabilities and projections onto contrast
-    vectors built from example texts. Each readout is labelled by how it was built. Nothing here measures
-    experience.
+    Brainscan shows functional measurements: logit-lens probabilities, direct logit attribution and projections
+    onto contrast vectors built from example texts. Each readout is labelled by how it was built. Nothing here
+    measures experience.
   </footer>
+  <script type="module" src="/ui/guide.js"></script>
   <script type="module" src="/ui/app.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
   <script type="module" src="/ui/weights.js"></script>

@@ -284,6 +284,39 @@ button.link.danger { color: var(--critical); }
 }
 .tabs button:hover { color: var(--ink); }
 .tabs button.active { background: var(--surface); color: var(--ink); font-weight: 600; box-shadow: 0 1px 2px rgba(0, 0, 0, 0.12), 0 0 0 1px var(--border); }
+.tabs button { display: inline-flex; align-items: center; gap: 7px; }
+.tab-n {
+  display: inline-flex; align-items: center; justify-content: center; width: 17px; height: 17px; border-radius: 50%;
+  font-size: 10.5px; font-weight: 600; color: var(--muted); border: 1px solid var(--border-strong);
+}
+.tabs button.active .tab-n { color: #fff; border-color: transparent; background: linear-gradient(135deg, var(--accent), var(--accent-2)); }
+.icon-btn.help { font-weight: 700; font-size: 14px; color: var(--accent); padding: 0; }
+
+/* ---- guide ---- */
+.guide { position: fixed; inset: 0; z-index: 60; display: flex; justify-content: center; align-items: flex-start; padding: 7vh 16px 16px; background: rgba(4, 5, 8, 0.4); backdrop-filter: blur(3px); overflow: auto; }
+.guide-box { width: min(1080px, 100%); padding: 20px 22px 16px; animation: pop 0.16s ease-out; }
+.guide-head { display: flex; justify-content: space-between; gap: 16px; align-items: flex-start; margin-bottom: 14px; }
+.guide-head h2 { font-size: 21px; font-weight: 700; letter-spacing: -0.02em; margin: 2px 0 6px; text-transform: none; color: var(--ink); }
+.guide-head .hint { max-width: 680px; }
+.guide-steps { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 12px; }
+.guide-step { border: 1px solid var(--border); border-radius: 14px; background: color-mix(in srgb, var(--raised) 65%, transparent); padding: 12px 12px 6px; }
+.guide-step header { display: flex; gap: 10px; align-items: flex-start; padding-bottom: 8px; border-bottom: 1px solid var(--border); }
+.guide-step h3 { margin: 0; font-size: 15px; color: var(--ink); }
+.guide-step header p { margin: 2px 0 0; font-size: 12px; color: var(--ink-2); line-height: 1.45; }
+.step-n {
+  flex: none; width: 24px; height: 24px; border-radius: 50%; display: inline-flex; align-items: center; justify-content: center;
+  color: #fff; font-weight: 700; font-size: 12.5px; background: linear-gradient(135deg, var(--accent), var(--accent-2));
+}
+.guide-step ul { list-style: none; margin: 0; padding: 0; }
+.guide-step li { padding: 9px 2px; border-bottom: 1px solid var(--grid); }
+.guide-step li:last-child { border-bottom: none; }
+.tool-head { display: flex; align-items: center; gap: 8px; font-size: 13px; }
+.guide-step li p { margin: 3px 0 5px; font-size: 12px; color: var(--ink-2); line-height: 1.5; }
+.endpoint { display: flex; align-items: center; gap: 10px; }
+.endpoint code { font-size: 11.5px; background: var(--surface); border: 1px solid var(--border); border-radius: 6px; padding: 2px 7px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.guide-keys { display: flex; flex-wrap: wrap; gap: 6px 16px; margin-top: 14px; font-size: 12px; color: var(--ink-2); }
+@media (max-width: 900px) { .guide-steps { grid-template-columns: minmax(0, 1fr); } }
+@media (prefers-reduced-motion: reduce) { .guide-box { animation: none; } }
 .model-badge {
   font-size: 12px; color: var(--ink-2); padding: 4px 11px; border: 1px solid var(--border); border-radius: 999px;
   background: var(--raised); max-width: 480px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap;

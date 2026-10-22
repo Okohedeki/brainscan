@@ -118,7 +118,7 @@ async function saveDirection(ev) {
   try {
     await busy(ev.target, "Saving…", () => post("/brainscan/directions/save", { id: W.sweep.id, layer, name,
       description: `Set A vs set B (${W.sweep.n_positive} vs ${W.sweep.n_negative} examples), built in the workbench.` }));
-    message("#wb-find-msg", `Saved "${name}" at layer ${layer}. It now shows in the Scanner and can be used for edits.`, "ok");
+    message("#wb-find-msg", `Saved "${name}" at layer ${layer}. It now shows in Watch and can be used for edits.`, "ok");
     await refresh();
     $("#wb-dir").value = name;
   } catch (err) { message("#wb-find-msg", err.message, "error"); }
@@ -250,6 +250,7 @@ async function exportModel(ev) {
 // ---------------------------------------------------------------- boot
 function boot() {
   document.querySelectorAll(".tabs [data-view]").forEach((b) => { b.onclick = () => show(b.dataset.view); });
+  document.addEventListener("brainscan:show", (ev) => { if (VIEWS.includes(ev.detail)) show(ev.detail); });  // from the guide
   $("#wb-example").onclick = () => { $("#wb-a").value = EXAMPLE.a.join("\n"); $("#wb-b").value = EXAMPLE.b.join("\n"); $("#wb-name").value = "language_fr"; };
   $("#wb-analyze").onclick = analyze;
   $("#wb-save").onclick = saveDirection;

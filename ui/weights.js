@@ -130,6 +130,7 @@ async function loadAtlas() {
     api("/brainscan/anatomy/edges").then((e) => {
       if (e.available) { e.up = Int32Array.from(e.up); e.down = Int32Array.from(e.down); e.up_x = Float32Array.from(e.up_x); e.down_x = Float32Array.from(e.down_x); }
       A.edges = e; graph.setEdges(e); renderLegend();
+      if (A.pathsOpen) runPathSearch(true);
     }).catch(() => {});
     return true;
    } catch (err) {
@@ -401,7 +402,7 @@ function renderReadout() {
   if (rec == null) {
     const why = !A.runId ? `No run yet. Point any harness at <code>${esc(location.origin)}/v1</code>; the graph lights up as tokens arrive.`
       : A.skipped ? "This run was recorded with a different unit map (another model or cluster count)."
-        : A.view.length ? "No weight activity in this run: it was recorded before the Weights view existed. New requests record it."
+        : A.view.length ? "No unit activity in this run: it was recorded before tracing was added. New requests record it."
           : "No tokens in this run yet.";
     el.innerHTML = `<span class="muted">${why}</span>`;
     return;
@@ -540,7 +541,8 @@ function pathMessage(text) {
 function runPathSearch(frame) {
   if (!A.pathsOpen) return;
   const e = A.edges;
-  if (!e?.available) { pathMessage("Edges are not available for this model yet."); return; }
+  if (!e) { pathMessage("Loading the graph's edges…"); return; }  // loadAtlas reruns the search
+  if (!e.available) { pathMessage("Edges are not available for this model yet."); return; }
   const weight = A.pathActivity && rowOf(A.cursor) != null ? (g) => 0.15 + 0.85 * activityAt(g) : null;
   const opts = { hops: A.pathHops, branch: A.pathBranch, weight, limit: 60 };
   let found;
@@ -943,7 +945,7 @@ function renderDetail() {
       </div>
       ${d.edited ? `<div class="pill warn">Changed by an applied edit</div>` : ""}
       <div class="d-actions">
-        <button type="button" id="an-lesion" class="btn" title="Adds an edit that zeroes this unit's output weights to the Workbench stack. Nothing changes until you apply the stack.">Lesion in Workbench</button>
+        <button type="button" id="an-lesion" class="btn" title="Adds an edit that zeroes this unit's output weights to the edit stack in Tune. Nothing changes until you apply the stack.">Lesion in Tune</button>
         <button type="button" id="an-focus" class="btn ghost">Center in graph</button>
       </div>
       <div class="wb-msg" id="an-lesion-msg" role="status"></div>
@@ -1028,7 +1030,7 @@ async function lesion(ev) {
   try {
     const e = await post(`/brainscan/anatomy/units/${g}/lesion`, { factor: 0 });
     msg.className = "wb-msg ok";
-    msg.innerHTML = `Added “${esc(e.summary)}” to the Workbench stack. Apply it there; recordings made while it is applied are tagged.`;
+    msg.innerHTML = `Added “${esc(e.summary)}” to the edit stack in Tune. Apply it there; recordings made while it is applied are tagged.`;
   } catch (err) { msg.className = "wb-msg error"; msg.textContent = err.message; }
   ev.target.disabled = false;
 }
@@ -1394,7 +1396,8 @@ function setupInput() {
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
     if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); openPalette(); return; }
     if (typing) return;
-    if (ev.key === "/") { ev.preventDefault(); openPalette(); }
+    if (ev.key === "/" && !ev.shiftKey) { ev.preventDefault(); openPalette(); }  // shift-/ is ? (the guide)
+    else if (ev.key === "?" || ev.key === "/") { /* the guide handles it */ }
     else if (ev.key === "Escape") {
       if (!$("#gv-palette").hidden) closePalette();
       else if (A.sel.size) clearSelection();
@@ -1453,6 +1456,12 @@ function boot() {
   // A hidden view catches up in activate(), so switching runs in the Scanner costs nothing here.
   document.addEventListener("brainscan:run", (ev) => { if (A.atlas && A.visible && ev.detail !== A.runId) openRun(ev.detail); });
   document.addEventListener("brainscan:focus-layer", (ev) => { if (A.atlas) graph.flyToLayer(Number(ev.detail)); });
+  document.addEventListener("brainscan:trace", (ev) => {  // from the guide
+    const d = ev.detail || {};
+    if (d.mode) setMode(d.mode);
+    if (d.paths) openPaths(d.paths === true ? undefined : d.paths);
+    if (d.palette) openPalette();
+  });
   const recolor = () => { readColors(); renderLegend(); schedule(); resetThumbs(); if (H.tile && $("#an-heat")) { drawHeat(); renderHeatInfo(); } };
   $("#theme-toggle").addEventListener("click", recolor);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", recolor);

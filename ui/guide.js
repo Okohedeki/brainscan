@@ -1,0 +1,104 @@
+// The guide: every tool in Brainscan on one page, in workflow order (watch a run, trace it, tune the
+// weights), each with a "Show me" that takes you there. Opens from the ? button or the ? key, and on
+// the first visit.
+
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const SEEN = "brainscan-guide-seen";
+
+const go = (view, then) => () => {
+  document.dispatchEvent(new CustomEvent("brainscan:show", { detail: view }));
+  if (then) requestAnimationFrame(() => setTimeout(then, 60));
+};
+const trace = (detail) => document.dispatchEvent(new CustomEvent("brainscan:trace", { detail }));
+const scrollTo = (sel) => () => $(sel)?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+const STEPS = [
+  {
+    view: "scanner", n: 1, title: "Watch", lead: "Run any agent on the model and see every token's internals as it works.",
+    tools: [
+      { name: "Connect an agent", what: "Point any OpenAI-compatible harness at the endpoint below. Each request becomes a recorded run.", endpoint: true },
+      { name: "Transcript and timeline", what: "Messages, tool calls and results lined up with a per-token timeline: events, logit lens by layer, surprisal, projections onto directions.", act: go("scanner") },
+      { name: "Token inspector", what: "Click any token to see what the model predicted there, layer by layer.", act: go("scanner", scrollTo("#h-inspector")) },
+      { name: "Steering", what: "Add, ablate or clamp a direction at a layer while the model generates. Requests made with steering on are marked.", act: go("scanner", scrollTo("#h-steer")) },
+    ],
+  },
+  {
+    view: "weights", n: 2, title: "Trace", lead: "Open the model as a graph of attention heads and MLP neuron clusters, and follow a token through it.",
+    tools: [
+      { name: "Live unit graph", what: "Every head and neuron cluster, lit by how much it wrote at the current token. Scroll to zoom, drag to pan, replay the run on the timeline.", act: go("weights") },
+      { name: "Explain the next token", key: "A", what: "Color each unit by how much it pushed the next token up or down. Click a runner-up token to explain it instead.", act: go("weights", () => trace({ mode: "attr" })) },
+      { name: "Path explorer", key: "P", what: "Strongest routes out of or into a selection, between selected units, or the circuit behind the next token. Select all, frame, copy as JSON.", act: go("weights", () => trace({ paths: "explain" })) },
+      { name: "Select many units", key: "⇧", what: "Shift-click to add a unit, shift-drag a box to select a region, alt-drag to remove. Esc clears.", act: go("weights") },
+      { name: "Inside a unit", what: "Open a unit for its weights, what it writes, its connections, and at the current token: a head's attention pattern or a cluster's neurons, expandable in the graph.", act: go("weights", () => trace({ palette: true })) },
+    ],
+  },
+  {
+    view: "workbench", n: 3, title: "Tune", lead: "Change the weights, measure what changed, and export the variant.",
+    tools: [
+      { name: "Find a direction", what: "Two sets of examples give a direction in the residual stream, scored at every layer on held-out examples.", act: go("workbench", scrollTo("#h-find")) },
+      { name: "Edit weights", what: "Remove a direction from the weights, or scale a block, head or neuron (a lesion at 0). Lesion any unit straight from the Trace graph.", act: go("workbench", scrollTo("#h-edit")) },
+      { name: "Compare", what: "Run prompts on the original and edited weights side by side, with side-effect checks on neutral text.", act: go("workbench", scrollTo("#h-compare")) },
+      { name: "Export", what: "Save the edited model as a Hugging Face checkpoint with every edit recorded.", act: go("workbench", scrollTo("#h-export")) },
+    ],
+  },
+];
+
+const KEYS = [
+  ["?", "this guide"], ["⌘K or /", "jump to a unit"], ["A", "explain next token"], ["P", "paths"],
+  ["Space", "replay"], ["← →", "step tokens"], ["F", "fit graph"], ["Esc", "clear / close"],
+];
+
+function render() {
+  const endpoint = `${location.origin}/v1`;
+  $("#guide-body").innerHTML = `
+    <div class="guide-steps">${STEPS.map((s, si) => `
+      <section class="guide-step">
+        <header><span class="step-n">${s.n}</span><div><h3>${s.title}</h3><p>${esc(s.lead)}</p></div></header>
+        <ul>${s.tools.map((t, ti) => `<li>
+          <div class="tool-head"><b>${esc(t.name)}</b>${t.key ? `<kbd>${esc(t.key)}</kbd>` : ""}</div>
+          <p>${esc(t.what)}</p>
+          ${t.endpoint ? `<div class="endpoint"><code>${esc(endpoint)}</code><button type="button" class="link" data-copy="${esc(endpoint)}">Copy</button></div>`
+            : `<button type="button" class="link" data-step="${si}" data-tool="${ti}">Show me →</button>`}
+        </li>`).join("")}</ul>
+      </section>`).join("")}
+    </div>
+    <div class="guide-keys">${KEYS.map(([k, v]) => `<span><kbd>${esc(k)}</kbd> ${esc(v)}</span>`).join("")}</div>`;
+  $("#guide-body").querySelectorAll("[data-step]").forEach((b) => {
+    b.onclick = () => { close(); STEPS[Number(b.dataset.step)].tools[Number(b.dataset.tool)].act(); };
+  });
+  $("#guide-body").querySelectorAll("[data-copy]").forEach((b) => {
+    b.onclick = async () => {
+      try { await navigator.clipboard.writeText(b.dataset.copy); b.textContent = "Copied"; } catch { b.textContent = "Select and copy"; }
+      setTimeout(() => { b.textContent = "Copy"; }, 1600);
+    };
+  });
+}
+
+let lastFocus = null;
+function open() {
+  render();
+  lastFocus = document.activeElement;
+  $("#guide").hidden = false;
+  $("#guide-close").focus();
+  try { localStorage.setItem(SEEN, "1"); } catch { /* storage unavailable */ }
+}
+function close() {
+  if ($("#guide").hidden) return;
+  $("#guide").hidden = true;
+  lastFocus?.focus?.();
+}
+
+function boot() {
+  $("#help-btn").onclick = open;
+  $("#guide-close").onclick = close;
+  $("#guide").addEventListener("pointerdown", (ev) => { if (ev.target.id === "guide") close(); });
+  document.addEventListener("keydown", (ev) => {
+    if (!$("#guide").hidden && ev.key === "Escape") { ev.stopImmediatePropagation(); close(); return; }
+    const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "") || document.activeElement?.isContentEditable;
+    if (!typing && (ev.key === "?" || (ev.key === "/" && ev.shiftKey))) { ev.preventDefault(); if ($("#guide").hidden) open(); else close(); }
+  }, true);
+  const seen = (() => { try { return localStorage.getItem(SEEN); } catch { return "1"; } })();
+  if (!seen) open();
+}
+boot();

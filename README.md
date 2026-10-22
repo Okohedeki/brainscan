@@ -1,10 +1,22 @@
 # Brainscan
 
-An open lab for watching the inside of an open-weights model while it works through real
-multi-step agent tasks. The recorder sits behind an OpenAI-compatible endpoint, so any agent
-harness can use it as a drop-in model. Every token's internals are recorded and lined up with
-what the agent does: tool calls, tool results, errors, test outcomes, file edits, verdicts.
-The scanner UI shows it live.
+A tracing and tuning platform for open-weights models. The recorder sits behind an
+OpenAI-compatible endpoint, so any agent harness can use it as a drop-in model. Every token's
+internals are recorded and lined up with what the agent does: tool calls, tool results, errors,
+test outcomes, file edits, verdicts. You can then trace any token back through the model's
+attention heads and neurons, and change the weights and measure what changed.
+
+The UI follows that workflow in three tabs:
+
+1. **Watch**: the run live: transcript, a per-token timeline (logit lens, surprisal,
+   projections onto directions), a token inspector, and runtime steering.
+2. **Trace**: the model as a graph of attention heads and MLP neuron clusters. Explain the next
+   token by attribution, find paths through the graph, and open any unit down to its neurons and
+   attention pattern at a token.
+3. **Tune**: find directions from examples, edit the weights (remove a direction, lesion a head
+   or neuron), compare original and edited side by side, and export the variant.
+
+Press `?` anywhere in the UI for a guide to every tool, with a "Show me" link to each.
 
 Readouts are functional measurements (logit-lens probabilities, projections onto contrast
 vectors built from example texts). Each is labelled by how it was built. Nothing here measures
@@ -32,7 +44,7 @@ experience.
   demos for the UI, not validated probes.
 - **Storage**: `runs/<run>/` holds Parquet token tables, JSONL events and transcript entries, and
   safetensors decision residuals, under a disk budget.
-- **Scanner UI** at `http://localhost:8765/`: transcript, a shared token timeline (event lane,
+- **Watch tab** at `http://localhost:8765/`: transcript, a shared token timeline (event lane,
   logit-lens heatmap by layer, surprisal and entropy, projections against the random control and
   a |z| ≤ 2 band), a token inspector, and steering controls.
 - **Mini agent harness** with three tasks: `fix_fizzbuzz`, `toml_lite`, and `impossible_clamp`
@@ -41,11 +53,11 @@ experience.
   collapsible thinking in the transcript; `--thinking on|off` on the harness, or
   `chat_template_kwargs` per request.
 
-## Workbench: edit the weights
+## Tune: edit the weights
 
-The Workbench tab changes the model's parameters, the way "abliterated" models are made, and
-measures what that does. Runtime steering (Scanner tab) edits activations during a run; the
-workbench edits the weights themselves.
+The Tune tab changes the model's parameters, the way "abliterated" models are made, and
+measures what that does. Runtime steering (Watch tab) edits activations during a run; Tune edits
+the weights themselves.
 
 1. **Find a direction.** Paste two sets of examples. Brainscan reads the residual stream for each
    at every layer, takes the difference of the set means, and charts how well each layer's
@@ -69,9 +81,9 @@ workbench edits the weights themselves.
 4. **Export.** Saves the edited weights as a Hugging Face checkpoint with `brainscan_edits.json`
    recording the base model and every edit.
 
-## Weights: the model as a live graph
+## Trace: the model as a live graph
 
-The Weights tab draws the model as a node graph on a zoomable canvas. Layers run left to right
+The Trace tab draws the model as a node graph on a zoomable canvas. Layers run left to right
 along the residual stream; each layer's attention heads sit above it and its MLP neurons, grouped
 into clusters by the direction of their output weights (64 per layer by default), sit below.
 
@@ -93,10 +105,32 @@ into clusters by the direction of their output weights (64 per layer by default)
 - **A unit.** Clicking a node opens a drawer: its output and input weights as a heatmap you can
   zoom down to single weights, the value histogram and singular values, the tokens its main write
   direction promotes and suppresses through the unembedding, its strongest connections, its most
-  active tokens in the run, its neurons, and a button that adds a lesion of it to the Workbench
-  stack. The token embedding and unembedding nodes open their matrices the same way.
+  active tokens in the run, its neurons, and a button that adds a lesion of it to the edit stack
+  in Tune. The token embedding and unembedding nodes open their matrices the same way.
 - **Timeline.** The dock follows a live run (units hit per token, or the selected unit's activity)
   and can replay a recorded one token by token.
+
+### Tracing a token
+
+Tracing re-runs the run's context up to a token on the current weights (a couple of seconds for a
+few hundred tokens on Qwen3.5-9B; results are cached) and reads every unit exactly.
+
+- **Attribution** (`A`). Colors each unit by its direct effect on the next token's logit: its
+  write at this token, read through the final norm (with its scale held at the recorded value)
+  and the target's unembedding row. The units plus the embedding add up to the logit. The dock
+  shows the target, its probability and the runner-up tokens; click one to explain it instead.
+  This is the direct effect only; effects a unit has through later layers are not counted.
+- **Selection.** Shift-click adds a unit, shift-drag selects a box (alt-drag removes), Esc clears.
+- **Paths** (`P`). A beam search over the composition edges: the strongest routes out of the
+  selection, into it, between selected units, or the circuit behind the next token (the units
+  with the largest positive attribution and the active units feeding them). Paths can be weighted
+  by activity at the current token. Select all or none, frame them, add their units to the
+  selection, or copy them as JSON.
+- **At this token.** A unit's drawer shows its attribution and, for a full-attention head, where
+  it attended from this token (click a token to jump there); for an MLP cluster, every neuron's
+  activation and effect on the next token, and a grid of its neurons inside the graph node.
+  Linear-attention heads keep a running state rather than attending to earlier tokens, so they
+  have no attention pattern.
 
 Activity costs one byte per unit per token (2,944 units, about 3 KB per token, for Qwen3.5-9B) and
 is stored under `runs/<run>/anatomy/`. The first start on a model clusters the neurons and scores
@@ -160,8 +194,8 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 | `BRAINSCAN_MAX_CONTEXT` | `16384` | Prompt plus completion limit |
 | `BRAINSCAN_PREFILL_LENS` | `1` | Logit lens on prompt and tool-result tokens too |
 | `BRAINSCAN_DECISION_RESIDUALS` | `1` | Save full residual stacks at decision points |
-| `BRAINSCAN_ANATOMY` | `1` | Record per-token unit activity for the Weights tab; `0` turns it off |
-| `BRAINSCAN_ANATOMY_CLUSTERS` | `64` | MLP neuron clusters per layer in the Weights tab |
+| `BRAINSCAN_ANATOMY` | `1` | Record per-token unit activity for the Trace tab; `0` turns it off |
+| `BRAINSCAN_ANATOMY_CLUSTERS` | `64` | MLP neuron clusters per layer in the Trace tab |
 | `BRAINSCAN_GRAPH_DECODE` | `1` | Replay decode steps from CUDA graphs (same outputs, about 3x faster); `0` decodes eagerly |
 
 ## Known limits
@@ -191,24 +225,29 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
   output weights doesn't fully remove it from the stream. Mixture-of-experts MLPs (GPT-OSS) are
   not edited yet. Head scaling needs standard attention (`o_proj`); Qwen3.5's linear-attention
   layers have none.
-- **Weights tab measures are coarse.** Per-neuron activations are not recorded, only each
-  cluster's write mass, which is an upper bound on what the cluster writes together. Unit labels
-  read write directions straight through the unembedding, which is noisy in early layers. Edges use
-  each unit's top four output directions and the original weights. MoE layers have no clusters yet.
-- **Not built yet:** SAE features, attention summaries, MoE routing capture, and nnsight-based
-  analysis modules. One request runs at a time.
+- **Recorded unit activity is coarse.** During a run only each cluster's write mass is recorded,
+  an upper bound on what the cluster writes together; tracing recomputes exact per-neuron values
+  for one token on demand. Unit labels read write directions straight through the unembedding,
+  which is noisy in early layers. Edges use each unit's top four output directions and the
+  original weights. MoE layers have no clusters yet.
+- **Attribution is direct effect only**, on the current weights (a warning shows when they differ
+  from the recording), and paths follow weight-based edges, not measured causal effects.
+  Tracing waits while the model is generating.
+- **Not built yet:** SAE features, MoE routing capture, and nnsight-based analysis modules. One
+  request runs at a time.
 
 ## Layout
 
 ```
 brainscan/recorder/   model loading, hooks, chat rendering, events, storage, session, directions,
-                      weight edits (edits.py), workbench checks (workbench.py), and the weight
-                      graph's units, activity probe and edges (anatomy.py)
+                      weight edits (edits.py), workbench checks (workbench.py), the weight
+                      graph's units, activity probe and edges (anatomy.py), and token tracing:
+                      attribution, neurons and attention at a token (tracing.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
-ui/                   scanner, weight graph (graph.js, weights.js) and workbench (plain HTML,
-                      CSS and canvas JavaScript; no build step)
+ui/                   Watch (app.js), Trace (graph.js, weights.js, paths.js), Tune (workbench.js)
+                      and the guide (guide.js): plain HTML, CSS and canvas JavaScript; no build step
 reports/              research reports
 tests/                unit tests (pytest)
 ```
