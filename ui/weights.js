@@ -487,7 +487,8 @@ function updateTrace() {
   stopFollow();
   A.trace = { t: info.t, start: visTok(A.tok[info.t]?.tx ?? info.token), end: visTok(info.target.text), routes, cmp };
   if (!A.pathsOpen) {
-    A.paths = routes.map((r) => ({ ...r, on: true, focus: false }));
+    A.traceFocus = 0;  // one route at a time reads clearly; the others stay faint
+    A.paths = routes.map((r, i) => ({ ...r, on: true, focus: i === 0 }));
     if (A.frameTrace) { A.frameTrace = false; requestAnimationFrame(() => graph.fitTrace(routeUnits())); }
   }
   pathsChanged();
@@ -503,9 +504,13 @@ function clearTrace() {
   pathsChanged();
 }
 
-function focusRoute(i, on) {
+/** Light up route i (hover); `pin` keeps it lit; un-hovering goes back to the pinned route. */
+function focusRoute(i, on, pin = false) {
   if (A.pathsOpen || !A.trace) return;
-  A.paths.forEach((p, j) => { p.focus = on && j === i; });
+  if (pin) A.traceFocus = i;
+  const lit = on ? i : A.traceFocus;
+  A.paths.forEach((p, j) => { p.focus = j === lit; });
+  document.querySelectorAll(".routes li[data-i]").forEach((li) => li.classList.toggle("pinned", Number(li.dataset.i) === A.traceFocus));
   pushState();
 }
 
@@ -519,7 +524,7 @@ function followRoute(i) {
   stopFollow();
   const r = A.trace?.routes[i];
   if (!r) return;
-  focusRoute(i, true);
+  focusRoute(i, true, true);
   const steps = ["start", ...r.units, "end"];
   const li = document.querySelector(`.routes li[data-i="${i}"]`);
   const marks = li ? [...li.querySelectorAll("[data-step]")] : [];
@@ -1019,14 +1024,15 @@ async function renderTokenPanel() {
   box.querySelectorAll(".routes li[data-i]").forEach((li) => {
     const i = Number(li.dataset.i), r = A.trace?.routes[i];
     li.onmouseenter = () => focusRoute(i, true);
-    li.onmouseleave = () => { if (!A.followTimer) focusRoute(i, false); };
+    li.onmouseleave = () => { if (!A.followTimer) focusRoute(i, false); };  // back to the pinned route
     li.onclick = (ev) => {
       const chip = ev.target.closest(".pchip[data-g]");
       if (chip) { const g = Number(chip.dataset.g); selectUnit(g); graph.flyTo(g, Math.max(graph.target.s, 1.6)); return; }
-      if (r) { focusRoute(i, true); graph.fitTrace(r.units); }
+      if (r) { focusRoute(i, true, true); graph.fitTrace(r.units); }
     };
+    li.classList.toggle("pinned", i === A.traceFocus);
   });
-  $("#tp-follow")?.addEventListener("click", () => followRoute(0));
+  $("#tp-follow")?.addEventListener("click", () => followRoute(A.traceFocus || 0));
   $("#tp-frame")?.addEventListener("click", () => graph.fitTrace(routeUnits()));
   $("#tp-trace-off")?.addEventListener("click", () => { A.traceOn = false; clearTrace(); renderTokenPanel(); });
   $("#tp-trace-on")?.addEventListener("click", () => { A.traceOn = true; updateTrace(); renderTokenPanel(); });
@@ -1045,6 +1051,11 @@ function topUnits(info, n, positive) {
 function tokenPanelHtml(info, lens) {
   const o = info.orig, fmtL = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}`;
   const ctxTok = A.tok[info.t]?.tx ?? info.token;
+  // The word being explained: one the model generated, one from the prompt (typed by you or a tool),
+  // or a runner-up picked from the chips.
+  const ofRec = A.tok[A.attrOf ?? nextSlot(info.t)];
+  const chosen = A.attrOf == null && A.attrTarget != null && !(ofRec && A.attrInfo?.target?.text === ofRec.tx);
+  const typed = !chosen && !!ofRec && ofRec.ph !== "gen";
   const alts = info.alternatives.filter((a) => a.id !== info.target.id).slice(0, 5).map((a) =>
     `<button type="button" class="alt" data-id="${a.id}" title="Explain this candidate instead">${esc(visTok(a.text))} <span class="dim">${fmtP(a.prob)}</span></button>`).join("");
   const unitRows = (gs) => {
@@ -1057,8 +1068,12 @@ function tokenPanelHtml(info, lens) {
     }).join("");
   };
   return `<div class="d-hero">
-      <div class="d-kicker">After <span class="mono">${esc(visTok(ctxTok))}</span> (t${info.t}) the model wrote</div>
+      <div class="d-kicker">${typed
+        ? `You wrote this after <span class="mono">${esc(visTok(ctxTok))}</span> (t${info.t}): how the model predicted it`
+        : `After <span class="mono">${esc(visTok(ctxTok))}</span> (t${info.t}) the model ${chosen ? "could have written" : "wrote"}`}</div>
       <div class="tp-target"><span class="tok-chip target big">${esc(visTok(info.target.text))}</span></div>
+      ${typed && info.target.rank > 1 ? `<p class="hint tp-note">The model didn't expect this word: it ranked it #${info.target.rank} and expected
+        <b>${esc(visTok(info.alternatives[0].text))}</b> (${fmtP(info.alternatives[0].prob)}) instead.</p>` : ""}
       <div class="d-stats">
         <div><span>probability</span><b>${fmtP(info.target.prob)}</b></div>
         <div><span>rank</span><b>#${info.target.rank}</b></div>
@@ -1357,9 +1372,11 @@ function renderLegend() {
   const e = A.edges;
   $("#gv-legend").innerHTML = `
     <div class="lg-row"><span class="lg-grad" style="background:${g}"></span><span>${scale}</span></div>
-    ${A.trace && !A.pathsOpen ? `<div class="lg-row"><span class="lg-line" style="background:${C.path}"></span><span>trace: START <b>${esc(A.trace.start)}</b> (embedding) → units → END <b>${esc(A.trace.end)}</b> (unembedding)</span></div>`
+    ${A.trace && !A.pathsOpen ? `<div class="lg-row"><span class="lg-line" style="background:${C.busA}"></span><span>residual stream: carries the text left to right, from START <b>${esc(A.trace.start)}</b> to END <b>${esc(A.trace.end)}</b></span></div>
+      <div class="lg-row"><span class="lg-line dashed" style="border-color:${C.path}"></span><span>START feeds the route's first unit</span></div>
+      <div class="lg-row"><span class="lg-line" style="background:${C.pathFocus}"></span><span>each unit reads the one before; the last writes into END (numbered: the lit route)</span></div>`
       : A.paths.some((p) => p.on) ? `<div class="lg-row"><span class="lg-line" style="background:${C.path}"></span><span>highlighted paths</span><span class="lg-ring" style="border-color:${C.multiSelect}"></span><span>selected</span></div>` : ""}
-    ${A.edgeMode !== "off" ? `<div class="lg-row"><span class="lg-line" style="background:${C.edgeCircuit}"></span><span>${A.selected != null ? `<span style="color:${C.edgeIn}">inputs</span> · <span style="color:${C.edgeOut}">outputs</span> of the selected unit` : A.edgeMode === "circuit" ? "composition between units active now" : "edges of the unit under the cursor"}</span></div>` : ""}
+    ${A.edgeMode !== "off" && !(A.trace && !A.pathsOpen && A.selected == null) ? `<div class="lg-row"><span class="lg-line" style="background:${C.edgeCircuit}"></span><span>${A.selected != null ? `<span style="color:${C.edgeIn}">inputs</span> · <span style="color:${C.edgeOut}">outputs</span> of the selected unit` : A.edgeMode === "circuit" ? "composition between units active now" : "edges of the unit under the cursor"}</span></div>` : ""}
     <div class="lg-row"><span class="lg-ring" style="border-color:${C.trail}"></span><span>hit in the last few tokens</span><span class="lg-dot" style="background:${C.edited}"></span><span>edited</span></div>
     <details><summary>How to read this</summary>
       <p><b>Nodes.</b> Attention heads sit above the residual stream, MLP neuron clusters below; one column per layer. ${esc(A.atlas?.measures?.head || "")} ${esc(A.atlas?.measures?.cluster || "")} ${esc(A.atlas?.measures?.clusters || "")}</p>

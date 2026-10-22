@@ -568,6 +568,7 @@ table.cmp pre { margin: 4px 0 0; white-space: pre-wrap; font: 12px/1.5 var(--mon
 .gv-legend .lg-row { display: flex; align-items: center; gap: 8px; margin: 2px 0; }
 .lg-grad { width: 84px; height: 8px; border-radius: 4px; flex: none; }
 .lg-line { width: 22px; height: 2px; border-radius: 2px; flex: none; }
+.lg-line.dashed { height: 0; border-top: 2px dashed; background: none; border-radius: 0; }
 .lg-ring { width: 10px; height: 10px; border-radius: 50%; border: 2px solid; flex: none; }
 .lg-dot { width: 8px; height: 8px; border-radius: 50%; flex: none; margin-left: 8px; }
 .gv-legend details { margin-top: 6px; }
@@ -871,6 +872,8 @@ button.stop:hover:not(:disabled) { background: color-mix(in srgb, var(--critical
 .rt-val { margin-left: auto; font: 600 11px var(--mono); }
 .rt-val.pos { color: var(--div-pos); }
 .rt-val.neg { color: var(--div-neg); }
+.routes li.pinned { background: color-mix(in srgb, var(--path) 12%, transparent); border-color: color-mix(in srgb, var(--path) 45%, transparent); }
+.tp-note { margin: 0 0 8px; }
 .routes .now { outline: 2px solid var(--path-focus); outline-offset: 1px; background: color-mix(in srgb, var(--path) 22%, transparent); }
 .tp-tools { padding-top: 4px; }
 .ko-list { list-style: none; margin: 6px 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
