@@ -29,6 +29,7 @@ const STEPS = [
     tools: [
       { name: "Live unit graph", what: "Every head and neuron cluster, lit by how much it wrote at the current token. Scroll to zoom, drag to pan, replay the run on the timeline.", act: go("weights") },
       { name: "Explain the next token", key: "A", what: "Color each unit by how much it pushed the next token up or down. Click a runner-up token to explain it instead.", act: go("weights", () => trace({ mode: "attr" })) },
+      { name: "Before and after an edit", what: "With weight edits applied, turn on \"vs original\" in Explain: each unit is colored by how the edit changed its effect on the token, the dock shows the probability before → after, and Paths traces the circuit behind the change.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Path explorer", key: "P", what: "Strongest routes out of or into a selection, between selected units, or the circuit behind the next token. Select all, frame, copy as JSON.", act: go("weights", () => trace({ paths: "explain" })) },
       { name: "Select many units", key: "⇧", what: "Shift-click to add a unit, shift-drag a box to select a region, alt-drag to remove. Esc clears.", act: go("weights") },
       { name: "Inside a unit", what: "Open a unit for its weights, what it writes, its connections, and at the current token: a head's attention pattern or a cluster's neurons, expandable in the graph.", act: go("weights", () => trace({ palette: true })) },
@@ -38,7 +39,7 @@ const STEPS = [
     view: "workbench", n: 3, title: "Tune", lead: "Change the weights, measure what changed, and export the variant.",
     tools: [
       { name: "Find a direction", what: "Two sets of examples give a direction in the residual stream, scored at every layer on held-out examples.", act: go("workbench", scrollTo("#h-find")) },
-      { name: "Edit weights", what: "Remove a direction from the weights, or scale a block, head or neuron (a lesion at 0). Lesion any unit straight from the Trace graph.", act: go("workbench", scrollTo("#h-edit")) },
+      { name: "Edit weights", what: "Remove a direction from the weights, or scale a block, head or neuron (a lesion at 0). Lesion any unit straight from the Trace graph, then compare its circuit with the original there.", act: go("workbench", scrollTo("#h-edit")) },
       { name: "Compare", what: "Run prompts on the original and edited weights side by side, with side-effect checks on neutral text.", act: go("workbench", scrollTo("#h-compare")) },
       { name: "Export", what: "Save the edited model as a Hugging Face checkpoint with every edit recorded.", act: go("workbench", scrollTo("#h-export")) },
     ],

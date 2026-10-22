@@ -309,8 +309,10 @@ class EditStack:
 
     @contextlib.contextmanager
     def suspended(self):
-        """Temporarily run on the original weights, then restore exactly the applied edits."""
-        ids = list(self.applied)
+        """Temporarily run on the original weights, then restore exactly the applied edits. The
+        version differs inside and is the same again after, since the weights are then identical
+        to before (so caches keyed by it, like the recorder's KV prefix, stay valid)."""
+        ids, version = list(self.applied), self.version
         if not ids:
             yield
             return
@@ -319,6 +321,7 @@ class EditStack:
             yield
         finally:
             self._apply_ids(ids)
+            self.version = version
 
     def active(self) -> list[dict]:
         return [self.edits[eid].describe() for eid in self.applied if eid in self.edits]

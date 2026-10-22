@@ -11,6 +11,7 @@ const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "
 const cssVar = (name) => getComputedStyle(document.documentElement).getPropertyValue(name).trim();
 const visTok = (s) => (s ?? "").replace(/\n/g, "⏎").replace(/\t/g, "⇥").replace(/ /g, "·") || "∅";
 const clamp = (x, a, b) => Math.max(a, Math.min(b, x));
+const fmtP = (p) => (p >= 0.001 || p === 0 ? p.toFixed(3) : p.toExponential(1));  // small probabilities stay readable
 const num = (x, d = 3) => (x == null || Number.isNaN(x) ? "–"
   : x !== 0 && (Math.abs(x) >= 1e4 || Math.abs(x) < 1e-3) ? Number(x).toExponential(2) : Number(x).toFixed(d));
 async function api(path, opts) {
@@ -42,6 +43,7 @@ const A = {
   sel: new Set(),                    // multi-selected units
   attr: null, attrN: null,           // per-unit attribution of the next token at the cursor (raw, scaled to [-1, 1])
   attrInfo: null, attrTarget: null, attrSeq: 0, attrTimer: 0,
+  cmp: false, attrOrig: null, attrDiff: null,  // "vs original": attribution with the weight edits lifted, and the change
   paths: [], pathMode: "down", pathHops: 3, pathBranch: 4, pathActivity: true, pathsOpen: false,
   expanded: new Map(),               // cluster g -> Float32Array neuron activity in [-1, 1] at the cursor
   tokenTimer: 0, tokenSeq: 0,
@@ -156,7 +158,8 @@ function resetRunData() {
   A.hitCache = new Map(); A.hitBase = 0; A.cursor = null; A.skipped = 0; A.statN = -1; A.meta = null;
   if (A.trail) A.trail.fill(0);
   // Token-level tracing belongs to the old run; the selection and path settings carry over.
-  A.attr = null; A.attrN = null; A.attrInfo = null; A.attrTarget = null; A.attrSeq++; clearTimeout(A.attrTimer);
+  A.attr = null; A.attrN = null; A.attrInfo = null; A.attrTarget = null; A.attrOrig = null; A.attrDiff = null;
+  A.attrSeq++; clearTimeout(A.attrTimer);
   A.expanded.clear();
 }
 
@@ -292,6 +295,7 @@ function handle(msg) {
     case "workbench":
       refreshEdited();
       if (A.selected != null && A.visible) selectUnit(A.selected, true);  // the weights changed
+      if (A.mode === "attr" && A.visible) loadExplain();
       break;
     case "status":
       if (!A.atlas && A.visible) activate();
@@ -419,15 +423,21 @@ function renderReadout() {
     else if (info.busy) html += `<span class="muted">The model is generating; tracing when it pauses…</span>`;
     else if (info.error) html += `<span class="warn-text">${esc(info.error)}</span>`;
     else {
+      const o = info.orig, sign = (x) => (x >= 0 ? "+" : "−") + Math.abs(x).toFixed(2);
       html += `<span class="arrow">→</span><span class="tok-chip target">${esc(visTok(info.target.text))}</span>
-        <span class="meta">p ${info.target.prob.toFixed(3)} · logit ${info.target.logit.toFixed(2)}</span>
+        ${o ? `<span class="meta" title="original weights → edited weights">p ${fmtP(o.target.prob)} → ${fmtP(info.target.prob)} · logit ${sign(info.target.logit - o.logit)}</span>`
+          : `<span class="meta">p ${fmtP(info.target.prob)} · logit ${info.target.logit.toFixed(2)}</span>`}
         <span class="alts">${info.alternatives.filter((a) => a.id !== info.target.id).slice(0, 4).map((a) =>
-          `<button type="button" class="alt" data-id="${a.id}" title="Explain this candidate instead (p ${a.prob.toFixed(3)})">${esc(visTok(a.text))}</button>`).join("")}</span>`;
-      if (!info.weights_match) html += `<span class="warn-text" title="Tracing uses the current weights">weights differ from the recording</span>`;
+          `<button type="button" class="alt" data-id="${a.id}" title="Explain this candidate instead (p ${fmtP(a.prob)})">${esc(visTok(a.text))}</button>`).join("")}</span>`;
+      if (info.weights_edited) {
+        html += `<button type="button" class="tbtn cmp" id="an-cmp" aria-pressed="${A.cmp}" title="Color units by how the applied weight edits changed their effect on this token">vs original</button>`;
+      }
+      if (!info.weights_match && !o) html += `<span class="warn-text" title="Tracing uses the current weights">weights differ from the recording</span>`;
     }
   }
   el.innerHTML = html;
   $("#an-explain-btn")?.addEventListener("click", () => setMode("attr"));
+  $("#an-cmp")?.addEventListener("click", toggleCompare);
   el.querySelectorAll(".alt[data-id]").forEach((b) => { b.onclick = () => { A.attrTarget = b.dataset.id; loadExplain(); }; });
 }
 
@@ -452,7 +462,23 @@ function scheduleTokenWork() {
 }
 
 const tokenUrl = (t) => `/brainscan/runs/${encodeURIComponent(A.runId)}/tokens/${t}`;
-const fetchExplain = (t, target) => api(`${tokenUrl(t)}/explain${target != null ? `?target=${encodeURIComponent(target)}` : ""}`);
+function fetchExplain(t, target, weights) {
+  const q = new URLSearchParams();
+  if (target != null) q.set("target", target);
+  if (weights) q.set("weights", weights);
+  const qs = q.toString();
+  return api(`${tokenUrl(t)}/explain${qs ? `?${qs}` : ""}`);
+}
+
+/** Scale to [-1, 1] on a square-root scale, so mid-sized effects stay visible; returns [scaled, max]. */
+function sqrtScale(arr) {
+  let m = 1e-9;
+  for (const x of arr) m = Math.max(m, Math.abs(x));
+  return [arr.map((x) => Math.sign(x) * Math.sqrt(Math.abs(x) / m)), m];
+}
+
+/** What the graph colors and the next-token paths start from: the attribution, or its change. */
+const attrView = () => A.attrDiff || A.attr;
 
 async function loadExplain() {
   const t = A.cursor, seq = ++A.attrSeq, target = A.attrTarget;
@@ -463,18 +489,29 @@ async function loadExplain() {
   try {
     const ex = await fetchExplain(t, target);
     if (seq !== A.attrSeq) return;
+    // Before/after: the same target token, traced again with the applied weight edits lifted.
+    const orig = A.cmp && ex.weights_edited ? await fetchExplain(t, ex.target.id, "original") : null;
+    if (seq !== A.attrSeq) return;
     A.attr = Float32Array.from(ex.contrib);
-    let m = 1e-9;
-    for (const x of A.attr) m = Math.max(m, Math.abs(x));
-    A.attrN = A.attr.map((x) => Math.sign(x) * Math.sqrt(Math.abs(x) / m));  // sqrt: mid-sized effects stay visible
-    A.attrInfo = { ...ex, t, max: m };
+    A.attrOrig = orig ? Float32Array.from(orig.contrib) : null;
+    A.attrDiff = orig ? A.attr.map((x, g) => x - A.attrOrig[g]) : null;
+    const [scaled, m] = sqrtScale(attrView());
+    A.attrN = scaled;
+    A.attrInfo = { ...ex, t, max: m, orig: orig && { target: orig.target, logit: orig.logit } };
   } catch (err) {
     if (seq !== A.attrSeq) return;
     A.attrInfo = err.status === 409 ? { busy: true, t } : { error: err.message, t };
     if (err.status === 409) A.attrTimer = setTimeout(() => { if (A.cursor === t) loadExplain(); }, 1500);
   }
   pushState(); renderReadout(); renderLegend();
+  if (A.pathsOpen) renderPathControls();
   if (A.pathsOpen && A.pathMode === "explain") runPathSearch(false);
+}
+
+function toggleCompare() {
+  A.cmp = !A.cmp;
+  loadExplain();
+  if (A.detailMode === "unit" && A.selected != null) renderTokenSection();
 }
 
 const shortName = (g) => { const u = A.units[g]; return `L${u.layer} ${u.kind === "head" ? "h" : "c"}${u.i}`; };
@@ -518,7 +555,9 @@ function closePaths() {
 }
 function renderPathControls() {
   setSeg("#gv-path-mode", "pm", A.pathMode);
-  $("#gv-path-hint").textContent = PATH_MODES[A.pathMode];
+  $("#gv-path-hint").textContent = A.pathMode === "explain" && A.attrDiff
+    ? "The circuit behind the change: the units whose effect on the next token the weight edits changed most, and the active units feeding them."
+    : PATH_MODES[A.pathMode];
   $("#gv-path-hops").value = A.pathHops; $("#gv-path-hops-v").textContent = A.pathHops;
   $("#gv-path-branch").value = A.pathBranch; $("#gv-path-branch-v").textContent = A.pathBranch;
   $("#gv-path-activity").checked = A.pathActivity;
@@ -553,7 +592,8 @@ function runPathSearch(frame) {
       if (!A.attrInfo?.loading || A.attrInfo?.t !== A.cursor) loadExplain();
       return;
     }
-    found = explainPaths(e, A.attr, opts);
+    // Comparing: start from the units whose effect the edits changed most, either way.
+    found = explainPaths(e, A.attrDiff ? A.attrDiff.map(Math.abs) : A.attr, opts);
   } else {
     const src = pathSources();
     if (!src.length) { pathMessage("Select units first: click one, shift-click to add more, or shift-drag a box on the graph."); return; }
@@ -588,7 +628,8 @@ function renderPathList() {
     </span>`;
   $("#gv-path-list").innerHTML = A.paths.map((p, i) => {
     const chips = p.units.map((g) => `<span class="pchip ${A.units[g].kind}">${shortName(g)}</span>`).join(`<span class="parrow">→</span>`);
-    const extra = p.root != null && A.attr ? `<span class="pattr">${A.attr[p.root] >= 0 ? "+" : ""}${A.attr[p.root].toFixed(2)}</span>` : "";
+    const v = p.root != null && A.attr ? attrView()[p.root] : null;
+    const extra = v != null ? `<span class="pattr" title="${A.attrDiff ? "change from the original weights" : "effect on the next token"}">${A.attrDiff ? "Δ" : ""}${v >= 0 ? "+" : ""}${v.toFixed(2)}</span>` : "";
     return `<li data-i="${i}" class="${p.on ? "on" : ""}${p.focus ? " focus" : ""}">
       <input type="checkbox" ${p.on ? "checked" : ""} aria-label="Show path ${i + 1}">
       <span class="ptext">${chips}</span>
@@ -615,7 +656,9 @@ function pathAction(act) {
   else if (act === "select") { for (const p of shown) for (const g of p.units) A.sel.add(g); pushState(); renderSelChip(); }
   else if (act === "copy") {
     const data = shown.map((p) => ({ path: p.units.map(shortName), units: p.units, score: +p.score.toFixed(5),
-      edges_x_chance: p.xs.map((x) => +x.toFixed(3)), ...(p.root != null && A.attr ? { attribution: +A.attr[p.root].toFixed(4) } : {}) }));
+      edges_x_chance: p.xs.map((x) => +x.toFixed(3)),
+      ...(p.root != null && A.attr ? { attribution: +A.attr[p.root].toFixed(4) } : {}),
+      ...(p.root != null && A.attrDiff ? { attribution_original: +A.attrOrig[p.root].toFixed(4) } : {}) }));
     navigator.clipboard?.writeText(JSON.stringify({ run: A.runId, token: A.cursor, mode: A.pathMode, paths: data }, null, 2));
   }
 }
@@ -633,16 +676,26 @@ async function renderTokenSection() {
   if (t == null || !A.runId) { box.innerHTML = `<p class="empty">Pick a token on the timeline to see what this unit did there.</p>`; return; }
   if (!box.innerHTML.trim()) box.innerHTML = `<div class="skeleton short"></div>`;
   try {
+    const target = A.mode === "attr" ? A.attrTarget : null;
     const [ex, more] = await Promise.all([
-      fetchExplain(t, A.mode === "attr" ? A.attrTarget : null),
-      api(`${tokenUrl(t)}/${u.kind === "cluster" ? "neurons" : "attention"}?unit=${g}`),
+      fetchExplain(t, target),
+      api(`${tokenUrl(t)}/${u.kind === "cluster" ? "neurons" : "attention"}?unit=${g}${u.kind === "cluster" && target != null ? `&target=${encodeURIComponent(target)}` : ""}`),
     ]);
+    const orig = A.cmp && ex.weights_edited ? await fetchExplain(t, ex.target.id, "original") : null;
     if (seq !== A.tokenSeq || A.selected !== g) return;
     const c = ex.contrib[g], rank = 1 + ex.contrib.filter((x) => Math.abs(x) > Math.abs(c)).length;
+    const fmt = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(3)}`;
+    const before = orig ? orig.contrib[g] : null;
     box.innerHTML = `<div class="tok-line"><span class="tok-chip">${esc(visTok(ex.token))}</span><span class="arrow">→</span>
         <span class="tok-chip target">${esc(visTok(ex.target.text))}</span>
-        <span class="attr-val ${c >= 0 ? "pos" : "neg"}">${c >= 0 ? "+" : ""}${c.toFixed(3)} logits</span></div>
-      <p class="hint">${c >= 0 ? "Pushed" : "Pulled"} the model's next token ${c >= 0 ? "toward" : "away from"} this candidate, by its direct write. #${rank} of ${A.U} units by size of effect.</p>
+        <span class="attr-val ${c >= 0 ? "pos" : "neg"}">${fmt(c)} logits</span></div>
+      <p class="hint">${Math.abs(c) < 5e-4
+        ? `No direct effect on this candidate${A.edited.has(g) ? "; its weights are changed by an applied edit" : ""}.`
+        : `${c >= 0 ? "Pushed" : "Pulled"} the model's next token ${c >= 0 ? "toward" : "away from"} this candidate, by its direct write. #${rank} of ${A.U} units by size of effect.`}</p>
+      ${orig ? `<div class="cmp-line"><span>original weights <b>${fmt(before)}</b></span><span class="arrow">→</span>
+        <span>edited <b>${fmt(c)}</b></span><span class="attr-val ${c - before >= 0 ? "pos" : "neg"}">Δ ${fmt(c - before)}</span></div>
+        <p class="hint">p(${esc(visTok(ex.target.text))}) ${fmtP(orig.target.prob)} → ${fmtP(ex.target.prob)} with the applied edits.
+        Below is the edited model.</p>` : ""}
       ${u.kind === "cluster" ? neuronsHtml(g, more) : attentionHtml(more)}`;
     box.querySelector("#an-expand")?.addEventListener("click", () => toggleExpand(g));
     box.querySelectorAll("[data-t]").forEach((el) => {
@@ -870,7 +923,8 @@ function renderLegend() {
   const g = `linear-gradient(90deg, ${((attr ? C.attrStops : C.graphStops) || []).join(",")})`;
   const info = A.attrInfo;
   const scale = attr
-    ? (info?.target ? `pulls <b>${esc(visTok(info.target.text))}</b> down ← · → pushes it up (√ scale, max ${(info.max ?? 0).toFixed(2)} logits)` : "effect on the next token")
+    ? (info?.target && info.orig ? `edits weakened <b>${esc(visTok(info.target.text))}</b> ← · → strengthened it (edited − original, √ scale, max Δ ${(info.max ?? 0).toFixed(2)} logits)`
+      : info?.target ? `pulls <b>${esc(visTok(info.target.text))}</b> down ← · → pushes it up (√ scale, max ${(info.max ?? 0).toFixed(2)} logits)` : "effect on the next token")
     : A.mode === "rel" ? "at or below its run average → 4σ above" : A.mode === "abs" ? "activity, log scale" : "output-weight norm, log scale";
   const e = A.edges;
   $("#gv-legend").innerHTML = `
@@ -881,7 +935,9 @@ function renderLegend() {
     <details><summary>How to read this</summary>
       <p><b>Nodes.</b> Attention heads sit above the residual stream, MLP neuron clusters below; one column per layer. ${esc(A.atlas?.measures?.head || "")} ${esc(A.atlas?.measures?.cluster || "")} ${esc(A.atlas?.measures?.clusters || "")}</p>
       <p><b>Color.</b> ${attr
-        ? "Attribution: how much each unit's write at this token moved the logit of the target token, read through the final norm (held at its recorded scale) and the unembedding. Orange pushed it up, blue pulled it down. The units plus the embedding add up to the logit exactly; this is the direct effect only, not effects routed through later layers."
+        ? `Attribution: how much each unit's write at this token moved the logit of the target token, read through the final norm (held at its recorded scale) and the unembedding. Orange pushed it up, blue pulled it down. The units plus the embedding add up to the logit exactly; this is the direct effect only, not effects routed through later layers.${A.attrDiff
+          ? " With <b>vs original</b> on, each unit is colored by how its effect changed when the applied weight edits are lifted: the same token traced on both weight sets, edited minus original. A lesioned unit shows its whole former effect, reversed; later units show how their own direct effect shifted once their inputs changed."
+          : " When weight edits are applied, <b>vs original</b> in the dock compares against the unedited model."}`
         : `Each unit against its own average over the run, on a log scale; a unit counts as hit at ${HIT_Z}σ. Every weight takes part in every token, so this is how much a unit wrote, not an on/off firing.`}</p>
       <p><b>Selecting.</b> Click a unit to open it. Shift-click adds it to a selection; shift-drag a box to select many (alt-drag removes). Open <b>Paths</b> to trace routes from the selection, between units, or behind the next token.</p>
       <p><b>Edges.</b> ${esc(e?.measure || "")}${e?.available ? ` Median ${e.p50}×, 99th percentile ${e.p99}×.` : ""}</p>
@@ -1426,7 +1482,8 @@ function resetModel() {
   selectUnit(null);
   resetThumbs();
   A.atlas = null; A.atlasError = null; A.edges = null; A.params = null; A.runId = null; A.edited = new Set();
-  A.attr = null; A.attrN = null; A.attrInfo = null; A.attrTarget = null; A.attrSeq++; clearTimeout(A.attrTimer);
+  A.attr = null; A.attrN = null; A.attrInfo = null; A.attrTarget = null; A.attrOrig = null; A.attrDiff = null;
+  A.attrSeq++; clearTimeout(A.attrTimer);
   A.expanded.clear();
   graph.setEdges(null);
   schedule();

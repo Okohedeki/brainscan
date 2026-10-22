@@ -645,21 +645,22 @@ async def _trace(fn, *args):
 
 
 @app.get("/brainscan/runs/{run_id}/tokens/{t}/explain")
-async def explain_token(run_id: str, t: int, target: str | None = None):
-    """Per-unit attribution of the next token's logit at tape slot t (see recorder/tracing.py)."""
-    return await _trace("explain", run_id, t, target)
+async def explain_token(run_id: str, t: int, target: str | None = None, weights: str = "current"):
+    """Per-unit attribution of the next token's logit at tape slot t (see recorder/tracing.py).
+    weights=original reads it with the applied weight edits lifted, for a before/after comparison."""
+    return await _trace("explain", run_id, t, target, weights)
 
 
 @app.get("/brainscan/runs/{run_id}/tokens/{t}/neurons")
-async def token_neurons(run_id: str, t: int, unit: int, target: str | None = None):
+async def token_neurons(run_id: str, t: int, unit: int, target: str | None = None, weights: str = "current"):
     """Each neuron of an MLP cluster at tape slot t: activation and share of the attribution."""
-    return await _trace("neurons", run_id, t, unit, target)
+    return await _trace("neurons", run_id, t, unit, target, weights)
 
 
 @app.get("/brainscan/runs/{run_id}/tokens/{t}/attention")
-async def token_attention(run_id: str, t: int, unit: int):
+async def token_attention(run_id: str, t: int, unit: int, weights: str = "current"):
     """A softmax-attention head's attention over the earlier tokens at tape slot t."""
-    return await _trace("attention", run_id, t, unit)
+    return await _trace("attention", run_id, t, unit, weights)
 
 
 @app.websocket("/brainscan/live")

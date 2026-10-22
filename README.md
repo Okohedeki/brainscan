@@ -132,6 +132,13 @@ few hundred tokens on Qwen3.5-9B; results are cached) and reads every unit exact
   activation and effect on the next token, and a grid of its neurons inside the graph node.
   Linear-attention heads keep a running state rather than attending to earlier tokens, so they
   have no attention pattern.
+- **Before and after an edit** (`vs original`). With weight edits applied in Tune, the dock offers
+  a comparison: the same token is traced again with the edits lifted (the forward pass and the
+  weights the attribution is read through), the graph colors each unit by edited minus original,
+  the dock shows the target's probability before → after, a unit's drawer shows both values, and
+  the path explorer's next-token mode traces the circuit behind the change. The model is held
+  for the whole read, so no request runs on the unedited weights, and the edits go back exactly.
+  The same `weights=original` option works on the `explain`, `neurons` and `attention` endpoints.
 
 Activity costs one byte per unit per token (2,944 units, about 3 KB per token, for Qwen3.5-9B) and
 is stored under `runs/<run>/anatomy/`. The first start on a model clusters the neurons and scores
@@ -253,9 +260,12 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
   for one token on demand. Unit labels read write directions straight through the unembedding,
   which is noisy in early layers. Edges use each unit's top four output directions and the
   original weights. MoE layers have no clusters yet.
-- **Attribution is direct effect only**, on the current weights (a warning shows when they differ
-  from the recording), and paths follow weight-based edges, not measured causal effects.
-  Tracing waits while the model is generating.
+- **Attribution is direct effect only**, on the current weights unless you compare with the
+  original (a warning shows when they differ from the recording), and paths follow weight-based
+  edges, not measured causal effects. A before/after difference is also direct effect: a change
+  at a later unit reflects its changed inputs, not why they changed. Tracing waits while the
+  model is generating, and comparing with large applied edits takes a few seconds each way
+  while the original weights are swapped in and back.
 - **Not built yet:** SAE features, MoE routing capture, and nnsight-based analysis modules. One
   request runs at a time.
 

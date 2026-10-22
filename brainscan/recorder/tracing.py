@@ -15,7 +15,10 @@ and captures, at t's position:
                matrix, so they have none.
 
 Tracing uses the current weights with runtime steering paused, and says when the run was recorded
-under different weight edits or with steering on.
+under different weight edits or with steering on. With weights="original" it lifts the applied
+weight edits for the whole read (the forward pass and the weights the attribution is read through),
+holding the model so no request runs meanwhile, then puts the edits back exactly; comparing the two
+shows what an edit changed in the circuit behind a token.
 """
 
 from __future__ import annotations
@@ -32,6 +35,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 
 CACHE_SIZE = 6
 TOP_UNITS = 24
+WEIGHTS = ("current", "original")
 
 
 class Busy(Exception):
@@ -109,6 +113,24 @@ class Tracer:
             self.rec.release_memory(below_gb=2.0)
             self.rec.lock.release()
 
+    @contextlib.contextmanager
+    def _weights(self, weights: str):
+        """Read on the current weights, or with the applied edits lifted. For "original" the model is
+        held for the whole read, so no request ever runs on the unedited weights."""
+        if weights not in WEIGHTS:
+            raise ValueError(f"weights must be one of {WEIGHTS}")
+        if weights == "current" or not self.rec.edits.applied:
+            yield
+            return
+        with self._model(), self.rec.edits.suspended():
+            yield
+
+    def _key(self, run, t: int, n: int) -> tuple:
+        """Cache key for a capture on whatever weights are in place now. Unedited weights are the
+        same whatever the edit history, so their captures are shared across edits."""
+        edits = self.rec.edits
+        return (run.id, t, n, ("edited", edits.version) if edits.applied else "original")
+
     def _hooks(self, cap: Capture) -> list:
         handles = []
 
@@ -165,7 +187,7 @@ class Tracer:
 
     def capture(self, run, t: int) -> Capture:
         ids, pos, _ = self.context(run, t)
-        key = (run.id, t, self.rec.edits.version, len(ids))
+        key = self._key(run, t, len(ids))
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
@@ -242,9 +264,14 @@ class Tracer:
     def _neuron_contrib(self, lm, a: torch.Tensor, u: torch.Tensor) -> torch.Tensor:
         return a * (u @ lm.down.weight.float())
 
-    @torch.no_grad()
-    def explain(self, run_id: str, t: int, target=None) -> dict:
+    def explain(self, run_id: str, t: int, target=None, weights: str = "current") -> dict:
         run = self._run(run_id)
+        with self._weights(weights):
+            out = self._explain(run, t, target)
+        return out | {"model_weights": weights} | self._conditions(run, out["req"])
+
+    @torch.no_grad()
+    def _explain(self, run, t: int, target) -> dict:
         _, pos, req = self.context(run, t)
         cap = self.capture(run, t)
         tid = self._resolve_target(run, req, pos, cap, target)
@@ -287,7 +314,6 @@ class Tracer:
             "rest": round(logit - total, 4),
             "top": [[int(g), round(float(c[g]), 4)] for g in order],
             "context_tokens": len(cap.ids), "seconds": cap.seconds,
-            **self._conditions(run, req),
         }
 
     def _conditions(self, run, req: int) -> dict:
@@ -299,9 +325,14 @@ class Tracer:
 
     # ---- deeper internals ---------------------------------------------------------------
 
-    @torch.no_grad()
-    def neurons(self, run_id: str, t: int, g: int, target=None) -> dict:
+    def neurons(self, run_id: str, t: int, g: int, target=None, weights: str = "current") -> dict:
         run = self._run(run_id)
+        lifted = weights == "original" and bool(self.rec.edits.applied)
+        with self._weights(weights):
+            return self._neurons(run, t, g, target, lifted) | {"model_weights": weights}
+
+    @torch.no_grad()
+    def _neurons(self, run, t: int, g: int, target, lifted: bool) -> dict:
         lm, kind, i = self.an.locate(int(g))
         if kind != "cluster":
             raise ValueError("neurons are listed for MLP clusters; open a cluster unit")
@@ -311,7 +342,8 @@ class Tracer:
         idx = (lm.assign == i).nonzero().flatten()
         a = cap.mlp_in[lm.index][idx]
         cn = self._neuron_contrib(lm, cap.mlp_in[lm.index], self._direction(cap, tid))[idx]
-        wn = lm.wnorm[idx] if lm.wnorm is not None else lm.down.weight.float()[:, idx].norm(dim=0)
+        # lm.wnorm describes the weights as applied; with the edits lifted, read the norms directly.
+        wn = lm.down.weight.float()[:, idx].norm(dim=0) if lifted or lm.wnorm is None else lm.wnorm[idx]
         rows = sorted(zip(idx.tolist(), a.tolist(), cn.tolist(), wn.tolist()), key=lambda r: -abs(r[2]))
         # Gated MLP activations are almost never exactly zero, so "active" counts the neurons that
         # carry 90% of the cluster's write (sum of |activation| x output-weight norm).
@@ -323,9 +355,13 @@ class Tracer:
                 "neurons": [{"n": n, "act": round(x, 4), "write": round(abs(x) * w, 4), "contrib": round(c, 4)}
                             for n, x, c, w in rows]}
 
-    @torch.no_grad()
-    def attention(self, run_id: str, t: int, g: int) -> dict:
+    def attention(self, run_id: str, t: int, g: int, weights: str = "current") -> dict:
         run = self._run(run_id)
+        with self._weights(weights):
+            return self._attention(run, t, g) | {"model_weights": weights}
+
+    @torch.no_grad()
+    def _attention(self, run, t: int, g: int) -> dict:
         lm, kind, h = self.an.locate(int(g))
         if kind != "head":
             raise ValueError("attention patterns belong to heads; open a head unit")

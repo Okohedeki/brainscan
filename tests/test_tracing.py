@@ -133,6 +133,52 @@ def test_tracing_waits_for_generation(traced):
         th.join()
 
 
+def test_original_weights_trace_matches_the_unedited_model(traced):
+    """With a head lesioned, weights=original reproduces the pre-edit trace exactly, the current trace
+    shows the lesioned head at zero, and the edit is back in place (same weights, same version)."""
+    rec, run, _ = traced
+    t = last_prompt_slot(run, 2)
+    before = rec.tracer.explain(run.id, t)
+    an = rec.anatomy
+    heads = [g for g in range(an.n_units) if an.units[g]["kind"] == "head"]
+    g = max(heads, key=lambda u: abs(before["contrib"][u]))
+    lm, _, h = an.locate(g)
+    cluster = max((u for u in range(an.n_units) if an.units[u]["kind"] == "cluster" and an.locate(u)[0].index > lm.index),
+                  key=lambda u: abs(before["contrib"][u]))
+    nn_before = rec.tracer.neurons(run.id, t, cluster)
+    edit = rec.add_weight_edit("scale", layers=str(lm.index), targets=["head"], index=h, factor=0.0)
+    rec.apply_weight_edits()
+    try:
+        weight = lm.heads[0].weight.detach().clone()
+        version = rec.edits.version
+        cur = rec.tracer.explain(run.id, t)
+        assert cur["model_weights"] == "current" and cur["weights_edited"]
+        assert abs(cur["contrib"][g]) < 1e-6  # its output projection is zeroed
+        assert cur["target"]["id"] == before["target"]["id"]
+
+        rec.tracer._cache.clear()  # re-run the forward pass itself with the edits lifted, not a cached one
+        orig = rec.tracer.explain(run.id, t, weights="original")
+        assert orig["model_weights"] == "original" and orig["weights_edited"]  # edit status is read outside the lift
+        assert orig["target"] == before["target"]
+        assert torch.allclose(torch.tensor(orig["contrib"]), torch.tensor(before["contrib"]), atol=1e-4)
+        assert orig["logit"] == pytest.approx(before["logit"], abs=1e-4)
+        nn_orig = rec.tracer.neurons(run.id, t, cluster, weights="original")
+        assert nn_orig["contrib"] == pytest.approx(nn_before["contrib"], abs=1e-4)
+        assert nn_orig["active"] == nn_before["active"]
+        assert rec.tracer.attention(run.id, t, g, weights="original")["model_weights"] == "original"
+
+        # The edit is back exactly, and caches keyed by the edit version (the KV prefix) stay valid.
+        assert torch.equal(lm.heads[0].weight, weight) and rec.edits.version == version
+        assert rec.edits.applied == [edit.id]
+        assert abs(rec.tracer.explain(run.id, t)["contrib"][g]) < 1e-6
+        with pytest.raises(ValueError):
+            rec.tracer.explain(run.id, t, weights="edited")
+    finally:
+        rec.revert_weight_edits()
+        rec.edits.remove(edit.id)
+    assert torch.allclose(torch.tensor(rec.tracer.explain(run.id, t)["contrib"]), torch.tensor(before["contrib"]), atol=1e-4)
+
+
 def test_trace_endpoints(traced):
     rec, run, _ = traced
     saved = dict(server.state)
@@ -146,6 +192,8 @@ def test_trace_endpoints(traced):
         cluster = rec.anatomy.layers[0].offset + rec.anatomy.layers[0].n_heads
         assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/attention", params={"unit": cluster}).status_code == 400
         assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/neurons", params={"unit": cluster}).status_code == 200
+        assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/explain", params={"weights": "original"}).json()["model_weights"] == "original"
+        assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/explain", params={"weights": "bogus"}).status_code == 400
         assert client.get(f"/brainscan/runs/nope/tokens/{t}/explain").status_code == 404
         assert client.get(f"/brainscan/runs/{run.id}/tokens/99999/explain").status_code == 404
     finally:

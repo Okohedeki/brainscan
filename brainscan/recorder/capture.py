@@ -84,12 +84,12 @@ class LayerTap:
 
     @contextlib.contextmanager
     def paused(self):
-        """Run forward passes with interventions switched off (probe building)."""
-        self._paused = True
+        """Run forward passes with interventions switched off (probe building). Nests."""
+        before, self._paused = self._paused, True
         try:
             yield
         finally:
-            self._paused = False
+            self._paused = before
 
     def stack(self) -> torch.Tensor:
         """Residuals of the last forward pass for batch item 0, shape (layers, tokens, d_model)."""
