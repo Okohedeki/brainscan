@@ -15,6 +15,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import asyncio  # noqa: E402
+import contextlib
 import gc
 import json
 import struct
@@ -33,7 +34,7 @@ from fastapi.staticfiles import StaticFiles
 from .config import PROJECT_ROOT, Settings
 from .recorder import catalog, workbench
 from .recorder.model import Subject, display_name
-from .recorder.session import GenParams, ModelSwitched, Recorder, compact
+from .recorder.session import Cancelled, GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
 from .recorder.tracing import Busy
 
@@ -208,6 +209,17 @@ async def list_models():
     return {"object": "list", "data": [{"id": name, "object": "model", "created": 0, "owned_by": "brainscan"}]}
 
 
+async def _cancel_on_disconnect(request: Request, cancel: threading.Event) -> None:
+    """Cancel a request's generation when its client goes away (a closed tab, an aborted fetch, a
+    killed harness), so the model doesn't keep generating for no one. Once the body has been read,
+    the next message from the server is the disconnect. (request.is_disconnected() can't be used: its
+    zero-timeout peek never sees one through the HTTP middleware.) Run as a task; the caller cancels
+    it once the reply is in."""
+    while (await request.receive())["type"] != "http.disconnect":
+        pass
+    cancel.set()
+
+
 @app.post("/v1/chat/completions")
 async def chat_completions(request: Request):
     rec = recorder()
@@ -217,12 +229,23 @@ async def chat_completions(request: Request):
     if body.get("stream"):
         include_usage = bool((body.get("stream_options") or {}).get("include_usage"))
         return StreamingResponse(_stream(rec, params, model_name, include_usage), media_type="text/event-stream")
+    cancel = threading.Event()
+    watch = asyncio.create_task(_cancel_on_disconnect(request, cancel))
     try:
-        res = await asyncio.to_thread(rec.generate, params)
+        res = await asyncio.to_thread(rec.generate, params, cancel=cancel)
     except ModelSwitched as exc:
         raise HTTPException(503, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
+    except Cancelled:  # stopped while it waited for the model: nothing was recorded
+        return JSONResponse({
+            "id": f"chatcmpl-{uuid.uuid4().hex[:24]}", "object": "chat.completion", "created": int(time.time()),
+            "model": model_name, "brainscan": {"run": None, "request": None},
+            "usage": {"prompt_tokens": 0, "completion_tokens": 0, "total_tokens": 0},
+            "choices": [{"index": 0, "message": {"role": "assistant", "content": None},
+                         "finish_reason": "cancelled", "logprobs": None}]})
+    finally:
+        watch.cancel()
     message = {"role": "assistant", "content": res.content}
     if res.reasoning:
         message["reasoning_content"] = res.reasoning
@@ -238,14 +261,18 @@ async def chat_completions(request: Request):
 async def _stream(rec: Recorder, params: GenParams, model_name: str, include_usage: bool):
     loop = asyncio.get_running_loop()
     queue: asyncio.Queue = asyncio.Queue()
+    cancel = threading.Event()
 
     def put(item):
-        loop.call_soon_threadsafe(queue.put_nowait, item)
+        with contextlib.suppress(RuntimeError):  # the loop closed: no one is listening any more
+            loop.call_soon_threadsafe(queue.put_nowait, item)
 
     def work():
         try:
             put(("done", rec.generate(params, on_text=lambda delta: put(("text", delta)),
-                                      on_reasoning=lambda delta: put(("reasoning", delta)))))
+                                      on_reasoning=lambda delta: put(("reasoning", delta)), cancel=cancel)))
+        except Cancelled:
+            put(("cancelled", None))
         except Exception as exc:
             traceback.print_exc()
             put(("error", exc))
@@ -258,24 +285,35 @@ async def _stream(rec: Recorder, params: GenParams, model_name: str, include_usa
                    "choices": [{"index": 0, "delta": delta, "finish_reason": finish}], **extra}
         return f"data: {json.dumps(payload)}\n\n"
 
-    yield chunk({"role": "assistant", "content": ""})
-    while True:
-        kind, val = await queue.get()
-        if kind in ("text", "reasoning"):
-            yield chunk({"content": val} if kind == "text" else {"reasoning_content": val})
-            continue
-        if kind == "done":
-            if val.tool_calls:
-                yield chunk({"tool_calls": [{"index": i, **c} for i, c in enumerate(val.tool_calls)]})
-            yield chunk({}, val.finish_reason, brainscan={"run": val.run_id, "request": val.req})
-            if include_usage:
-                payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
-                           "model": model_name, "choices": [], "usage": _usage(val)}
-                yield f"data: {json.dumps(payload)}\n\n"
-        else:
-            yield f"data: {json.dumps({'error': {'message': str(val), 'type': type(val).__name__}})}\n\n"
-        yield "data: [DONE]\n\n"
-        return
+    finished = False
+    try:
+        yield chunk({"role": "assistant", "content": ""})
+        while True:
+            kind, val = await queue.get()
+            if kind in ("text", "reasoning"):
+                yield chunk({"content": val} if kind == "text" else {"reasoning_content": val})
+                continue
+            finished = True
+            if kind == "done":
+                if val.tool_calls:
+                    yield chunk({"tool_calls": [{"index": i, **c} for i, c in enumerate(val.tool_calls)]})
+                yield chunk({}, val.finish_reason, brainscan={"run": val.run_id, "request": val.req})
+                if include_usage:
+                    payload = {"id": cid, "object": "chat.completion.chunk", "created": created,
+                               "model": model_name, "choices": [], "usage": _usage(val)}
+                    yield f"data: {json.dumps(payload)}\n\n"
+            elif kind == "cancelled":  # stopped while it waited for the model: nothing was recorded
+                yield chunk({}, "cancelled", brainscan={"run": None, "request": None})
+            else:
+                yield f"data: {json.dumps({'error': {'message': str(val), 'type': type(val).__name__}})}\n\n"
+            yield "data: [DONE]\n\n"
+            return
+    finally:
+        # The client went away mid-reply: StreamingResponse notices the disconnect and cancels or
+        # closes this generator. Stop generating; the request still finishes, and is recorded, in
+        # its own thread.
+        if not finished:
+            cancel.set()
 
 
 @app.get("/brainscan/status")
@@ -290,6 +328,17 @@ async def get_status():
     if state["recorder"]:
         out.update(state["recorder"].status())
     return out
+
+
+@app.post("/brainscan/cancel")
+async def cancel_generation(request: Request):
+    """Stop the request that is generating, between two tokens. It finishes like any other request,
+    with finish_reason "cancelled": the tokens generated so far are recorded and returned to its
+    client. Body {"run": id} (optional) stops only a request of that run, including one of its
+    requests still waiting for the model, which then returns "cancelled" with nothing recorded."""
+    body = await request.json() if await request.body() else {}
+    run = body.get("run") if isinstance(body, dict) else None
+    return recorder().cancel(str(run) if run else None)
 
 
 @app.get("/brainscan/models")

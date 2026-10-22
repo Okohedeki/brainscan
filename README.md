@@ -32,6 +32,16 @@ experience.
   layer, a token-by-token generation loop with KV-prefix reuse across agent turns, and
   OpenAI-compatible `/v1/chat/completions` (streaming and tool calls; Llama-JSON and Hermes
   `<tool_call>` formats).
+- **Stopping a generation**: `POST /brainscan/cancel` stops the request that is generating;
+  with `{"run": "<id>"}` it stops only a request of that run, including one still waiting for the
+  model. The request stops between two tokens (or between prefill chunks of a long prompt) and
+  finishes like any other: the tokens generated so far are recorded (tape, transcript, unit
+  activity), a `cancelled` event marks where it stopped, and its client gets them back with
+  `finish_reason: "cancelled"`. OpenAI's API has no such value; most SDKs pass it through. A
+  stopped reply is returned as text, never as tool calls a harness might run. A client that
+  disconnects mid-request (a closed tab, a killed harness) stops its request the same way. A
+  request stopped before it reached the model records nothing and returns `cancelled` with
+  `"brainscan": {"run": null}`.
 - **Per-token record** for prompt, tool-result and generated tokens: probability and surprisal,
   entropy, top-5 alternatives, logit lens at every layer (probability of the actual token and
   each layer's top guess), residual norm per layer, and z-scored projections onto a direction bank.
@@ -124,6 +134,11 @@ few hundred tokens on Qwen3.5-9B; results are cached) and reads every unit exact
   recorded like any agent run: its tokens stream into the transcript, the timeline and the graph
   as they are generated. A chat continues in the same run until **New chat**; options are
   thinking on/off, max tokens and temperature (0 = greedy).
+- **Stop.** While the composer's request runs, its Send button is **■ Stop** (or press Esc in the
+  box): the reply ends at the next token and the composer reports how many tokens were kept. The
+  Trace dock shows **■ Stop** whenever any request is generating, an agent harness's included.
+  Either way the stopped request is recorded up to where it stopped (see *Stopping a generation*
+  above), and the next message continues the run.
 - **The conversation in Trace.** The run's text, word by word, grouped into turns, with words the
   model found surprising underlined (by −log₂ p). Clicking a word traces the position before it
   with that word as the target, so you see why the model wrote it; the readout and the graph

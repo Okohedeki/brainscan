@@ -149,6 +149,15 @@ class ModelSwitched(RuntimeError):
     """The recorder was closed for a model switch while a request waited for it."""
 
 
+class Cancelled(RuntimeError):
+    """The request was cancelled while it waited for the model, so nothing was recorded."""
+
+
+def run_name(hint: str) -> str:
+    """The run id a client's X-Brainscan-Run header (or event run) names."""
+    return re.sub(r"[^A-Za-z0-9._-]+", "-", hint)[:80]
+
+
 class Recorder:
     def __init__(self, subject, store, settings, publish):
         self.s, self.store, self.settings, self.publish = subject, store, settings, publish
@@ -177,6 +186,8 @@ class Recorder:
         self._kv_epoch = -1
         self._kv_run: str | None = None
         self.perf = {"decode_tok_s": None, "prefill_tok_s": None, "busy": False}
+        self.active: dict | None = None  # the request generating: its run, request number, cancel flag
+        self._queued: list[tuple[str | None, threading.Event]] = []  # requests waiting: (run named, cancel)
         self.closed = False
 
     def close(self) -> None:
@@ -268,7 +279,7 @@ class Recorder:
 
     def _resolve_run(self, p: GenParams, ids: list[int]) -> RunState:
         if p.run_hint:
-            rid = re.sub(r"[^A-Za-z0-9._-]+", "-", p.run_hint)[:80]
+            rid = run_name(p.run_hint)
             return self.runs.get(rid) or self._new_run(rid, p.label)
         best, best_len = None, 0
         for run in self.runs.values():
@@ -316,7 +327,7 @@ class Recorder:
     def external_event(self, run_id: str | None, etype: str, data: dict, t: int | None = None) -> dict:
         """Events a harness reports that the transcript can't show (verdicts, file edits)."""
         if run_id:
-            run_id = re.sub(r"[^A-Za-z0-9._-]+", "-", run_id)[:80]
+            run_id = run_name(run_id)
             run = self.runs.get(run_id) or self._new_run(run_id, data.get("task"))
         elif self.runs:
             run = max(self.runs.values(), key=lambda r: r.meta["updated"])
@@ -335,17 +346,52 @@ class Recorder:
 
     # ---- generation ----------------------------------------------------------------
 
-    def generate(self, p: GenParams, on_text=None, on_reasoning=None) -> GenResult:
-        with self.lock:
+    def generate(self, p: GenParams, on_text=None, on_reasoning=None,
+                 cancel: threading.Event | None = None) -> GenResult:
+        """Run one chat request. Setting `cancel` stops it between tokens (or between prefill chunks):
+        it then finishes like any other request, with finish_reason "cancelled", and keeps what it
+        generated. Set while the request still waits for the model, it raises Cancelled instead."""
+        cancel = cancel or threading.Event()
+        queued = (run_name(p.run_hint) if p.run_hint else None, cancel)
+        self._queued.append(queued)
+        try:
+            while not self.lock.acquire(timeout=0.2):  # a request cancelled while it waits stops waiting
+                if cancel.is_set():
+                    raise Cancelled("the request was cancelled before it reached the model")
+        finally:
+            self._queued.remove(queued)
+        try:
             if self.closed:
                 raise ModelSwitched("the model was switched while this request waited; send it again")
+            if cancel.is_set():
+                raise Cancelled("the request was cancelled before it reached the model")
             self.perf["busy"] = True
+            self.active = {"named": queued[0], "run": None, "req": None, "cancel": cancel}
             try:
                 self.release_memory(below_gb=2.0)
                 with torch.no_grad(), self._anatomy_recording():
-                    return self._generate(p, on_text, on_reasoning)
+                    return self._generate(p, on_text, on_reasoning, cancel)
             finally:
                 self.perf["busy"] = False
+                self.active = None
+        finally:
+            self.lock.release()
+
+    def cancel(self, run: str | None = None) -> dict:
+        """Stop the request that is generating at its next token. With `run`, only a request of that
+        run, and also that run's requests still waiting for the model (they end without recording
+        anything). Doesn't wait: the request finishes, and is recorded, in its own thread."""
+        out = {"cancelled": False, "run": None, "req": None, "queued": 0}
+        active = self.active
+        if active is not None and (run is None or run in (active["named"], active["run"])):
+            active["cancel"].set()
+            out.update(cancelled=True, run=active["run"] or active["named"], req=active["req"])
+        if run is not None:
+            for named, flag in list(self._queued):
+                if named == run_name(run):
+                    flag.set()
+                    out["queued"] += 1
+        return out
 
     def _anatomy_recording(self):
         return self.anatomy.recording() if self.anatomy is not None else contextlib.nullcontext()
@@ -403,7 +449,7 @@ class Recorder:
                                      phase, pred, row_of.get(pos), norms[:, k], {n: v[k] for n, v in proj.items()}))
         return recs
 
-    def _generate(self, p: GenParams, on_text, on_reasoning) -> GenResult:
+    def _generate(self, p: GenParams, on_text, on_reasoning, cancel: threading.Event) -> GenResult:
         s = self.s
         rendered = render(s.tokenizer, p.messages, p.tools, template_kwargs=p.template_kwargs)
         ids = rendered.ids
@@ -414,6 +460,7 @@ class Recorder:
         run = self._resolve_run(p, ids)
         run.meta["requests"] += 1
         req = run.meta["requests"]
+        self.active.update(run=run.id, req=req)
         tmsgs = to_template_messages(p.messages)
         seen = min(run.seen_msgs, len(p.messages))
         new_from = max((e for st, e in rendered.spans[:seen] if st >= 0), default=0)
@@ -454,7 +501,13 @@ class Recorder:
             timing[key] += now - since
             return now
 
+        # A cancel between chunks keeps what was read: the cache then holds ids[:read_to] and the
+        # next request of the run records on from there.
+        read_to, finish = len(ids), "length"
         for cs in range(start, len(ids), s.prefill_chunk):
+            if cs > start and cancel.is_set():
+                read_to, finish = cs, "cancelled"
+                break
             chunk = ids[cs:cs + s.prefill_chunk]
             tick = time.perf_counter()
             out = s.model(input_ids=torch.tensor([chunk], device=s.device), past_key_values=self._kv, use_cache=True)
@@ -473,7 +526,7 @@ class Recorder:
             pending = (resid[:, -1, :].clone(), logits[-1].float().clone())
             del out, resid, logits
             lap("prefill_readout", tick)
-        self._kv_ids = list(ids)
+        self._kv_ids = ids[:read_to]
         prefill_s = time.perf_counter() - t0
         for i in range(0, len(new_records), 256):
             self.publish({"k": "toks", "run": run.id, "items": [compact(r) for r in new_records[i:i + 256]]})
@@ -482,9 +535,10 @@ class Recorder:
 
         for i in range(seen, len(p.messages)):
             first = rendered.first_token_of(i)
-            t = run.pos2tape.get(first) if first is not None else None
+            unread = first is not None and first >= read_to  # a cancelled prefill stopped before it
+            t = run.pos2tape.get(first) if first is not None and not unread else None
             if t is None:
-                t = new_records[0]["t"] if new_records else max(len(run.tape) - 1, 0)
+                t = new_records[0]["t"] if new_records and not unread else max(len(run.tape) - 1, 0)
             m = tmsgs[i]
             self._add_message(run, {"i": i, "req": req, "t": t, "role": m["role"], "content": m["content"],
                                     "name": m.get("name"), "tool_calls": p.messages[i].get("tool_calls")})
@@ -508,7 +562,7 @@ class Recorder:
             generator.manual_seed(int(p.seed))
         else:
             generator.seed()
-        finish, msg_idx = "length", len(p.messages)
+        msg_idx = len(p.messages)
         # Interventions are baked into the decode graphs, so the set that applies keys them.
         graph_key = tuple(iv.id for iv in self.tap.interventions if iv.applies("gen", run.id))
         cuda = s.device.type == "cuda"
@@ -540,6 +594,11 @@ class Recorder:
         unsettled, picked = None, None
         t1 = time.perf_counter()
         for _ in range(max_tokens):
+            # Checked before a token is picked: every token fed so far is in the cache and is recorded
+            # (the last one when it settles below), as if max_tokens had been reached here.
+            if cancel.is_set():
+                finish = "cancelled"
+                break
             next_id = sample(pending[1], p.temperature, p.top_p, generator) if picked is None else picked
             pos = len(self._kv_ids)
             is_stop = next_id in s.stop_ids
@@ -604,7 +663,11 @@ class Recorder:
 
         reasoning, answer, _ = split_reasoning(text, think_open)
         reasoning = reasoning.strip() if reasoning is not None else None
-        content, calls = parse_tool_calls(answer, p.tools) if p.tools else ((answer.strip() or None), [])
+        # A cancelled reply is returned as the text so far, never as tool calls a harness might run.
+        if p.tools and finish != "cancelled":
+            content, calls = parse_tool_calls(answer, p.tools)
+        else:
+            content, calls = answer.strip() or None, []
         stream.finish(content)
         if calls:
             finish = "tool_calls"
@@ -615,10 +678,12 @@ class Recorder:
             k = min(bisect.bisect_left(text_lens, at + 1), len(gen_tapes) - 1) if at >= 0 and gen_tapes else 0
             self._event(run, gen_tapes[k] if gen_tapes else first_t, "tool_call",
                         {"name": c["function"]["name"], "arguments": c["function"]["arguments"][:400]})
-        if finish == "length" and not calls:
+        if finish in ("length", "cancelled") and not calls:
             last_t = gen_tapes[-1] if gen_tapes else first_t
-            self._event(run, last_t, "cutoff", {"tokens": len(gen_ids), "while_reasoning": think_open and
-                                                not split_reasoning(text, think_open)[2]})
+            data = {"tokens": len(gen_ids), "while_reasoning": think_open and not split_reasoning(text, think_open)[2]}
+            if finish == "cancelled":
+                data["in_prompt"] = read_to < len(ids)
+            self._event(run, last_t, "cutoff" if finish == "length" else "cancelled", data)
         elif not calls:
             self._event(run, first_t, "final_answer", {"chars": len(answer), "finish": finish})
         self._add_message(run, {"i": msg_idx, "req": req, "t": first_t, "role": "assistant", "content": content,
@@ -656,14 +721,15 @@ class Recorder:
                 self.anatomy.pending.pop(run.id, None)
                 print(f"[brainscan] could not store weight activity for {run.id}: {type(exc).__name__}: {exc}", flush=True)
         self.store.write_meta(run.id, run.meta)
-        n_new = len(ids) - start
+        n_new = read_to - start
         self.perf.update(prefill_tok_s=round(n_new / prefill_s, 1) if prefill_s > 0 else None,
                          decode_tok_s=round(len(gen_ids) / decode_s, 1) if decode_s > 0 and gen_ids else None,
                          seconds={k: round(v, 3) for k, v in timing.items()})
-        print(f"[brainscan] {run.id} req {req}: prefill {n_new} tok ({len(ids) - record_from} recorded), "
-              f"decode {len(gen_ids)} tok, " + ", ".join(f"{k} {v:.2f}s" for k, v in timing.items()), flush=True)
-        self.publish({"k": "done", "run": run.id, "req": req, "finish": finish, "perf": dict(self.perf),
-                      "meta": run.meta})
+        print(f"[brainscan] {run.id} req {req}: prefill {n_new} tok ({max(0, read_to - record_from)} recorded), "
+              f"decode {len(gen_ids)} tok, " + ", ".join(f"{k} {v:.2f}s" for k, v in timing.items())
+              + (", cancelled" if finish == "cancelled" else ""), flush=True)
+        self.publish({"k": "done", "run": run.id, "req": req, "finish": finish, "generated": len(gen_ids),
+                      "perf": dict(self.perf), "meta": run.meta})
         return GenResult(run.id, req, text, content, calls, finish, len(ids), len(gen_ids), start, reasoning)
 
     # ---- reads ---------------------------------------------------------------------
@@ -681,7 +747,11 @@ class Recorder:
 
     def status(self) -> dict:
         graphs = self.graphs.describe() if self.graphs else {"on": False, "off": "disabled"}
+        active = self.active
+        generating = None if active is None else {"run": active["run"] or active["named"], "req": active["req"],
+                                                  "cancelling": active["cancel"].is_set()}
         return {"model": self.s.info(), "perf": self.perf | {"decode_graphs": graphs},
+                "generating": generating, "queued": len(self._queued),
                 "disk": {"used": self.store.used_bytes(), "budget": self.store.budget},
                 "interventions": [iv.describe() for iv in self.interventions.values()],
                 "directions": self.directions.describe(), "workbench": self.edits.summary()}

@@ -24,6 +24,7 @@ const S = {
   dirs: [], nLayers: 32, status: null,
   colW: 6, scrollX: 0, plotW: 600, follow: true, showReplay: false,
   hover: null, selected: null, liveCard: null, ws: null, wsOpen: false, raf: 0,
+  generating: null, genAt: 0,
 };
 
 // ---------------------------------------------------------------- colors
@@ -73,6 +74,7 @@ function eventLook(e) {
     case "final_answer": return { label: "■ answer", tone: "ink", glyph: "■" };
     case "think_end": return { label: "◆ end of thinking", tone: "ink2", glyph: "◆" };
     case "cutoff": return { label: d.while_reasoning ? "▲ cut off while thinking" : "▲ cut off", tone: "serious", glyph: "▲", line: true, status: "serious" };
+    case "cancelled": return { label: d.in_prompt ? "■ stopped while reading" : d.while_reasoning ? "■ stopped while thinking" : "■ stopped", tone: "serious", glyph: "■", line: true, status: "serious" };
     case "verdict": return d.success ? { label: "✓ PASS", tone: "good", glyph: "✓", line: true, status: "good" }
       : { label: "✕ FAIL", tone: "critical", glyph: "✕", line: true, status: "critical" };
     default: return null;
@@ -668,7 +670,16 @@ function renderMeta() {
   $("#run-meta").textContent = `${m.requests} requests · ${m.tokens} tokens · ${out}`;
 }
 
+/** Which request is generating, for the Stop buttons (ui/chat.js): live from "req"/"done", else polled. */
+function setGenerating(g) {
+  S.genAt = performance.now();
+  S.generating = g;
+  document.dispatchEvent(new CustomEvent("brainscan:generating", { detail: g }));
+}
+
 function handle(msg) {
+  if (msg.k === "req") setGenerating({ run: msg.run, req: msg.req });
+  else if (msg.k === "done") { setGenerating(null); document.dispatchEvent(new CustomEvent("brainscan:done", { detail: msg })); }
   if (S.loadingRun && msg.run === S.loadingRun && ["toks", "ev", "msg", "done"].includes(msg.k)) {
     S.buffer.push(msg);
     return;
@@ -727,8 +738,12 @@ function connect() {
 }
 
 async function pollStatus() {
+  const asked = performance.now();
   try { S.status = await api("/brainscan/status"); } catch (err) { S.status = { status: "error", error: err.message }; }
   const st = S.status;
+  // A live "req" or "done" that arrived while this poll was out is newer than the poll.
+  const gen = st.generating ? { run: st.generating.run, req: st.generating.req } : null;
+  if (S.genAt < asked && JSON.stringify(gen) !== JSON.stringify(S.generating)) setGenerating(gen);
   if (st.model && st.model.spec !== S.modelSpec) {
     // The recorder switched models: the Trace and Tune views rebuild for it, the run list refreshes.
     if (S.modelSpec !== undefined) { document.dispatchEvent(new CustomEvent("brainscan:model", { detail: st.model })); loadRuns(); }
