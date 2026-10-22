@@ -94,7 +94,10 @@ function b64Halves(b64) { const u8 = b64Bytes(b64), u16 = new Uint16Array(u8.buf
 
 // ---------------------------------------------------------------- the unit map and its edges
 async function loadAtlas() {
-  try {
+  if (A.atlas) return true;
+  if (A._loadingAtlas) return A._loadingAtlas;  // single-flight: a retry + a status frame must not double-load
+  A._loadingAtlas = (async () => {
+   try {
     const atlas = await api("/brainscan/anatomy");
     A.atlas = atlas; A.U = atlas.n_units; A.layers = atlas.layers; A.units = atlas.units;
     ENC.lo = atlas.encoding.lo; ENC.steps = atlas.encoding.steps;
@@ -117,15 +120,19 @@ async function loadAtlas() {
       A.edges = e; graph.setEdges(e); renderLegend();
     }).catch(() => {});
     return true;
-  } catch (err) {
+   } catch (err) {
     A.atlasError = err;
     return false;
-  }
+   } finally {
+    A._loadingAtlas = null;
+   }
+  })();
+  return A._loadingAtlas;
 }
 
 async function refreshEdited() {
   try { A.edited = new Set((await api("/brainscan/anatomy/edited")).edited); } catch { /* recorder busy */ }
-  graph.thumbs.clear();
+  resetThumbs();
   pushState();
 }
 
@@ -257,6 +264,7 @@ function handle(msg) {
       if (msg.run !== A.runId || !A.atlas || msg.u !== A.U) break;
       addSlice(msg.t, b64Bytes(msg.b64));
       A.lastAnat = performance.now();
+      if (!A.visible) { A.pendingCursor = true; break; }  // keep the data; skip redraw/heat recompute while hidden
       if (A.follow && !A.playing) setCursor(msg.t[msg.t.length - 1], msg.t.length === 1 ? "step" : "jump");
       else schedule();
       if (A.selected != null) throttledRunStats();
@@ -278,7 +286,7 @@ function handle(msg) {
 function connect() {
   const ws = new WebSocket(`${location.protocol === "https:" ? "wss" : "ws"}://${location.host}/brainscan/live`);
   ws.onclose = () => setTimeout(connect, 1500);
-  ws.onmessage = (ev) => { for (const msg of JSON.parse(ev.data)) handle(msg); };
+  ws.onmessage = (ev) => { try { for (const msg of JSON.parse(ev.data)) handle(msg); } catch (err) { console.warn("weights: bad live frame", err); } };
 }
 
 // ---------------------------------------------------------------- cursor, heat, trail, replay
@@ -807,7 +815,7 @@ function drawHeat() {
   // values on a diverging one with zero at the surface color
   const img = new ImageData(t.w, t.h), px = img.data, signed = t.mode !== "rms", inv = 1 / (H.scale - H.lo);
   for (let k = 0; k < t.w * t.h; k++) {
-    const v = (H.vals[k] - H.lo) * inv;
+    const raw = H.vals[k], v = Number.isFinite(raw) ? (raw - H.lo) * inv : 0;  // a NaN weight must not poison the ImageData
     const c = signed ? C.div[Math.round((clamp(v, -1, 1) + 1) * 127.5)] : C.ramp[Math.round(clamp(v, 0, 1) * 255)];
     px[4 * k] = c[0]; px[4 * k + 1] = c[1]; px[4 * k + 2] = c[2]; px[4 * k + 3] = 255;
   }
@@ -911,14 +919,16 @@ function pumpThumbs() {
         const v = b64Halves(t.data), sorted = Array.from(v).sort((a, b) => a - b);
         const lo = sorted[Math.floor(sorted.length * 0.01)], hi = sorted[Math.floor(sorted.length * 0.99)] || lo + 1e-6;
         const img = new ImageData(t.w, t.h);
-        for (let k = 0; k < v.length; k++) { const c = C.ramp[Math.round(clamp((v[k] - lo) / (hi - lo), 0, 1) * 255)]; img.data.set([c[0], c[1], c[2], 255], 4 * k); }
+        for (let k = 0; k < v.length; k++) { const x = (v[k] - lo) / (hi - lo); const c = C.ramp[Number.isFinite(x) ? Math.round(clamp(x, 0, 1) * 255) : 0]; img.data.set([c[0], c[1], c[2], 255], 4 * k); }
         graph.setThumb(key, await createImageBitmap(img));
       })
       .catch(() => {})
-      .finally(() => { thumbActive--; pumpThumbs(); });
+      .finally(() => { thumbActive--; thumbPending.delete(key); pumpThumbs(); });  // allow a re-request after clear
   }
   if (thumbQueue.length > 40) { for (const [, , key] of thumbQueue.splice(0, thumbQueue.length - 40)) thumbPending.delete(key); }
 }
+// Drop cached thumbnails (and in-flight bookkeeping) so they regenerate — after a theme change or weight edit.
+function resetThumbs() { graph.clearThumbs(); thumbPending.clear(); thumbQueue.length = 0; }
 
 // ---------------------------------------------------------------- jump-to palette (⌘K)
 async function loadParams() {
@@ -1065,7 +1075,11 @@ async function activate() {
   }
   const id = $("#run-select").value || null;
   if (id !== A.runId) await openRun(id);
-  else { renderReadout(); schedule(); }
+  else {
+    if (A.pendingCursor && A.follow && !A.playing) setCursor(lastRecorded(), "jump");  // catch up after being hidden
+    renderReadout(); pushState(); schedule();
+  }
+  A.pendingCursor = false;
   graph.invalidate();
 }
 
@@ -1083,12 +1097,12 @@ function boot() {
   stopPlay();
   document.addEventListener("brainscan:view", (ev) => {
     A.visible = ev.detail === "weights";
-    graph.setState({ visible: A.visible });
+    graph.setState({ visible: A.visible, live: A.visible && isLive() });  // hidden → loop stops
     if (A.visible) activate(); else stopPlay();
   });
   // A hidden view catches up in activate(), so switching runs in the Scanner costs nothing here.
   document.addEventListener("brainscan:run", (ev) => { if (A.atlas && A.visible && ev.detail !== A.runId) openRun(ev.detail); });
-  const recolor = () => { readColors(); renderLegend(); schedule(); graph.thumbs.clear(); if (H.tile && $("#an-heat")) { drawHeat(); renderHeatInfo(); } };
+  const recolor = () => { readColors(); renderLegend(); schedule(); resetThumbs(); if (H.tile && $("#an-heat")) { drawHeat(); renderHeatInfo(); } };
   $("#theme-toggle").addEventListener("click", recolor);
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", recolor);
   connect();

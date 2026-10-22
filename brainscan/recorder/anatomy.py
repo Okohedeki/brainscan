@@ -33,6 +33,7 @@ import base64
 import contextlib
 import hashlib
 import json
+import threading
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -227,6 +228,7 @@ class Anatomy:
         self.parts: dict[int, torch.Tensor] = {}
         self.pending: dict[str, list[tuple[np.ndarray, np.ndarray]]] = {}
         self._stats: OrderedDict = OrderedDict()
+        self._stats_lock = threading.Lock()  # tile reads run off the recorder lock; refresh() clears mid-read
         self._stream = None
         self._load_or_build()
         self.edges: dict | None = None
@@ -398,7 +400,7 @@ class Anatomy:
 
     def _set_edges(self, score: torch.Tensor, seconds: float | None) -> None:
         """Keep each unit's strongest incoming and outgoing edges. score[b, a] scores a -> b."""
-        k = min(EDGES_KEPT, score.shape[0] - 1)
+        k = max(0, min(EDGES_KEPT, score.shape[0] - 1))  # a one-unit model has no edges; topk(-1) would raise
         up_x, up = score.topk(k, dim=1)
         down_x, down = score.T.topk(k, dim=1)
         nz = score[score > 0]
@@ -527,7 +529,8 @@ class Anatomy:
                 lm.gram.copy_(torch.einsum("dhi,dhj->hij", W, W))
             if lm.wnorm is not None:
                 lm.wnorm.copy_(lm.down.weight.detach().float().norm(dim=0))
-        self._stats.clear()
+        with self._stats_lock:
+            self._stats.clear()
 
     def _put(self, a: int, act: torch.Tensor) -> None:
         if act.shape[0] == 1:
@@ -745,10 +748,12 @@ class Anatomy:
                 mode = "value" if exact else "rms"
             vals = b["mean"] if mode in ("value", "mean") else b[mode]
             skey = (json.dumps({k: req.get(k) for k in ("param", "unit", "matrix")}), version)
-            if skey not in self._stats:
-                self._stats[skey] = matrix_stats(t)
-                while len(self._stats) > 32:
-                    self._stats.popitem(last=False)
+            with self._stats_lock:
+                stats = self._stats.get(skey)
+                if stats is None:
+                    stats = self._stats[skey] = matrix_stats(t)
+                    while len(self._stats) > 32:
+                        self._stats.popitem(last=False)
             data = vals.to(torch.float16).cpu().numpy()
             return {"title": spec["title"], "desc": spec["desc"], "rows_label": spec["rows"], "cols_label": spec["cols"],
                     "rows": R, "cols": C, "window": [r0, r1, c0, c1], "bh": b["bh"], "bw": b["bw"],
@@ -756,7 +761,7 @@ class Anatomy:
                     "data": base64.b64encode(data.tobytes()).decode(),
                     "row_rms": [round(x, 6) for x in b["row_rms"].tolist()],
                     "col_rms": [round(x, 6) for x in b["col_rms"].tolist()],
-                    "stats": self._stats[skey]}
+                    "stats": stats}
 
     @torch.no_grad()
     def unit_detail(self, g: int, edited: set[int] | None = None) -> dict:

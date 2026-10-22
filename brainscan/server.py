@@ -502,6 +502,7 @@ async def get_run_anatomy(run_id: str):
     (tape indices, unit count, unit-map key), then one byte per unit per token, row-major."""
     rec = recorder()
     an = _anatomy(rec)
+    _run_or_404(run_id)  # "unknown run" should 404, not return an empty 200 like "run with no activity"
     t, codes, skipped = await asyncio.to_thread(an.read_run, rec.store, run_id)
     header = json.dumps({"n": int(len(t)), "units": an.n_units, "key": an.key, "skipped": skipped,
                          "t": t.tolist()}).encode()

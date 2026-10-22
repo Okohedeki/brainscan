@@ -152,8 +152,14 @@ class Recorder:
         self.edits = EditStack(subject)
         use_graphs = settings.graph_decode and DecodeGraphs.available(subject)
         self.graphs = DecodeGraphs(subject, self.tap) if use_graphs else None
-        self.anatomy = (Anatomy(subject, store.root / "anatomy", settings.anatomy_clusters)
-                        if settings.anatomy else None)
+        # Anatomy is an optional feature; a failure to build it must not take the recorder down.
+        self.anatomy = None
+        if settings.anatomy:
+            try:
+                self.anatomy = Anatomy(subject, store.root / "anatomy", settings.anatomy_clusters)
+            except Exception as exc:
+                print(f"[brainscan] weight anatomy disabled ({type(exc).__name__}: {exc}); "
+                      "the Weights tab will be unavailable", flush=True)
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}
@@ -618,7 +624,11 @@ class Recorder:
             run.meta.setdefault("weight_edits", []).append({"req": req, "edits": weight_edits})
         self.store.write_tokens(run.id, req, new_records)
         if self.anatomy is not None:
-            self.anatomy.flush(self.store, run.id, req)
+            try:  # storing activity must never fail the completion (e.g. disk full)
+                self.anatomy.flush(self.store, run.id, req)
+            except Exception as exc:
+                self.anatomy.pending.pop(run.id, None)
+                print(f"[brainscan] could not store weight activity for {run.id}: {type(exc).__name__}: {exc}", flush=True)
         self.store.write_meta(run.id, run.meta)
         n_new = len(ids) - start
         self.perf.update(prefill_tok_s=round(n_new / prefill_s, 1) if prefill_s > 0 else None,

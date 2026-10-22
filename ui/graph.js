@@ -33,7 +33,7 @@ export class WeightGraph {
     this.selected = null; this.hover = null; this.edited = new Set();
     this.edges = null; this.edgeMode = "circuit"; this.drawnEdges = [];
     this.thumbs = new Map(); this.C = null; this.live = false;
-    this.raf = 0; this.last = performance.now(); this.W = 1; this.H = 1;
+    this.raf = 0; this.last = performance.now(); this.W = 1; this.H = 1; this.dpr = 1;
     this._input();
     new ResizeObserver(() => { const fitAgain = this.fitted; this._size(); if (fitAgain) this.fit(true); this.invalidate(); }).observe(canvas.parentElement);
   }
@@ -78,11 +78,13 @@ export class WeightGraph {
 
   // heat: Float32Array of 0..1 per unit (NaN = no data); trail likewise
   setState(s) { Object.assign(this, s); this._edgesDirty = true; this.invalidate(); }
-  setThumb(key, bmp) { this.thumbs.set(key, bmp); this.invalidate(); }
+  setThumb(key, bmp) { const old = this.thumbs.get(key); if (old && old !== bmp) old.close?.(); this.thumbs.set(key, bmp); this.invalidate(); }
+  clearThumbs() { for (const b of this.thumbs.values()) b.close?.(); this.thumbs.clear(); this.invalidate(); }
 
   // ---------------------------------------------------------------- camera
   _size() {
     const dpr = window.devicePixelRatio || 1, W = this.cv.clientWidth, H = this.cv.clientHeight;
+    this.dpr = dpr;
     if (!W || !H) return;
     this.W = W; this.H = H;
     if (this.cv.width !== Math.round(W * dpr) || this.cv.height !== Math.round(H * dpr)) { this.cv.width = Math.round(W * dpr); this.cv.height = Math.round(H * dpr); }
@@ -123,6 +125,7 @@ export class WeightGraph {
 
   _frame(now) {
     this.raf = 0;
+    if (this.visible === false) return;  // hidden view: stop the self-sustaining loop; setState/activate re-kick it
     const dt = Math.min(64, now - this.last); this.last = now;
     const c = this.cam, t = this.target, k = reduceMotion() ? 1 : 1 - Math.exp(-dt / 70);
     c.x = lerp(c.x, t.x, k); c.y = lerp(c.y, t.y, k); c.s = Math.exp(lerp(Math.log(c.s), Math.log(t.s), k));
