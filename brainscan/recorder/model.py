@@ -12,6 +12,7 @@ import glob
 import json
 import os
 import re
+import struct
 import sys
 from pathlib import Path
 
@@ -122,10 +123,43 @@ def _first_attr(obj, paths: list[str]):
     raise AttributeError(f"none of {paths} found on {type(obj).__name__}")
 
 
+# Parts of a checkpoint that loading the text model leaves on disk: vision and audio towers, their
+# projectors, and multi-token-prediction heads (AutoModelForCausalLM loads only the language model).
+UNLOADED_PARTS = {"visual", "vision_tower", "vision_model", "audio_tower", "audio", "mtp",
+                  "multi_modal_projector", "mm_projector"}
+_FLOAT_BYTES = {"F64": 8, "F32": 4, "BF16": 2, "F16": 2}
+
+
+def weight_bytes(path, load_bytes_per_float: int = 2) -> tuple[int, int]:
+    """(bytes of safetensors on disk, bytes the text model takes once loaded) for a checkpoint folder.
+    Read from the safetensors headers: unloaded parts are skipped and float weights are counted at
+    the size they load at (bf16 by default). Falls back to file size where a header can't be read."""
+    total = loaded = 0
+    for f in Path(path).glob("*.safetensors"):
+        size = f.stat().st_size
+        total += size
+        try:
+            with open(f, "rb") as fh:
+                n = struct.unpack("<Q", fh.read(8))[0]
+                if n > min(size - 8, 1 << 28):  # not a safetensors header (a corrupt or foreign file)
+                    raise ValueError("bad header length")
+                header = json.loads(fh.read(n))
+        except (OSError, ValueError, struct.error):
+            loaded += size
+            continue
+        for name, meta in header.items():
+            if name == "__metadata__" or UNLOADED_PARTS.intersection(name.split(".")[:3]):
+                continue
+            a, b = meta["data_offsets"]
+            item = _FLOAT_BYTES.get(meta.get("dtype"))
+            loaded += (b - a) // item * load_bytes_per_float if item else b - a
+    return total, loaded
+
+
 def _check_vram(path: str, device: str, headroom_gb: float = 2.5) -> None:
     """Refuse to load when the weights won't fit. On Windows the driver would otherwise spill
     into system memory and every forward pass would crawl."""
-    weights = sum(f.stat().st_size for f in Path(path).glob("*.safetensors")) if Path(path).is_dir() else 0
+    weights = weight_bytes(path)[1] if Path(path).is_dir() else 0
     if not weights or not device.startswith("cuda") or not torch.cuda.is_available():
         return
     free, _ = torch.cuda.mem_get_info()

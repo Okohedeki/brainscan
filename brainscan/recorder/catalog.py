@@ -14,7 +14,7 @@ import os
 import re
 from pathlib import Path
 
-from .model import CACHE, _slug, display_name, ollama_roots
+from .model import CACHE, _slug, display_name, ollama_roots, weight_bytes
 
 HEADROOM = 2.5 * 1024 ** 3  # the loader's margin over the weights, in bytes (model._check_vram)
 GIB = 1024 ** 3
@@ -71,12 +71,10 @@ def _supported(types: set[str] | None, *model_types) -> bool | None:
 def _checkpoint(path: Path, types) -> dict | None:
     """Describe a Hugging Face checkpoint folder, or None if it isn't one."""
     cfg = _json(path / "config.json")
-    weights = list(path.glob("*.safetensors"))
-    if not cfg or not weights:
+    if not cfg or not any(path.glob("*.safetensors")):
         return None
-    size = sum(f.stat().st_size for f in weights)  # stat follows the hub cache's symlinks to blobs
+    size, loaded = weight_bytes(path)  # stat follows the hub cache's symlinks to blobs
     text = cfg.get("text_config") or cfg
-    dtype = str(cfg.get("torch_dtype") or cfg.get("dtype") or text.get("torch_dtype") or text.get("dtype") or "bfloat16")
     notes = []
     has_tokenizer = any((path / f).exists() for f in TOKENIZER_FILES)
     if not has_tokenizer:
@@ -85,16 +83,18 @@ def _checkpoint(path: Path, types) -> dict | None:
         notes.append("Quantized checkpoint: tracing and weight edits assume dense weights.")
     if any(k in text for k in ("num_experts", "num_local_experts", "n_routed_experts")):
         notes.append("Mixture-of-experts MLPs: the Trace tab has no neuron clusters for them yet.")
-    if size / (4 if "32" in dtype else 2) < 1e8:
+    if loaded / 2 < 1e8:
         notes.append("Very small model (under 100M parameters): good for trying the tools, not for findings.")
+    if size - loaded > 0.05 * size and loaded < size:
+        notes.append(f"{(size - loaded) / GIB:.1f} GB of the files (e.g. a vision tower) isn't loaded for the text model.")
     return {
         "architecture": (cfg.get("architectures") or [None])[0],
         "model_type": text.get("model_type") or cfg.get("model_type"),
         "n_layers": text.get("num_hidden_layers") or text.get("n_layer"),
         "d_model": text.get("hidden_size") or text.get("n_embd"),
-        "params": size / (4 if "32" in dtype else 2),
+        "params": loaded / 2,  # loaded as bf16
         "disk_bytes": size,
-        "need_bytes": size + HEADROOM,  # what the loader checks against free GPU memory
+        "need_bytes": loaded + HEADROOM,  # what the loader checks against free GPU memory (model._check_vram)
         "supported": _supported(types, cfg.get("model_type"), text.get("model_type")) if has_tokenizer else False,
         "notes": notes,
     }

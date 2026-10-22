@@ -100,6 +100,20 @@ def test_catalog_fits_against_the_gpu_budget(shelf):
                 if e["spec"] == str(shelf["beta"]))["fits"] is True
 
 
+def test_weight_estimate_counts_what_the_text_model_loads(tmp_path):
+    """Vision towers and multi-token-prediction heads stay on disk; fp32 weights load as bf16."""
+    import torch
+    from safetensors.torch import save_file
+    from brainscan.recorder.model import weight_bytes
+    save_file({"model.language_model.layers.0.w": torch.zeros(100, dtype=torch.float32),  # 400 B, loads as 200
+               "model.visual.blocks.0.w": torch.zeros(100, dtype=torch.bfloat16),         # skipped
+               "mtp.layers.0.w": torch.zeros(50, dtype=torch.bfloat16),                   # skipped
+               "lm_head.weight": torch.zeros(10, dtype=torch.bfloat16)}, str(tmp_path / "model.safetensors"))
+    total, loaded = weight_bytes(tmp_path)
+    assert total == (tmp_path / "model.safetensors").stat().st_size
+    assert loaded == 200 + 20
+
+
 def test_display_names():
     assert display_name("/x/models--Qwen--Qwen3.5-9B/snapshots/abc") == "Qwen/Qwen3.5-9B"
     assert display_name("ollama:llama3.1:8b") == "llama3.1:8b"
