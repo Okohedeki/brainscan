@@ -36,6 +36,7 @@ from .directions import DirectionBank
 from .edits import EditStack
 from .events import message_events
 from .graphs import DecodeGraphs
+from .tracing import Tracer
 
 
 @dataclass
@@ -160,6 +161,7 @@ class Recorder:
             except Exception as exc:
                 print(f"[brainscan] weight anatomy disabled ({type(exc).__name__}: {exc}); "
                       "the Weights tab will be unavailable", flush=True)
+        self.tracer = Tracer(self) if self.anatomy is not None else None  # needs the unit map
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}

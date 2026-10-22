@@ -34,6 +34,7 @@ from .recorder import workbench
 from .recorder.model import Subject
 from .recorder.session import GenParams, Recorder, compact
 from .recorder.store import RunStore
+from .recorder.tracing import Busy
 
 UI_DIR = PROJECT_ROOT / "ui"
 settings = Settings()
@@ -507,6 +508,39 @@ async def get_run_anatomy(run_id: str):
     header = json.dumps({"n": int(len(t)), "units": an.n_units, "key": an.key, "skipped": skipped,
                          "t": t.tolist()}).encode()
     return Response(struct.pack("<I", len(header)) + header + codes.tobytes(), media_type="application/octet-stream")
+
+
+async def _trace(fn, *args):
+    """Run a tracer read off the event loop, mapping its failures to HTTP codes."""
+    rec = recorder()
+    if getattr(rec, "tracer", None) is None:
+        raise HTTPException(404, "tracing needs weight anatomy (BRAINSCAN_ANATOMY=1)")
+    try:
+        return await asyncio.to_thread(getattr(rec.tracer, fn), *args)
+    except Busy as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/brainscan/runs/{run_id}/tokens/{t}/explain")
+async def explain_token(run_id: str, t: int, target: str | None = None):
+    """Per-unit attribution of the next token's logit at tape slot t (see recorder/tracing.py)."""
+    return await _trace("explain", run_id, t, target)
+
+
+@app.get("/brainscan/runs/{run_id}/tokens/{t}/neurons")
+async def token_neurons(run_id: str, t: int, unit: int, target: str | None = None):
+    """Each neuron of an MLP cluster at tape slot t: activation and share of the attribution."""
+    return await _trace("neurons", run_id, t, unit, target)
+
+
+@app.get("/brainscan/runs/{run_id}/tokens/{t}/attention")
+async def token_attention(run_id: str, t: int, unit: int):
+    """A softmax-attention head's attention over the earlier tokens at tape slot t."""
+    return await _trace("attention", run_id, t, unit)
 
 
 @app.websocket("/brainscan/live")

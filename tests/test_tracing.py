@@ -1,0 +1,148 @@
+"""Tracing: per-unit attribution, neuron drill-down and attention patterns at a token of a run.
+
+Runs a real CPU recorder on the tiny saved Llama in fp32, so the attribution identity (embedding +
+every unit's write, projected through the frozen final norm, equals the logit) holds to float
+precision, and attention patterns can be checked against an eager reference model.
+"""
+
+import threading
+from pathlib import Path
+
+import pytest
+import torch
+from fastapi.testclient import TestClient
+from transformers import AutoModelForCausalLM
+
+from brainscan import server
+from brainscan.config import Settings
+from brainscan.recorder.chat import render
+from brainscan.recorder.model import Subject
+from brainscan.recorder.session import GenParams, Recorder
+from brainscan.recorder.store import RunStore
+from brainscan.recorder.tracing import Busy
+
+MODEL_DIR = Path.home() / ".cache" / "brainscan" / "models" / "tiny-llama-test"
+
+pytestmark = pytest.mark.skipif(not MODEL_DIR.exists(), reason=f"needs the tiny CPU Llama at {MODEL_DIR}")
+
+FIRST = [{"role": "user", "content": "Name a color."}]
+
+
+@pytest.fixture(scope="module")
+def traced(tmp_path_factory):
+    """A two-request run: the second request extends the first, so its context spans both."""
+    torch.manual_seed(0)
+    root = tmp_path_factory.mktemp("trace")
+    subject = Subject(str(MODEL_DIR), dtype=torch.float32, device="cpu")
+    settings = Settings(model=str(MODEL_DIR), device="cpu", anatomy=True, anatomy_clusters=8,
+                        graph_decode=False, data_dir=root)
+    rec = Recorder(subject, RunStore(root / "data", settings.disk_budget_gb), settings, lambda m: None)
+    r1 = rec.generate(GenParams(messages=FIRST, max_tokens=6, temperature=0, run_hint="trace-run"))
+    second = FIRST + [{"role": "assistant", "content": r1.content or ""},
+                      {"role": "user", "content": "Another one please."}]
+    rec.generate(GenParams(messages=second, max_tokens=6, temperature=0, run_hint="trace-run"))
+    return rec, rec.get_run("trace-run"), second
+
+
+def last_prompt_slot(run, req):
+    return max(r["t"] for r in run.tape if r["req"] == req and r["ph"] != "gen")
+
+
+def test_attribution_adds_up_to_the_logit(traced):
+    rec, run, _ = traced
+    t = last_prompt_slot(run, 2)
+    out = rec.tracer.explain(run.id, t)
+    assert len(out["contrib"]) == rec.anatomy.n_units
+    total = out["embed"] + sum(out["contrib"])
+    assert abs(out["logit"] - total) < 1e-3 and abs(out["rest"]) < 1e-3
+    # The target defaults to the token the model actually produced next, and its probability is
+    # the one the recorder stored for that token while generating.
+    nxt = next(r for r in run.tape if r["req"] == 2 and r["pos"] == out["pos"] + 1)
+    assert out["target"]["id"] == nxt["tok"]
+    assert out["target"]["prob"] == pytest.approx(nxt["p"], abs=2e-3)
+    # Per-layer sums partition the same total.
+    assert sum(h + c for h, c in out["layers"]) == pytest.approx(sum(out["contrib"]), abs=1e-2)
+
+
+def test_custom_target_and_context_across_requests(traced):
+    rec, run, second = traced
+    t = last_prompt_slot(run, 2)
+    ids, pos, req = rec.tracer.context(run, t)
+    rendered = render(rec.s.tokenizer, second, None, add_generation_prompt=True).ids
+    assert req == 2 and ids == rendered[:pos + 1]  # positions recorded by request 1 fill the prefix
+    alt = rec.tracer.explain(run.id, t)["alternatives"][1]
+    out = rec.tracer.explain(run.id, t, target=str(alt["id"]))
+    assert out["target"]["id"] == alt["id"] and out["target"]["rank"] == 2
+
+
+def test_neurons_add_up_to_their_cluster(traced):
+    rec, run, _ = traced
+    t = last_prompt_slot(run, 1)
+    out = rec.tracer.explain(run.id, t)
+    an = rec.anatomy
+    clusters = [g for g in range(an.n_units) if an.units[g]["kind"] == "cluster"]
+    g = max(clusters, key=lambda u: abs(out["contrib"][u]))
+    nn = rec.tracer.neurons(run.id, t, g)
+    assert nn["contrib"] == pytest.approx(out["contrib"][g], abs=1e-3)
+    assert len(nn["neurons"]) == an.units[g]["size"]
+    assert abs(nn["neurons"][0]["contrib"]) >= abs(nn["neurons"][-1]["contrib"])  # sorted by impact
+    with pytest.raises(ValueError):
+        rec.tracer.neurons(run.id, t, 0)  # unit 0 is a head
+
+
+def test_attention_matches_an_eager_reference(traced):
+    rec, run, _ = traced
+    t = last_prompt_slot(run, 2)
+    ids, _, _ = rec.tracer.context(run, t)
+    ref = AutoModelForCausalLM.from_pretrained(str(MODEL_DIR), dtype=torch.float32,
+                                               attn_implementation="eager").eval()
+    with torch.no_grad():
+        attentions = ref(input_ids=torch.tensor([ids]), output_attentions=True).attentions
+    lm = rec.anatomy.layers[2]
+    out = rec.tracer.attention(run.id, t, lm.offset + 1)  # layer 2, head 1
+    assert out["available"] and len(out["weights"]) == len(ids)
+    assert sum(out["weights"]) == pytest.approx(1.0, abs=1e-3)
+    want = attentions[2][0, 1, -1]
+    assert torch.allclose(torch.tensor(out["weights"]), want, atol=1e-4)
+    assert out["tokens"][-1] == rec.s.token_str(ids[-1])
+
+
+def test_tracing_waits_for_generation(traced):
+    rec, run, _ = traced
+    held, release = threading.Event(), threading.Event()
+
+    def hold():
+        with rec.lock:
+            held.set()
+            release.wait(5)
+
+    th = threading.Thread(target=hold)
+    th.start()
+    held.wait(5)
+    rec.tracer._cache.clear()  # a cached capture would not need the model
+    try:
+        with pytest.raises(Busy):
+            rec.tracer.explain(run.id, 1)
+    finally:
+        release.set()
+        th.join()
+
+
+def test_trace_endpoints(traced):
+    rec, run, _ = traced
+    saved = dict(server.state)
+    server.state.update(recorder=rec, status="ready", step="ready", error=None)
+    try:
+        client = TestClient(server.app)
+        t = last_prompt_slot(run, 1)
+        r = client.get(f"/brainscan/runs/{run.id}/tokens/{t}/explain")
+        assert r.status_code == 200 and len(r.json()["contrib"]) == rec.anatomy.n_units
+        assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/attention", params={"unit": 0}).json()["available"]
+        cluster = rec.anatomy.layers[0].offset + rec.anatomy.layers[0].n_heads
+        assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/attention", params={"unit": cluster}).status_code == 400
+        assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/neurons", params={"unit": cluster}).status_code == 200
+        assert client.get(f"/brainscan/runs/nope/tokens/{t}/explain").status_code == 404
+        assert client.get(f"/brainscan/runs/{run.id}/tokens/99999/explain").status_code == 404
+    finally:
+        server.state.clear()
+        server.state.update(saved)
