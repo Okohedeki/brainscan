@@ -30,7 +30,8 @@ const STEPS = [
     view: "weights", n: 2, title: "Trace", lead: "Open the model as a graph of attention heads and MLP neuron clusters, and follow a token through it.",
     tools: [
       { name: "Why did it write that?", key: "W", what: "Click any word in the conversation: the graph colors by what each unit did to it, and a panel shows where its logit came from layer by layer, the layer where the model first had it as its top guess, the units that pushed it up or down, and the runners-up.", act: go("weights", () => trace({ mode: "attr" })) },
-      { name: "Knockout tests", what: "Remove units (the top ones, your selection, or the units on shown paths) and re-run: the token's probability before → after, its new rank and the new top guesses, with the units' total effect next to their direct effect.", act: go("weights", () => trace({ mode: "attr" })) },
+      { name: "Knockout tests", what: "Remove units (the top ones, your selection, or the units on shown paths) and re-run: the token's probability before → after, its new rank and the new top guesses, with the units' total effect next to their direct effect. \"Make permanent\" turns a knockout into one weight edit, applied at once.", act: go("weights", () => trace({ mode: "attr" })) },
+      { name: "Edits beside the trace", key: "E", what: "The Edits panel in Trace: apply or restore the edit stack, re-run the open chat on the edited weights, and run behavior checks, without leaving the graph.", act: go("weights", () => document.querySelector("#gv-edits-btn")?.click()) },
       { name: "Live unit graph", what: "Every head and neuron cluster, lit by how much it wrote at the current token. Scroll to zoom, drag to pan, replay the run on the timeline.", act: go("weights") },
       { name: "Explain the next token", key: "A", what: "Color each unit by how much it pushed the next token up or down. Click a runner-up token to explain it instead.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Before and after an edit", what: "With weight edits applied, turn on \"vs original\" in Explain: each unit is colored by how the edit changed its effect on the token, the dock shows the probability before → after, and Paths traces the circuit behind the change.", act: go("weights", () => trace({ mode: "attr" })) },
@@ -44,7 +45,8 @@ const STEPS = [
     tools: [
       { name: "Find a direction", what: "Two sets of examples give a direction in the residual stream, scored at every layer on held-out examples.", act: go("workbench", scrollTo("#h-find")) },
       { name: "Edit weights", what: "Remove a direction from the weights, or scale a block, head or neuron (a lesion at 0). Lesion any unit straight from the Trace graph, then compare its circuit with the original there.", act: go("workbench", scrollTo("#h-edit")) },
-      { name: "Compare", what: "Run prompts on the original and edited weights side by side, with side-effect checks on neutral text.", act: go("workbench", scrollTo("#h-compare")) },
+      { name: "Compare", what: "Re-run the open chat on the original and edited weights and trace the first word that changed, or run your own prompts side by side with side-effect checks on neutral text.", act: go("workbench", scrollTo("#h-compare")) },
+      { name: "Check behavior", what: "Save what the model should say next, from any traced word (\"Add as a check\") or typed. With edits applied, each check shows its probability on the original weights → now: what an edit fixed and what it broke.", act: go("workbench", scrollTo("#h-checks")) },
       { name: "Export", what: "Save the edited model as a Hugging Face checkpoint with every edit recorded.", act: go("workbench", scrollTo("#h-export")) },
     ],
   },
@@ -52,7 +54,7 @@ const STEPS = [
 
 const KEYS = [
   ["?", "this guide"], ["⌘K or /", "jump to a unit"], ["A", "explain next token"], ["P", "paths"],
-  ["W", "why this token"], ["T", "show/hide text"], ["Space", "replay"], ["← →", "step tokens"], ["F", "fit graph"], ["Esc", "clear / close"],
+  ["W", "why this token"], ["E", "weight edits"], ["T", "show/hide text"], ["Space", "replay"], ["← →", "step tokens"], ["F", "fit graph"], ["Esc", "clear / close"],
 ];
 
 function render() {

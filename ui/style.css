@@ -852,6 +852,48 @@ button.stop:hover:not(:disabled) { background: color-mix(in srgb, var(--critical
 .tp-units .v.neg { color: var(--div-neg); }
 .pbar.neg i { background: var(--div-neg); }
 .d-sec h4.sub { margin-top: 12px; }
+/* weight edits: the Trace tab's Edits panel and Tune (ui/edits.js) */
+.gv-edits {
+  position: absolute; top: 60px; left: 12px; bottom: 12px; width: 380px; z-index: 9; display: flex; flex-direction: column;
+  border-radius: 16px; overflow: hidden; animation: slide-in-left 0.22s cubic-bezier(0.2, 0.8, 0.2, 1);
+}
+@media (prefers-reduced-motion: reduce) { .gv-edits { animation: none; } }
+.gv-edits .edits-body { overflow: auto; padding: 0 14px 14px; flex: 1; min-height: 0; }
+.tbtn .count { min-width: 16px; height: 16px; padding: 0 5px; border-radius: 8px; font-size: 10.5px; font-weight: 700; color: var(--surface); background: var(--serious); display: inline-flex; align-items: center; justify-content: center; }
+.tbtn .count[hidden] { display: none; }
+.ed-sec { padding: 10px 0; border-bottom: 1px solid var(--border); display: flex; flex-direction: column; gap: 8px; }
+.ed-sec:last-child { border-bottom: none; }
+.ed-head { display: flex; align-items: center; justify-content: space-between; gap: 8px; font-size: 13px; }
+.ed-head .pill { margin-top: 0; }
+.ed-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.ed-msg { margin: 8px 0 0; font-size: 12px; }
+.ok-text { color: var(--good); }
+.ed-list, .ck-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 3px; font-size: 12px; }
+.ed-list li, .ck-list li { display: flex; align-items: center; gap: 8px; padding: 5px 6px; border-radius: 8px; border: 1px solid var(--border); background: color-mix(in srgb, var(--raised) 55%, transparent); }
+.ed-list li.on { border-color: color-mix(in srgb, var(--good) 40%, transparent); }
+.ed-list li.muted, .ck-list li.muted { border-style: dashed; display: block; line-height: 1.5; }
+.ed-list label.check { flex: 1; min-width: 0; display: flex; align-items: flex-start; gap: 6px; flex-direction: row; color: var(--ink); font-size: 12px; }
+.ed-list label.check span { word-break: break-word; }
+.ed-list .pill, .ck-list .pill { margin-top: 0; font-size: 10.5px; }
+.ck-label { flex: 1; min-width: 0; font-family: var(--mono); font-size: 11.5px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.ck-kind { font: 600 9.5px var(--sans); text-transform: uppercase; letter-spacing: 0.05em; color: var(--muted); margin-right: 6px; }
+.ck-res { display: flex; flex-direction: column; align-items: flex-end; flex: none; font-variant-numeric: tabular-nums; }
+.ck-val { font-size: 12px; }
+.ck-val.down b { color: var(--div-neg); }
+.ck-val.up b { color: var(--div-pos); }
+.ck-add { display: grid; grid-template-columns: minmax(0, 1fr) 120px; gap: 6px; align-items: center; }
+.ck-add input[type="text"] { min-height: 30px; font-size: 12px; }
+.ck-add .check { grid-column: 1; font-size: 11.5px; color: var(--ink-2); display: flex; flex-direction: row; align-items: center; gap: 5px; }
+.ck-add button { grid-column: 2; }
+.rp-card { border: 1px solid var(--border); border-radius: 10px; padding: 10px; background: color-mix(in srgb, var(--raised) 55%, transparent); display: flex; flex-direction: column; gap: 8px; }
+.rp-card .lbl { display: block; font-size: 10.5px; font-weight: 600; text-transform: uppercase; letter-spacing: 0.06em; color: var(--muted); margin-bottom: 2px; }
+.rp-q { font-size: 12.5px; }
+.rp-cols { display: grid; grid-template-columns: 1fr 1fr; gap: 8px; }
+.rp-cols p { margin: 0; font-size: 12.5px; line-height: 1.5; white-space: pre-wrap; word-break: break-word; max-height: 180px; overflow: auto; }
+.rp-card code { font-size: 11.5px; }
+.ko-actions { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; margin-top: 8px; }
+.wb-replay .ed-sec { padding-top: 0; }
+.wb-checks .ed-sec { padding-top: 0; }
 .routes { list-style: none; margin: 4px 0 8px; padding: 0; display: flex; flex-direction: column; gap: 3px; }
 .routes li { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: start; padding: 6px; border-radius: 9px; cursor: pointer; border: 1px solid transparent; }
 .routes li:hover { background: color-mix(in srgb, var(--path) 9%, transparent); border-color: color-mix(in srgb, var(--path) 35%, transparent); }

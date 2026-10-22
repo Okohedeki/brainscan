@@ -89,11 +89,27 @@ the weights themselves.
    Add a random-direction edit with the same settings as a control. Applying keeps a CPU copy of
    every touched weight, so restore is exact, and every recording made while edits are applied is
    tagged with them (`weight_edits` in the run metadata; "weights edited" in the header).
-3. **Compare.** Runs prompts on the original and edited weights side by side (greedy, steering
-   off), with a refusal-phrase heuristic and side-effect checks on neutral text (KL divergence and
-   perplexity).
-4. **Export.** Saves the edited weights as a Hugging Face checkpoint with `brainscan_edits.json`
+3. **Compare.** *Re-run this chat* asks the open conversation's last question again, greedy, on
+   the original weights (edits lifted, not recorded) and the edited weights (recorded as
+   `<run>-edited`), shows both answers and the first token where they part, and *Trace the
+   difference* opens that word in Trace compared with the original weights. Your own prompts can
+   still be run side by side, with a refusal-phrase heuristic and side-effect checks on neutral
+   text (KL divergence and perplexity).
+4. **Check behavior.** Saved checks of what the model should say next: from any traced word
+   (*Add as a check* in its panel; the exact context of that chat) or typed ("The capital of
+   France is" → "Paris", as raw text or a chat question). With edits applied, each shows its
+   probability on the original weights → now, with rank and the new top guess, so an edit's
+   intended effect and its side effects show up together. Checks are saved per model.
+5. **Export.** Saves the edited weights as a Hugging Face checkpoint with `brainscan_edits.json`
    recording the base model and every edit.
+
+Tune is also reachable from Trace. *Make permanent* on a knockout result adds one edit that
+removes all its units (heads and whole neuron clusters, kind `units`) and applies it, and the
+**Edits** panel (`E`) in the Trace toolbar holds the stack, *Re-run this chat* and the checks, so
+the loop find → test → edit → verify stays on the graph. On Qwen3.5-9B, making the five-unit
+" Canberra" knockout permanent turns the model's own answer to "What is the capital of
+Australia?" into "Sydney"; the checks show it also weakens " Paris" after "The capital of France
+is" (0.21 → 0.08), a side effect the single-token view would miss.
 
 ## Trace: the model as a live graph
 

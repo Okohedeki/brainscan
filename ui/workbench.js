@@ -251,6 +251,8 @@ async function exportModel(ev) {
 function boot() {
   document.querySelectorAll(".tabs [data-view]").forEach((b) => { b.onclick = () => show(b.dataset.view); });
   document.addEventListener("brainscan:show", (ev) => { if (VIEWS.includes(ev.detail)) show(ev.detail); });  // from the guide
+  // The stack changed elsewhere (a knockout made permanent in Trace, the Edits panel).
+  document.addEventListener("brainscan:workbench", () => { if (!$("#view-workbench").hidden) refresh(); });
   document.addEventListener("brainscan:model", () => {  // layer sweeps, comparisons and export names belong to one model
     W.sweep = null;
     $("#wb-sweep").innerHTML = ""; $("#wb-save-row").hidden = true; $("#wb-path").value = "";

@@ -46,6 +46,7 @@ const A = {
   cmp: false, attrOrig: null, attrDiff: null,  // "vs original": attribution with the weight edits lifted, and the change
   attrOf: null,                      // the slot of the word being explained, when it was clicked in the conversation
   trace: null, traceOn: true, frameTrace: false, followTimer: 0,  // the explained token's routes, START to END
+  editsOpen: false,
   panelSeq: 0, knockouts: [], koKey: null,
   paths: [], pathMode: "down", pathHops: 3, pathBranch: 4, pathActivity: true, pathsOpen: false,
   expanded: new Map(),               // cluster g -> Float32Array neuron activity in [-1, 1] at the cursor
@@ -307,6 +308,7 @@ function handle(msg) {
       refreshEdited();
       if (A.selected != null && A.visible) selectUnit(A.selected, true);  // the weights changed
       if (A.mode === "attr" && A.visible) loadExplain();  // hidden: activate() re-traces on return
+      document.dispatchEvent(new CustomEvent("brainscan:workbench"));  // the edit panels (ui/edits.js) refresh
       break;
     case "status":
       if (!A.atlas && A.visible) activate();
@@ -351,7 +353,7 @@ function pushState() {
     selected: A.selected, edited: A.edited, edgeMode: A.edgeMode, live: isLive(), visible: A.visible,
     signed, selection: A.sel, paths: A.paths, expanded: A.expanded,
     trace: A.trace && !A.pathsOpen ? { start: A.trace.start, end: A.trace.end } : null,
-    insets: { l: A.pathsOpen ? 396 : 0, r: $("#gv-drawer").hidden ? 0 : 452 } });
+    insets: { l: A.pathsOpen || A.editsOpen ? 396 : 0, r: $("#gv-drawer").hidden ? 0 : 452 } });
 }
 const isLive = () => A.follow && performance.now() - A.lastAnat < 2500;
 
@@ -1039,6 +1041,7 @@ async function renderTokenPanel() {
   $("#tp-circuit").onclick = () => openPaths("explain");
   $("#tp-ko-top").onclick = () => runKnockout(topUnits(info, 5, true), "top 5 units that pushed it up");
   $("#tp-ko-sel")?.addEventListener("click", () => runKnockout([...A.sel], `${A.sel.size} selected units`));
+  $("#tp-add-check").onclick = addCheckFromToken;
   $("#tp-copy").onclick = () => navigator.clipboard?.writeText(JSON.stringify(traceJson(info, lens), null, 2));
   renderKnockouts();
 }
@@ -1088,6 +1091,7 @@ function tokenPanelHtml(info, lens) {
         <button type="button" class="btn sm" id="tp-circuit" title="Open the path explorer on this token: up to 60 routes, with hops and branches to tune">All routes</button>
         <button type="button" class="btn sm" id="tp-ko-top" title="Remove the five units that pushed it up most and re-run">Knock out top 5</button>
         ${A.sel.size ? `<button type="button" class="btn sm" id="tp-ko-sel">Knock out selection (${A.sel.size})</button>` : ""}
+        <button type="button" class="btn sm ghost" id="tp-add-check" title="Save as a behavior check: after this context, this word. Checks show what an edit changes.">Add as a check</button>
         <button type="button" class="btn sm ghost" id="tp-copy" title="Copy this trace as JSON">Copy JSON</button>
       </div>
     </div>
@@ -1171,7 +1175,24 @@ async function runKnockout(units, label) {
   if (A.koKey === key) renderKnockouts();
 }
 
-function knockoutHtml(k) {
+/** Remove a knockout's units from the weights for real: one grouped edit, applied now. */
+async function makePermanent(k) {
+  if (!k?.res || k.permanent) return;
+  k.permanent = "pending"; k.permError = null;
+  renderKnockouts();
+  try {
+    await post("/brainscan/anatomy/lesion", { units: k.units, apply: true, note: `knockout for ${visTok(k.res.target.text)}` });
+    k.permanent = "done";
+    A.cmp = true;  // the trace now shows what the edit changed on this token
+    document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } }));
+    setEditsPanel(true);
+  } catch (err) {
+    k.permanent = null; k.permError = err.message;
+  }
+  renderKnockouts();
+}
+
+function knockoutHtml(k, i) {
   const names = k.units.length <= 4 ? k.units.map(shortName).join(" + ") : `${k.units.slice(0, 3).map(shortName).join(" + ")} + ${k.units.length - 3} more`;
   if (k.pending) return `<li class="pending"><b>${esc(k.label)}</b><span class="dim">${names}</span><span class="muted">Re-running without them…</span></li>`;
   if (k.error) return `<li class="err"><b>${esc(k.label)}</b><span class="warn-text">${esc(k.error)}</span></li>`;
@@ -1188,16 +1209,50 @@ function knockoutHtml(k) {
       <span>rank #${r.before.rank} → #${r.after.rank}</span></div>
     <div class="ko-bars"><span>direct</span>${dbar(d / Math.max(Math.abs(d), Math.abs(tot), 1e-6))}<span class="v">${sgn(d)}</span>
       <span>total</span>${dbar(tot / Math.max(Math.abs(d), Math.abs(tot), 1e-6))}<span class="v">${sgn(tot)}</span></div>
-    <p class="hint">${why} Most likely now: ${after}.</p></li>`;
+    <p class="hint">${why} Most likely now: ${after}.</p>
+    <div class="ko-actions">${k.permanent === "done"
+      ? `<span class="pill ok">made permanent: applied in the weights</span>`
+      : `<button type="button" class="btn sm" data-ko-perm="${i}" ${k.permanent ? "disabled" : ""} title="Remove these units from the weights for real: one edit in the stack, applied now. Restore any time from Edits.">${k.permanent ? "Applying…" : "Make permanent"}</button>`}
+      ${k.permError ? `<span class="warn-text small">${esc(k.permError)}</span>` : ""}</div></li>`;
 }
 
 function renderKnockouts() {
-  const list = $("#tp-ko-list");
-  if (list) list.innerHTML = (A.knockouts || []).map(knockoutHtml).join("") || `<li class="muted">No tests yet at this token.</li>`;
+  const list = $("#tp-ko-list"), kos = A.knockouts || [];
+  const onClick = (ev) => {
+    const b = ev.target.closest("[data-ko-perm]");
+    if (b) makePermanent(kos[Number(b.dataset.koPerm)]);
+  };
+  if (list) {
+    list.innerHTML = kos.map(knockoutHtml).join("") || `<li class="muted">No tests yet at this token.</li>`;
+    list.onclick = onClick;
+  }
   const unitBox = $("#an-ko");
   if (unitBox && A.selected != null) {
-    const k = (A.knockouts || []).find((x) => x.units.length === 1 && x.units[0] === A.selected);
-    unitBox.innerHTML = k ? knockoutHtml(k) : "";
+    const k = kos.find((x) => x.units.length === 1 && x.units[0] === A.selected);
+    unitBox.innerHTML = k ? knockoutHtml(k, kos.indexOf(k)) : "";
+    unitBox.onclick = onClick;
+  }
+}
+
+// ---------------------------------------------------------------- edits panel (rendered by ui/edits.js)
+function setEditsPanel(open) {
+  A.editsOpen = open;
+  $("#gv-edits").hidden = !open;
+  $("#gv-edits-btn").setAttribute("aria-pressed", String(open));
+  if (open) document.dispatchEvent(new CustomEvent("brainscan:workbench"));
+  pushState();
+}
+
+async function addCheckFromToken() {
+  const info = A.attrInfo, btn = $("#tp-add-check");
+  if (!info?.target || !A.runId) return;
+  btn.disabled = true;
+  try {
+    await post("/brainscan/checks", { run: A.runId, t: info.t, target: info.target.id });
+    btn.textContent = "Saved as a check ✓";
+    document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } }));
+  } catch (err) {
+    btn.textContent = "Couldn't save"; btn.title = err.message; btn.disabled = false;
   }
 }
 
@@ -1404,7 +1459,7 @@ function updateZoomLabel() {
 function openDrawer(on) {
   $("#gv-drawer").hidden = !on;
   $("#gv-stage").classList.toggle("drawer-open", on);
-  graph?.setState({ insets: { l: A.pathsOpen ? 396 : 0, r: on ? 452 : 0 } });
+  graph?.setState({ insets: { l: A.pathsOpen || A.editsOpen ? 396 : 0, r: on ? 452 : 0 } });
 }
 
 async function selectUnit(g, keepView = false) {
@@ -1872,6 +1927,8 @@ function setupInput() {
   $("#an-fit").onclick = () => { A.fit = true; schedule(); };
   document.querySelectorAll("#gv-mode [data-mode]").forEach((b) => { b.onclick = () => setMode(b.dataset.mode); });
   $("#gv-convo-btn").onclick = () => setConvo(!CV.open);
+  $("#gv-edits-btn").onclick = () => setEditsPanel(!A.editsOpen);
+  $("#gv-edits-close").onclick = () => setEditsPanel(false);
   $("#tv-convo-hide").onclick = () => setConvo(false);
   $("#tv-show-template").onchange = (ev) => { CV.showTemplate = ev.target.checked; renderConvo(true); };
   $("#tv-convo-body").addEventListener("click", (ev) => {
@@ -1922,8 +1979,10 @@ function setupInput() {
       if (!$("#gv-palette").hidden) closePalette();
       else if (A.sel.size) clearSelection();
       else if (A.selected != null || A.detailMode) selectUnit(null);
+      else if (A.editsOpen) setEditsPanel(false);
       else if (A.pathsOpen) closePaths();
     }
+    else if (ev.key === "e" || ev.key === "E") setEditsPanel(!A.editsOpen);
     else if (ev.key === "p" || ev.key === "P") (A.pathsOpen ? closePaths() : openPaths());
     else if (ev.key === "t" || ev.key === "T") setConvo(!CV.open);
     else if (ev.key === "w" || ev.key === "W") { if (A.mode !== "attr") setMode("attr"); openTokenPanel(); }
@@ -2004,6 +2063,7 @@ function boot() {
   renderConvo(true);
   document.addEventListener("brainscan:trace", (ev) => {  // from the guide
     const d = ev.detail || {};
+    if (d.cmp) A.cmp = true;  // e.g. the first word an edit changed: compare with the original weights
     if (d.word != null) {  // "why this token" for a token picked in another view
       if (A.atlas && A.runId && A.runId === $("#run-select").value && A.tok[d.word]) traceWord(d.word);
       else A.pendingWord = d.word;  // traced once the run is open here

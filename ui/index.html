@@ -154,6 +154,8 @@
         <button type="button" class="tbtn" id="gv-paths-btn" aria-pressed="false" title="Trace the strongest routes through the graph (P)">
           <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><g fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"><circle cx="3" cy="3.5" r="1.6"/><circle cx="13" cy="12.5" r="1.6"/><path d="M4.6 3.5c4.2 0 2.6 9 6.8 9"/></g></svg>
           Paths</button>
+        <button type="button" class="tbtn" id="gv-edits-btn" aria-pressed="false" title="Weight edits: apply or restore, re-run this chat on the edited model, behavior checks (E)">
+          Edits <span class="count" hidden></span></button>
         <span class="selchip" id="gv-selchip" hidden>
           <span id="gv-selcount"></span>
           <button type="button" class="link" id="gv-selpaths" title="Find paths from the selected units">paths</button>
@@ -161,6 +163,14 @@
           <button type="button" class="tbtn icon" id="gv-selclear" aria-label="Clear selection (Esc)">✕</button>
         </span>
       </div>
+
+      <aside class="gv-edits glass" id="gv-edits" hidden aria-labelledby="gv-edits-title">
+        <header class="drawer-head">
+          <span class="eyebrow" id="gv-edits-title">Weight edits</span>
+          <button type="button" class="tbtn icon" id="gv-edits-close" aria-label="Close weight edits">✕</button>
+        </header>
+        <div class="edits-body" data-edits="stack replay checks"></div>
+      </aside>
 
       <aside class="gv-paths glass" id="gv-paths" hidden aria-labelledby="gv-paths-title">
         <header class="drawer-head">
@@ -328,6 +338,8 @@
 
     <section class="panel wb-compare" aria-labelledby="h-compare">
       <div class="panel-head"><h2 id="h-compare">3 · Compare original and edited</h2></div>
+      <div class="wb-replay" data-edits="replay"></div>
+      <h3>Or your own prompts</h3>
       <p class="hint">Runs each prompt on the original and the edited weights (greedy, steering off) and checks side
         effects on neutral reference text.</p>
       <textarea id="wb-prompts" rows="4" spellcheck="false" placeholder="One prompt per line"></textarea>
@@ -340,8 +352,13 @@
       <div id="wb-results"></div>
     </section>
 
+    <section class="panel wb-checks" aria-labelledby="h-checks">
+      <div class="panel-head"><h2 id="h-checks">4 · Check behavior</h2></div>
+      <div data-edits="checks"></div>
+    </section>
+
     <section class="panel wb-export" aria-labelledby="h-export">
-      <div class="panel-head"><h2 id="h-export">4 · Export the variant</h2></div>
+      <div class="panel-head"><h2 id="h-export">5 · Export the variant</h2></div>
       <p class="hint">Saves the edited weights as a Hugging Face checkpoint, with brainscan_edits.json recording every
         edit and the base model. Paths are inside WSL; /mnt/h/... writes to the H: drive.</p>
       <div class="row">
@@ -383,6 +400,7 @@
   <script type="module" src="/ui/guide.js"></script>
   <script type="module" src="/ui/models.js"></script>
   <script type="module" src="/ui/chat.js"></script>
+  <script type="module" src="/ui/edits.js"></script>
   <script type="module" src="/ui/app.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
   <script type="module" src="/ui/weights.js"></script>
