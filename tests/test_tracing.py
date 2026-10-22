@@ -179,6 +179,68 @@ def test_original_weights_trace_matches_the_unedited_model(traced):
     assert torch.allclose(torch.tensor(rec.tracer.explain(run.id, t)["contrib"]), torch.tensor(before["contrib"]), atol=1e-4)
 
 
+def test_producer_explains_the_clicked_token(traced):
+    """Tracing the producer slot of a generated token explains that token, in its own context; the
+    first token of a later request maps back to an earlier request that saw the same prefix."""
+    rec, run, _ = traced
+    gen = [r for r in run.tape if r["ph"] == "gen" and r["req"] == 2]
+    g = gen[2]
+    src = rec.tracer.producer(run.id, g["t"])
+    s = run.tape[src["t"]]
+    assert s["pos"] == g["pos"] - 1 and src["target"]["id"] == g["tok"]
+    ex = rec.tracer.explain(run.id, src["t"], target=str(src["target"]["id"]))
+    assert ex["target"]["id"] == g["tok"]
+    assert ex["target"]["prob"] == pytest.approx(g["p"], abs=2e-3)  # what the model gave it while generating
+    first_new = min((r for r in run.tape if r["req"] == 2 and r["ph"] != "replay"), key=lambda r: r["t"])
+    if first_new["pos"] > 0:
+        src2 = rec.tracer.producer(run.id, first_new["t"])
+        assert run.tape[src2["t"]]["pos"] == first_new["pos"] - 1
+        ctx2, _, _ = rec.tracer.context(run, src2["t"])
+        ctx_new, _, _ = rec.tracer.context(run, first_new["t"])
+        assert ctx2 == ctx_new[:-1]  # the same tokens before it
+    first = next(r for r in run.tape if r["pos"] == 0)
+    with pytest.raises(ValueError):
+        rec.tracer.producer(run.id, first["t"])
+
+
+def test_knockout_matches_the_same_lesion_in_the_weights(traced):
+    """Knocking out a head and a cluster at run time gives exactly the logits of the model with those
+    units lesioned in its weights, and leaves the model as it was."""
+    rec, run, _ = traced
+    t = last_prompt_slot(run, 2)
+    base = rec.tracer.explain(run.id, t)
+    an = rec.anatomy
+    by_kind = lambda k: max((u for u in range(an.n_units) if an.units[u]["kind"] == k), key=lambda u: abs(base["contrib"][u]))
+    g, c = by_kind("head"), by_kind("cluster")
+    ko = rec.tracer.knockout(run.id, t, [c, g])
+    assert [u["g"] for u in ko["units"]] == sorted([g, c])
+    assert ko["target"]["id"] == base["target"]["id"]
+    assert ko["before"]["logit"] == pytest.approx(base["logit"], abs=1e-4)
+    assert ko["direct_effect"] == pytest.approx(base["contrib"][g] + base["contrib"][c], abs=1e-3)
+    assert ko["total_effect"] == pytest.approx(ko["before"]["logit"] - ko["after"]["logit"], abs=1e-3)
+
+    lm_h, _, h = an.locate(g)
+    lm_c, _, i = an.locate(c)
+    neurons = (lm_c.assign == i).nonzero().flatten().tolist()
+    edits = [rec.add_weight_edit("scale", layers=str(lm_h.index), targets=["head"], index=h, factor=0.0),
+             rec.add_weight_edit("scale", layers=str(lm_c.index), targets=["neuron"], index=neurons, factor=0.0)]
+    rec.apply_weight_edits()
+    try:
+        lesioned = rec.tracer.explain(run.id, t)
+        assert ko["after"]["logit"] == pytest.approx(lesioned["logit"], abs=1e-4)
+        assert ko["after"]["prob"] == pytest.approx(lesioned["target"]["prob"], abs=1e-4)
+    finally:
+        rec.revert_weight_edits()
+        for e in edits:
+            rec.edits.remove(e.id)
+    again = rec.tracer.explain(run.id, t)
+    assert again["logit"] == pytest.approx(base["logit"], abs=1e-6)  # the hooks are gone
+    with pytest.raises(ValueError):
+        rec.tracer.knockout(run.id, t, [])
+    with pytest.raises(KeyError):
+        rec.tracer.knockout(run.id, t, [10 ** 6])
+
+
 def test_trace_endpoints(traced):
     rec, run, _ = traced
     saved = dict(server.state)
@@ -194,6 +256,9 @@ def test_trace_endpoints(traced):
         assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/neurons", params={"unit": cluster}).status_code == 200
         assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/explain", params={"weights": "original"}).json()["model_weights"] == "original"
         assert client.get(f"/brainscan/runs/{run.id}/tokens/{t}/explain", params={"weights": "bogus"}).status_code == 400
+        assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": [0, 1]}).json()["after"]["logit"] is not None
+        assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": "0"}).status_code == 400
+        assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": []}).status_code == 400
         assert client.get(f"/brainscan/runs/nope/tokens/{t}/explain").status_code == 404
         assert client.get(f"/brainscan/runs/{run.id}/tokens/99999/explain").status_code == 404
     finally:

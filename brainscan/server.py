@@ -657,6 +657,22 @@ async def token_neurons(run_id: str, t: int, unit: int, target: str | None = Non
     return await _trace("neurons", run_id, t, unit, target, weights)
 
 
+@app.get("/brainscan/runs/{run_id}/tokens/{t}/producer")
+async def token_producer(run_id: str, t: int):
+    """The slot (and target) to explain to see why token t was written."""
+    return await _trace("producer", run_id, t)
+
+
+@app.post("/brainscan/runs/{run_id}/tokens/{t}/knockout")
+async def token_knockout(run_id: str, t: int, body: dict):
+    """Re-read the context with the given units removed and compare the next token's logit with the
+    intact model: their total causal effect, next to their direct effect (see recorder/tracing.py)."""
+    units = body.get("units")
+    if not isinstance(units, list):
+        raise HTTPException(400, "units must be a list of unit ids")
+    return await _trace("knockout", run_id, t, units, body.get("target"), body.get("weights") or "current")
+
+
 @app.get("/brainscan/runs/{run_id}/tokens/{t}/attention")
 async def token_attention(run_id: str, t: int, unit: int, weights: str = "current"):
     """A softmax-attention head's attention over the earlier tokens at tape slot t."""

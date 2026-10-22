@@ -13,6 +13,10 @@ and captures, at t's position:
   attention    for softmax-attention heads, how the head spread its attention over earlier tokens at t.
                Linear-attention heads (gated delta net) keep a recurrent state instead of an attention
                matrix, so they have none.
+  knockout     the total effect of removing units: the context is read again with each unit's write
+               zeroed at every position, and the target's logit compared with the intact model. Unlike
+               attribution this counts everything routed through later layers (and the final norm), so
+               the gap between the two shows how much the rest of the network makes up for the units.
 
 Tracing uses the current weights with runtime steering paused, and says when the run was recorded
 under different weight edits or with steering on. With weights="original" it lifts the applied
@@ -36,6 +40,7 @@ from transformers.modeling_utils import ALL_ATTENTION_FUNCTIONS
 CACHE_SIZE = 6
 TOP_UNITS = 24
 WEIGHTS = ("current", "original")
+MAX_KNOCKOUT = 64  # units removed in one knockout
 
 
 class Busy(Exception):
@@ -96,6 +101,23 @@ class Tracer:
     @staticmethod
     def next_token(run, req: int, pos: int) -> int | None:
         return next((r["tok"] for r in run.tape if r["req"] == req and r["pos"] == pos + 1), None)
+
+    def producer(self, run_id: str, t: int) -> dict:
+        """Where to trace to see why token t was written: the slot at the position before it, with t's
+        token as the target. A later request that reused (or re-read) the conversation shares its
+        tokens up to there, so an earlier request's slot has the same context; a slot shown on the
+        timeline is preferred over a re-read one."""
+        run = self._run(run_id)
+        if not 0 <= t < len(run.tape):
+            raise KeyError(f"no token {t}")
+        r = run.tape[t]
+        if r["pos"] == 0:
+            raise ValueError("the first token of the context has no prediction to trace")
+        slots = [x for x in run.tape if x["pos"] == r["pos"] - 1 and x["req"] <= r["req"]]
+        if not slots:
+            raise ValueError("the run's tape lacks the position before this token")
+        slots.sort(key=lambda x: (x["ph"] == "replay", x["req"] != r["req"], -x["req"], -x["t"]))
+        return {"t": slots[0]["t"], "of": t, "target": {"id": r["tok"], "text": self.s.token_str(r["tok"])}}
 
     # ---- the capture forward ------------------------------------------------------------
 
@@ -354,6 +376,100 @@ class Tracer:
                 "contrib": round(float(cn.sum()), 4), "active": carry,
                 "neurons": [{"n": n, "act": round(x, 4), "write": round(abs(x) * w, 4), "contrib": round(c, 4)}
                             for n, x, c, w in rows]}
+
+    # ---- causal: knockout --------------------------------------------------------------
+
+    def _knockout_hooks(self, units: list[int]) -> list:
+        """Pre-hooks that zero the given units' writes: a head's slice of its output projection's
+        input, a cluster's neurons at the MLP's down projection. Same effect as zeroing their output
+        weights (a lesion), without touching the weights."""
+        heads: dict[int, list[int]] = {}
+        neurons: dict[int, list[torch.Tensor]] = {}
+        maps = {}
+        for g in units:
+            lm, kind, i = self.an.locate(g)
+            maps[lm.index] = lm
+            if kind == "head":
+                heads.setdefault(lm.index, []).append(i)
+            else:
+                neurons.setdefault(lm.index, []).append((lm.assign == i).nonzero().flatten())
+
+        def zero(cols):
+            def fn(module, args):
+                x = args[0].clone()
+                x[..., cols] = 0
+                return (x, *args[1:])
+            return fn
+
+        handles = []
+        for layer, hs in heads.items():
+            o, _, hd = maps[layer].heads
+            cols = torch.cat([torch.arange(h * hd, (h + 1) * hd) for h in hs]).to(o.weight.device)
+            handles.append(o.register_forward_pre_hook(zero(cols)))
+        for layer, parts in neurons.items():
+            down = maps[layer].down
+            handles.append(down.register_forward_pre_hook(zero(torch.cat(parts).to(down.weight.device))))
+        return handles
+
+    def knockout(self, run_id: str, t: int, units, target=None, weights: str = "current") -> dict:
+        run = self._run(run_id)
+        units = sorted({int(g) for g in units or []})
+        if not units:
+            raise ValueError("pick at least one unit to knock out")
+        if len(units) > MAX_KNOCKOUT:
+            raise ValueError(f"knock out at most {MAX_KNOCKOUT} units at a time")
+        for g in units:
+            self.an.locate(g)  # KeyError for a unit that doesn't exist
+        with self._weights(weights):
+            return self._knockout(run, t, units, target) | {"model_weights": weights}
+
+    @torch.no_grad()
+    def _knockout(self, run, t: int, units: list[int], target) -> dict:
+        ids, pos, req = self.context(run, t)
+        ex = self._explain(run, t, target)  # the intact model: capture (cached) and direct effects
+        tid = ex["target"]["id"]
+        base = self.capture(run, t).logits
+        t0 = time.perf_counter()
+        with self._model():
+            handles = self._knockout_hooks(units)
+            try:
+                kv, chunk = None, self.s.prefill_chunk
+                for cs in range(0, len(ids), chunk):
+                    out = self.s.model(input_ids=torch.tensor([ids[cs:cs + chunk]], device=self.s.device),
+                                       past_key_values=kv, use_cache=True, logits_to_keep=1)
+                    kv = out.past_key_values
+                after = out.logits[0, -1].float()
+                del out, kv
+            finally:
+                for h in handles:
+                    h.remove()
+
+        def summary(logits):
+            probs = torch.softmax(logits, -1)
+            return {"logit": round(float(logits[tid]), 4), "prob": round(float(probs[tid]), 5),
+                    "rank": int((logits > logits[tid]).sum()) + 1}
+
+        top_p, top_i = torch.softmax(after, -1).topk(5)
+        before, now = summary(base), summary(after)
+        direct = sum(ex["contrib"][g] for g in units)
+        # Logits move together when the final norm rescales, so effects are read on the target's
+        # margin over the best other token as well as on its raw logit.
+        def margin(logits):
+            other = logits.clone()
+            other[tid] = -float("inf")
+            return float(logits[tid] - other.max())
+        return {
+            "run": run.id, "t": t, "token": ex["token"], "target": ex["target"],
+            "units": [{"g": g, "layer": self.an.locate(g)[0].index, "kind": self.an.locate(g)[1],
+                       "i": self.an.locate(g)[2], "direct": ex["contrib"][g]} for g in units],
+            "before": before, "after": now,
+            "total_effect": round(before["logit"] - now["logit"], 4),   # what the units added to the logit
+            "direct_effect": round(direct, 4),                          # their own writes, read directly
+            "margin_before": round(margin(base), 4), "margin_after": round(margin(after), 4),
+            "top_after": [{"id": int(i), "text": self.s.token_str(int(i)), "prob": round(float(p), 5)}
+                          for p, i in zip(top_p.tolist(), top_i.tolist())],
+            "seconds": round(time.perf_counter() - t0, 3),
+        }
 
     def attention(self, run_id: str, t: int, g: int, weights: str = "current") -> dict:
         run = self._run(run_id)
