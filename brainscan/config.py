@@ -18,6 +18,10 @@ class Settings:
     # "ollama:<tag>" loads a model from the local Ollama store (dequantized from GGUF);
     # anything else is a Hugging Face repo id or local directory.
     model: str = field(default_factory=lambda: _env("MODEL", "ollama:llama3.1:8b"))
+    # Extra folders the model picker searches for checkpoints, besides Brainscan's model cache and
+    # the Hugging Face hub cache (separated by ":"; e.g. /mnt/h/models). Nothing is downloaded.
+    model_dirs: list[Path] = field(default_factory=lambda: [
+        Path(p).expanduser() for p in _env("MODEL_DIRS", "").split(os.pathsep) if p.strip()])
     device: str = field(default_factory=lambda: _env("DEVICE", "cuda"))
     data_dir: Path = field(default_factory=lambda: Path(_env("DATA", str(PROJECT_ROOT / "runs"))))
     disk_budget_gb: float = field(default_factory=lambda: float(_env("DISK_BUDGET_GB", "50")))

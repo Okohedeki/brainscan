@@ -1417,6 +1417,22 @@ function setupInput() {
   setInterval(() => { if (A.visible) { $("#an-follow").classList.toggle("streaming", isLive()); graph.setState({ live: isLive() }); } }, 1000);
 }
 
+/** Another model was loaded: everything here describes the old one's units, so start over. */
+function resetModel() {
+  if (!A.atlas) return;  // nothing loaded yet; activate() fetches the new map
+  stopPlay();
+  if (A.pathsOpen) closePaths();
+  A.sel.clear(); renderSelChip();
+  selectUnit(null);
+  resetThumbs();
+  A.atlas = null; A.atlasError = null; A.edges = null; A.params = null; A.runId = null; A.edited = new Set();
+  A.attr = null; A.attrN = null; A.attrInfo = null; A.attrTarget = null; A.attrSeq++; clearTimeout(A.attrTimer);
+  A.expanded.clear();
+  graph.setEdges(null);
+  schedule();
+  if (A.visible) activate();
+}
+
 async function activate() {
   readColors();
   graph.setState({ visible: true });
@@ -1456,6 +1472,7 @@ function boot() {
   // A hidden view catches up in activate(), so switching runs in the Scanner costs nothing here.
   document.addEventListener("brainscan:run", (ev) => { if (A.atlas && A.visible && ev.detail !== A.runId) openRun(ev.detail); });
   document.addEventListener("brainscan:focus-layer", (ev) => { if (A.atlas) graph.flyToLayer(Number(ev.detail)); });
+  document.addEventListener("brainscan:model", resetModel);
   document.addEventListener("brainscan:trace", (ev) => {  // from the guide
     const d = ev.detail || {};
     if (d.mode) setMode(d.mode);

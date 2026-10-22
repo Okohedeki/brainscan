@@ -63,7 +63,11 @@ def display_name(spec: str) -> str:
     cached = re.search(r"models--([^/\\]+)--([^/\\]+)", spec)
     if cached:
         return f"{cached.group(1)}/{cached.group(2)}"
-    return spec.rstrip("/").split("/")[-1] if Path(spec).exists() else spec
+    if not Path(spec).exists():
+        return spec
+    folder = spec.rstrip("/").split("/")[-1]
+    org = re.fullmatch(r"([A-Za-z0-9][\w.-]*?)--(.+)", folder)  # a copied cache folder, "Org--Name"
+    return f"{org.group(1)}/{org.group(2)}" if org else folder
 
 
 def prepare(spec: str, dtype=torch.bfloat16) -> tuple[str, dict]:
@@ -135,11 +139,13 @@ def _check_vram(path: str, device: str, headroom_gb: float = 2.5) -> None:
 class Subject:
     """The model under study plus the handles the recorder needs."""
 
-    def __init__(self, spec: str, dtype=torch.bfloat16, device: str = "cuda"):
+    def __init__(self, spec: str, dtype=torch.bfloat16, device: str = "cuda", name: str | None = None):
         path, self.provenance = prepare(spec, dtype)
         _check_vram(path, device)
         self.spec = spec
-        self.name = os.environ.get("BRAINSCAN_MODEL_NAME") or display_name(spec)
+        # BRAINSCAN_MODEL_NAME names the model BRAINSCAN_MODEL points at, not one switched to later.
+        env_name = os.environ.get("BRAINSCAN_MODEL_NAME") if spec == os.environ.get("BRAINSCAN_MODEL") else None
+        self.name = name or env_name or display_name(spec)
         self.slug = _slug(self.name.split("/")[-1])
         self.tokenizer = AutoTokenizer.from_pretrained(path)
         self.model = AutoModelForCausalLM.from_pretrained(

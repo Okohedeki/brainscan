@@ -17,6 +17,7 @@ const STEPS = [
   {
     view: "scanner", n: 1, title: "Watch", lead: "Run any agent on the model and see every token's internals as it works.",
     tools: [
+      { name: "Choose a model", what: "Click the model name in the top bar to switch to any open-weights model already on this machine: Hugging Face checkpoints and Ollama tags. Nothing is downloaded.", act: () => document.dispatchEvent(new CustomEvent("brainscan:models")) },
       { name: "Connect an agent", what: "Point any OpenAI-compatible harness at the endpoint below. Each request becomes a recorded run.", endpoint: true },
       { name: "Transcript and timeline", what: "Messages, tool calls and results lined up with a per-token timeline: events, logit lens by layer, surprisal, projections onto directions.", act: go("scanner") },
       { name: "Token inspector", what: "Click any token to see what the model predicted there, layer by layer.", act: go("scanner", scrollTo("#h-inspector")) },

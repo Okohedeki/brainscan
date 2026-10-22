@@ -99,6 +99,9 @@ class Tracer:
     def _model(self):
         if not self.rec.lock.acquire(timeout=1.0):
             raise Busy("the model is generating; trace again when the request finishes")
+        if self.rec.closed:
+            self.rec.lock.release()
+            raise Busy("the model is being switched; trace again when it has loaded")
         try:
             with torch.no_grad(), self.rec.tap.paused():
                 yield

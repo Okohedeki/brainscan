@@ -251,6 +251,13 @@ async function exportModel(ev) {
 function boot() {
   document.querySelectorAll(".tabs [data-view]").forEach((b) => { b.onclick = () => show(b.dataset.view); });
   document.addEventListener("brainscan:show", (ev) => { if (VIEWS.includes(ev.detail)) show(ev.detail); });  // from the guide
+  document.addEventListener("brainscan:model", () => {  // layer sweeps, comparisons and export names belong to one model
+    W.sweep = null;
+    $("#wb-sweep").innerHTML = ""; $("#wb-save-row").hidden = true; $("#wb-path").value = "";
+    $("#wb-metrics").innerHTML = ""; $("#wb-results").innerHTML = "";
+    for (const id of ["#wb-find-msg", "#wb-edit-msg", "#wb-compare-msg", "#wb-export-msg"]) message(id, "");
+    refresh();
+  });
   $("#wb-example").onclick = () => { $("#wb-a").value = EXAMPLE.a.join("\n"); $("#wb-b").value = EXAMPLE.b.join("\n"); $("#wb-name").value = "language_fr"; };
   $("#wb-analyze").onclick = analyze;
   $("#wb-save").onclick = saveDirection;

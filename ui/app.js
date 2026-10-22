@@ -708,6 +708,7 @@ function handle(msg) {
       break;
     }
     case "status": pollStatus(); loadRuns(); break;
+    case "model": pollStatus(); loadRuns(); break;  // pollStatus tells the other views
   }
 }
 
@@ -722,6 +723,11 @@ function connect() {
 async function pollStatus() {
   try { S.status = await api("/brainscan/status"); } catch (err) { S.status = { status: "error", error: err.message }; }
   const st = S.status;
+  if (st.model && st.model.spec !== S.modelSpec) {
+    // The recorder switched models: the Trace and Tune views rebuild for it, the run list refreshes.
+    if (S.modelSpec !== undefined) { document.dispatchEvent(new CustomEvent("brainscan:model", { detail: st.model })); loadRuns(); }
+    S.modelSpec = st.model.spec;
+  }
   if (st.model) {
     S.nLayers = S.meta?.model?.n_layers || st.model.n_layers;
     const prov = st.model.provenance || {};

@@ -15,6 +15,7 @@ import os
 os.environ.setdefault("PYTORCH_CUDA_ALLOC_CONF", "expandable_segments:True")
 
 import asyncio  # noqa: E402
+import gc
 import json
 import struct
 import threading
@@ -30,14 +31,15 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
-from .recorder import workbench
-from .recorder.model import Subject
-from .recorder.session import GenParams, Recorder, compact
+from .recorder import catalog, workbench
+from .recorder.model import Subject, display_name
+from .recorder.session import GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
 from .recorder.tracing import Busy
 
 UI_DIR = PROJECT_ROOT / "ui"
 settings = Settings()
+STARTUP_MODEL = settings.model  # settings.model follows model switches
 
 
 class LiveHub:
@@ -68,30 +70,91 @@ class LiveHub:
 
 
 hub = LiveHub()
-state: dict = {"recorder": None, "status": "loading", "step": "starting", "error": None}
+state: dict = {"recorder": None, "status": "loading", "step": "starting", "error": None,
+               "target": None, "switch": None}
+_switching = threading.Lock()  # one model load or switch at a time
 
 
-def _load() -> None:
+def _step(text: str) -> None:
+    state["step"] = text
+    hub.publish({"k": "status", "status": state["status"], "step": text})
+
+
+def _load(spec: str | None = None) -> bool:
+    """Load a model and build its recorder; True when it is ready."""
+    spec = spec or settings.model
+    state.update(status="loading", error=None, target=spec)
     try:
-        state["step"] = f"loading {settings.model}"
-        subject = Subject(settings.model, device=settings.device)
+        _step(f"loading {display_name(spec)}")
+        subject = Subject(spec, device=settings.device)
+        _step(f"mapping {subject.name}'s units and edges (cached after the first load)")
         rec = Recorder(subject, RunStore(settings.data_dir, settings.disk_budget_gb), settings, hub.publish)
-        state["step"] = "building direction bank"
+        _step("building direction bank")
         with rec.lock:
             rec.directions.ensure_defaults()
-        state.update(recorder=rec, status="ready", step="ready")
+        settings.model = spec
+        state.update(recorder=rec, status="ready", step="ready", target=None)
         hub.publish({"k": "status", "status": "ready"})
+        hub.publish({"k": "model", "model": subject.info()})
         print(f"[brainscan] ready: {subject.name} ({subject.n_layers} layers) on {subject.device}", flush=True)
+        return True
     except Exception as exc:
         traceback.print_exc()
-        state.update(status="error", error=f"{type(exc).__name__}: {exc}")
+        state.update(status="error", error=f"{type(exc).__name__}: {exc}", target=None)
+        hub.publish({"k": "status", "status": "error"})
+        return False
+
+
+def _startup() -> None:
+    try:
+        _load()
+    finally:
+        _switching.release()
+
+
+def _free_memory() -> None:
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+
+
+def _switch(spec: str) -> None:
+    """Unload the current model, load `spec`, and reload the previous model if that fails. Takes the
+    recorder from `state` itself: a reference held anywhere else (even in this thread's arguments)
+    would keep the old weights on the GPU."""
+    try:
+        rec, state["recorder"] = state["recorder"], None
+        previous = rec.s.spec if rec is not None else None
+        if rec is not None:
+            _step(f"unloading {rec.s.name}")
+            rec.close()  # waits for a forward pass in flight
+            del rec
+            _free_memory()
+        if _load(spec):
+            state["switch"] = {"from": previous, "to": spec, "error": None}
+            return
+        state["switch"] = {"from": previous, "to": spec, "error": state["error"]}
+        _free_memory()
+        if previous is not None and _load(previous):
+            state["switch"]["restored"] = previous
+    finally:
+        _switching.release()
+
+
+def _gpu_budget() -> int | None:
+    """GPU memory free once the current model is unloaded, or None when models load on the CPU."""
+    if not settings.device.startswith("cuda") or not torch.cuda.is_available():
+        return None
+    free, _ = torch.cuda.mem_get_info()
+    return free + torch.cuda.memory_reserved()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     hub.loop, hub.queue = asyncio.get_running_loop(), asyncio.Queue()
     pump = asyncio.create_task(hub.pump())
-    threading.Thread(target=_load, daemon=True).start()
+    _switching.acquire()
+    threading.Thread(target=_startup, daemon=True).start()
     yield
     pump.cancel()
 
@@ -156,6 +219,8 @@ async def chat_completions(request: Request):
         return StreamingResponse(_stream(rec, params, model_name, include_usage), media_type="text/event-stream")
     try:
         res = await asyncio.to_thread(rec.generate, params)
+    except ModelSwitched as exc:
+        raise HTTPException(503, str(exc)) from exc
     except ValueError as exc:
         raise HTTPException(400, str(exc)) from exc
     message = {"role": "assistant", "content": res.content}
@@ -216,6 +281,7 @@ async def _stream(rec: Recorder, params: GenParams, model_name: str, include_usa
 @app.get("/brainscan/status")
 async def get_status():
     out = {"status": state["status"], "step": state["step"], "error": state["error"],
+           "target": state["target"], "switch": state["switch"],
            "settings": {"model": settings.model, "data_dir": str(settings.data_dir),
                         "disk_budget_gb": settings.disk_budget_gb, "max_context": settings.max_context}}
     if torch.cuda.is_available():
@@ -224,6 +290,59 @@ async def get_status():
     if state["recorder"]:
         out.update(state["recorder"].status())
     return out
+
+
+@app.get("/brainscan/models")
+async def get_models():
+    """Models on this machine the recorder can switch to. Nothing is downloaded."""
+    rec = state["recorder"]
+    current = rec.s.spec if rec is not None else settings.model
+    budget = _gpu_budget()
+    models = await asyncio.to_thread(catalog.scan, _model_dirs(), current, budget)
+    return {"current": current, "status": state["status"], "step": state["step"], "error": state["error"],
+            "target": state["target"], "switch": state["switch"], "device": settings.device,
+            "budget_gb": round(budget / catalog.GIB, 1) if budget is not None else None,
+            "roots": [str(r) for r in catalog.search_roots(settings.model_dirs)], "models": models}
+
+
+def _model_dirs() -> list:
+    """Folders to search: BRAINSCAN_MODEL_DIRS, plus the startup model's own folder so it can always
+    be switched back to, wherever it lives."""
+    dirs = list(settings.model_dirs)
+    if not STARTUP_MODEL.startswith("ollama:") and os.path.isdir(STARTUP_MODEL):
+        dirs.append(STARTUP_MODEL)
+    return dirs
+
+
+@app.post("/brainscan/model")
+async def switch_model(body: dict):
+    """Unload the current model and load another one found by GET /brainscan/models."""
+    spec = str(body.get("spec") or "")
+    rec = state["recorder"]
+    if rec is not None and rec.s.spec == spec and state["status"] == "ready":
+        return {"ok": True, "unchanged": True, "model": rec.s.info()}
+    entry = await asyncio.to_thread(catalog.find, spec, _model_dirs())
+    if entry is None:
+        raise HTTPException(404, f"{spec!r} is not a model found on this machine; Brainscan only loads "
+                                 "models already on disk (see GET /brainscan/models)")
+    if entry.get("supported") is False:
+        raise HTTPException(400, entry["notes"][0] if entry["notes"] else f"{entry['name']} can't be loaded")
+    if not _switching.acquire(blocking=False):
+        raise HTTPException(409, "a model is already loading")
+    if rec is not None and rec.perf.get("busy"):
+        _switching.release()
+        raise HTTPException(409, "the model is generating; switch when the request finishes")
+    budget = _gpu_budget()
+    if budget is not None and entry.get("need_bytes") and entry["need_bytes"] > budget and not body.get("force"):
+        _switching.release()
+        raise HTTPException(400, f"{entry['name']} needs about {entry['need_bytes'] / catalog.GIB:.1f} GB of GPU "
+                                 f"memory and about {budget / catalog.GIB:.1f} GB would be free after unloading "
+                                 "the current model. Close other GPU apps or choose a smaller model.")
+    del rec  # the switch thread must hold the only reference
+    state.update(status="loading", error=None, target=spec)
+    _step(f"switching to {entry['name']}")
+    threading.Thread(target=_switch, args=(spec,), daemon=True).start()
+    return {"ok": True, "loading": spec, "name": entry["name"]}
 
 
 @app.get("/brainscan/runs")

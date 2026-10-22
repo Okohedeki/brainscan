@@ -9,7 +9,8 @@ attention heads and neurons, and change the weights and measure what changed.
 The UI follows that workflow in three tabs:
 
 1. **Watch**: the run live: transcript, a per-token timeline (logit lens, surprisal,
-   projections onto directions), a token inspector, and runtime steering.
+   projections onto directions), a token inspector, and runtime steering. The model name in the
+   top bar switches to any other open-weights model on the machine.
 2. **Trace**: the model as a graph of attention heads and MLP neuron clusters. Explain the next
    token by attribution, find paths through the graph, and open any unit down to its neurons and
    attention pattern at a token.
@@ -177,6 +178,27 @@ Hardware report and disk estimates:
 wsl -e bash scripts/run.sh -m brainscan.hardware
 ```
 
+### Switching models
+
+Click the model name in the top bar to see every open-weights model already on this machine and
+load another one without restarting. The list comes from Brainscan's model cache
+(`~/.cache/brainscan/models`), the Hugging Face hub cache, any folders in `BRAINSCAN_MODEL_DIRS`,
+and the local Ollama store. Each entry shows its size, layer count and the GPU memory the loader
+needs against what would be free once the current model is unloaded; models that won't fit, that
+transformers can't load, or that have no tokenizer are marked and can't be picked.
+
+- Loading unloads the current model first. Steering and applied weight edits are dropped (files on
+  disk never change), and `/v1` returns 503 until the new model is ready. If the new model fails to
+  load, the previous one is loaded again and the picker shows why.
+- An Ollama tag is dequantized to bf16 once on first load (several minutes; it writes the
+  checkpoint under `~/.cache/brainscan/models`) and is marked exploratory.
+- The first load of a model also builds its unit map and edges for the Trace tab; both are cached
+  per model, like its direction bank. Runs keep the model they were recorded with.
+- Brainscan never downloads a model. To add one from Hugging Face, download it yourself, e.g.
+  `hf download Org/Name --local-dir ~/.cache/brainscan/models/Org--Name` inside WSL, then reopen
+  the list. `GET /brainscan/models` and `POST /brainscan/model {"spec": ...}` do the same over HTTP.
+- A restart loads `BRAINSCAN_MODEL` again.
+
 ### Settings (environment variables)
 
 Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.env.example`).
@@ -185,7 +207,8 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 | Variable | Default | Meaning |
 |---|---|---|
 | `BRAINSCAN_MODEL` | `ollama:llama3.1:8b` | `ollama:<tag>` (dequantized from the local Ollama GGUF), a Hugging Face repo id, or a local checkpoint folder |
-| `BRAINSCAN_MODEL_NAME` | from the path | Display name, e.g. `Qwen/Qwen3.5-9B` |
+| `BRAINSCAN_MODEL_NAME` | from the path | Display name for `BRAINSCAN_MODEL`, e.g. `Qwen/Qwen3.5-9B` (an `Org--Name` folder is already shown as `Org/Name`) |
+| `BRAINSCAN_MODEL_DIRS` | none | Extra folders the model picker searches for checkpoints, separated by `:` (e.g. `/mnt/h/models`) |
 | `BRAINSCAN_DEVICE` | `cuda` | `cpu` for testing without a GPU |
 | `BRAINSCAN_THINKING` | `default` | Reasoning models: `on`, `off`, or the chat template's default |
 | `BRAINSCAN_DATA` | `./runs` | Where recordings go |
@@ -240,13 +263,13 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 
 ```
 brainscan/recorder/   model loading, hooks, chat rendering, events, storage, session, directions,
-                      weight edits (edits.py), workbench checks (workbench.py), the weight
+                      weight edits (edits.py), workbench checks (workbench.py), models on disk (catalog.py), the weight
                       graph's units, activity probe and edges (anatomy.py), and token tracing:
                       attribution, neurons and attention at a token (tracing.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
-ui/                   Watch (app.js), Trace (graph.js, weights.js, paths.js), Tune (workbench.js)
+ui/                   Watch (app.js, models.js), Trace (graph.js, weights.js, paths.js), Tune (workbench.js)
                       and the guide (guide.js): plain HTML, CSS and canvas JavaScript; no build step
 reports/              research reports
 tests/                unit tests (pytest)

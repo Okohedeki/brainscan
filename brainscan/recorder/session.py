@@ -145,6 +145,10 @@ def to_host(x):
     return x.to("cpu", non_blocking=True)
 
 
+class ModelSwitched(RuntimeError):
+    """The recorder was closed for a model switch while a request waited for it."""
+
+
 class Recorder:
     def __init__(self, subject, store, settings, publish):
         self.s, self.store, self.settings, self.publish = subject, store, settings, publish
@@ -173,6 +177,24 @@ class Recorder:
         self._kv_epoch = -1
         self._kv_run: str | None = None
         self.perf = {"decode_tok_s": None, "prefill_tok_s": None, "busy": False}
+        self.closed = False
+
+    def close(self) -> None:
+        """Let go of the model before another one is loaded. Waits for any forward pass to finish;
+        requests still queued for the lock then fail instead of running on a dropped model. The
+        caller drops its reference and collects garbage to give the GPU memory back."""
+        with self.lock:
+            self.closed = True
+            for handle in getattr(self.tap, "handles", []):
+                handle.remove()
+            if self.graphs is not None:
+                self.graphs._release()
+                self.graphs = None
+            if self.tracer is not None:
+                self.tracer._cache.clear()
+            self._kv, self._kv_ids = None, []
+            self.interventions.clear()
+            self.tap.interventions = []
 
     # ---- interventions -------------------------------------------------------------
 
@@ -315,6 +337,8 @@ class Recorder:
 
     def generate(self, p: GenParams, on_text=None, on_reasoning=None) -> GenResult:
         with self.lock:
+            if self.closed:
+                raise ModelSwitched("the model was switched while this request waited; send it again")
             self.perf["busy"] = True
             try:
                 self.release_memory(below_gb=2.0)
