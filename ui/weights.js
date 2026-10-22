@@ -295,7 +295,7 @@ function handle(msg) {
     case "workbench":
       refreshEdited();
       if (A.selected != null && A.visible) selectUnit(A.selected, true);  // the weights changed
-      if (A.mode === "attr" && A.visible) loadExplain();
+      if (A.mode === "attr" && A.visible) loadExplain();  // hidden: activate() re-traces on return
       break;
     case "status":
       if (!A.atlas && A.visible) activate();
@@ -1503,6 +1503,7 @@ async function activate() {
   else {
     if (A.pendingCursor && A.follow && !A.playing) setCursor(lastRecorded(), "jump");  // catch up after being hidden
     renderReadout(); pushState(); schedule();
+    scheduleTokenWork();  // weights may have been edited in Tune meanwhile: re-trace (cached if not)
   }
   A.pendingCursor = false;
   graph.invalidate();
