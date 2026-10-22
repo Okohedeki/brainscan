@@ -537,7 +537,8 @@ function renderInspector(d) {
   ];
   if (d.has_residual) facts.push(`<span class="badge">full residual saved</span>`);
   if (d.model_mismatch) facts.push(`<span class="badge serious">recorded with a different model</span>`);
-  let html = `<div class="tok-hero"><span class="tok">${esc(visTok(d.text))}</span><div class="facts">${facts.join("")}</div></div>`;
+  let html = `<div class="tok-hero"><span class="tok">${esc(visTok(d.text))}</span><div class="facts">${facts.join("")}</div>
+    ${d.p != null && !d.model_mismatch ? `<button type="button" class="btn sm" id="insp-trace" title="Open the Trace tab on this token: the layers, units and knockouts behind it">Trace this token →</button>` : ""}</div>`;
   if (d.p == null) html += `<p class="empty">No prediction is stored for this slot (first token of the context or of a resumed segment).</p>`;
   const alts = (d.top || []).map(([tok, p]) => `<li class="${tok === d.text ? "actual" : ""}"><span class="t">${esc(visTok(tok))}</span><span class="track"><span class="fill" style="width:${(p * 100).toFixed(1)}%;display:block"></span></span><span class="v">${fmt(p, 3)}</span></li>`).join("");
   let lens = "";
@@ -561,6 +562,10 @@ function renderInspector(d) {
     ${d.norm ? `<h3>Residual norm by layer</h3>${sparkline(d.norm)}` : ""}</div>
     <div><h3>Logit lens: each layer's guess for this slot</h3>${lens || '<p class="empty">No lens for this token.</p>'}</div></div>`;
   $("#inspector").innerHTML = html;
+  $("#insp-trace")?.addEventListener("click", () => {
+    document.dispatchEvent(new CustomEvent("brainscan:show", { detail: "weights" }));
+    document.dispatchEvent(new CustomEvent("brainscan:trace", { detail: { word: d.t } }));
+  });
 }
 
 function sparkline(vals) {
@@ -674,7 +679,8 @@ function handle(msg) {
       if (i >= 0) S.runs[i] = msg.meta; else S.runs.unshift(msg.meta);
       renderRunSelect();
       if (msg.run === S.runId) { S.meta = msg.meta; renderMeta(); }
-      else if (i < 0 && S.follow) openRun(msg.run);
+      else if ((i < 0 && S.follow) || msg.run === S.expectRun) openRun(msg.run);
+      if (msg.run === S.expectRun) S.expectRun = null;
       break;
     }
     case "toks":
@@ -766,6 +772,12 @@ function setupTheme() {
 async function boot() {
   setupTheme(); readColors(); setupScopeInput(); setupSteering();
   $("#run-select").onchange = (ev) => openRun(ev.target.value);
+  // A message sent from a composer: open its run in every view as soon as it appears (ui/chat.js).
+  document.addEventListener("brainscan:expect-run", (ev) => {
+    if (ev.detail === S.runId) return;  // continuing the open conversation
+    S.expectRun = ev.detail;
+    if (S.runs.some((r) => r.id === ev.detail)) { S.expectRun = null; openRun(ev.detail); }
+  });
   connect();  // subscribe before loading snapshots so nothing recorded in between is lost
   await pollStatus();
   await loadRuns();

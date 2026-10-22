@@ -9,11 +9,14 @@ attention heads and neurons, and change the weights and measure what changed.
 The UI follows that workflow in three tabs:
 
 1. **Watch**: the run live: transcript, a per-token timeline (logit lens, surprisal,
-   projections onto directions), a token inspector, and runtime steering. The model name in the
-   top bar switches to any other open-weights model on the machine.
-2. **Trace**: the model as a graph of attention heads and MLP neuron clusters. Explain the next
-   token by attribution, find paths through the graph, and open any unit down to its neurons and
-   attention pattern at a token.
+   projections onto directions), a token inspector, and runtime steering. Ask the model directly
+   from the composer under the transcript; no harness needed. The model name in the top bar
+   switches to any other open-weights model on the machine.
+2. **Trace**: the conversation next to a graph of the model's attention heads and MLP neuron
+   clusters. Click any word to see why the model wrote it: where its logit came from layer by
+   layer, when the model first had it as its top guess, the units that pushed it up or down,
+   and knockout tests that remove units and re-run. Find paths through the graph, and open any
+   unit down to its neurons and attention pattern at a token.
 3. **Tune**: find directions from examples, edit the weights (remove a direction, lesion a head
    or neuron), compare original and edited side by side, and export the variant.
 
@@ -115,6 +118,29 @@ into clusters by the direction of their output weights (64 per layer by default)
 
 Tracing re-runs the run's context up to a token on the current weights (a couple of seconds for a
 few hundred tokens on Qwen3.5-9B; results are cached) and reads every unit exactly.
+
+- **Ask and watch.** The composer (under the Watch transcript, and at the bottom of the Trace
+  tab's conversation) sends a chat request to the recorder's own `/v1` endpoint, so it is
+  recorded like any agent run: its tokens stream into the transcript, the timeline and the graph
+  as they are generated. A chat continues in the same run until **New chat**; options are
+  thinking on/off, max tokens and temperature (0 = greedy).
+- **The conversation in Trace.** The run's text, word by word, grouped into turns, with words the
+  model found surprising underlined (by −log₂ p). Clicking a word traces the position before it
+  with that word as the target, so you see why the model wrote it; the readout and the graph
+  follow. `T` shows or hides the text.
+- **Why this token** (`W`, or **Why?** in the dock). The target's probability, rank and logit
+  and the runners-up; *where the logit came from*: each layer's attention heads and MLP clusters
+  by direct effect, with the running total from the embedding to the final logit; *when the
+  model knew*: the logit lens for that token at every layer and the first layer where it is the
+  top guess; the units that pushed it up or pulled it down (click one to open it).
+- **Knockout tests.** Remove units and re-run the context with their writes zeroed at every
+  position: the token's probability before → after, its rank and the new top guesses, with the
+  units' total effect next to their direct effect. Run it on the top five units, your selection,
+  the units on the shown paths, or one unit from its drawer. On Qwen3.5-9B, knocking out the five
+  units that pushed " Canberra" up for "What is the capital of Australia?" turns the answer to
+  " Sydney" (p 0.999 → 0.26; Sydney 0.71); their direct effect was +12.4 logits and the rest of
+  the network made up 40% of it. A knockout is the same as lesioning those units' output weights,
+  without touching the weights.
 
 - **Attribution** (`A`). Colors each unit by its direct effect on the next token's logit: its
   write at this token, read through the final norm (with its scale held at the recorded value)
@@ -279,8 +305,9 @@ brainscan/recorder/   model loading, hooks, chat rendering, events, storage, ses
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
-ui/                   Watch (app.js, models.js), Trace (graph.js, weights.js, paths.js), Tune (workbench.js)
-                      and the guide (guide.js): plain HTML, CSS and canvas JavaScript; no build step
+ui/                   Watch (app.js, models.js, chat.js), Trace (graph.js, weights.js, paths.js),
+                      Tune (workbench.js) and the guide (guide.js): plain HTML, CSS and canvas
+                      JavaScript; no build step
 reports/              research reports
 tests/                unit tests (pytest)
 ```

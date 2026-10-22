@@ -44,6 +44,8 @@ const A = {
   attr: null, attrN: null,           // per-unit attribution of the next token at the cursor (raw, scaled to [-1, 1])
   attrInfo: null, attrTarget: null, attrSeq: 0, attrTimer: 0,
   cmp: false, attrOrig: null, attrDiff: null,  // "vs original": attribution with the weight edits lifted, and the change
+  attrOf: null,                      // the slot of the word being explained, when it was clicked in the conversation
+  panelSeq: 0, knockouts: [], koKey: null,
   paths: [], pathMode: "down", pathHops: 3, pathBranch: 4, pathActivity: true, pathsOpen: false,
   expanded: new Map(),               // cluster g -> Float32Array neuron activity in [-1, 1] at the cursor
   tokenTimer: 0, tokenSeq: 0,
@@ -160,6 +162,7 @@ function resetRunData() {
   // Token-level tracing belongs to the old run; the selection and path settings carry over.
   A.attr = null; A.attrN = null; A.attrInfo = null; A.attrTarget = null; A.attrOrig = null; A.attrDiff = null;
   A.attrSeq++; clearTimeout(A.attrTimer);
+  A.attrOf = null; A.knockouts = []; A.koKey = null;
   A.expanded.clear();
 }
 
@@ -233,7 +236,7 @@ async function openRun(id) {
   stopPlay();
   resetRunData();
   schedule();
-  if (!id) { A.loading = null; setCursor(null); return; }
+  if (!id) { A.loading = null; renderConvo(true); setCursor(null); return; }
   try {
     const [run, tape, bin] = await Promise.all([
       api(`/brainscan/runs/${encodeURIComponent(id)}`),
@@ -242,7 +245,7 @@ async function openRun(id) {
     ]);
     if (A.runId !== id) return;
     A.meta = run.meta; A.events = run.events || [];
-    for (const r of tape) A.tok[r.t] = { t: r.t, tx: r.tx, r: r.r, ph: r.ph };
+    for (const r of tape) A.tok[r.t] = { t: r.t, tx: r.tx, r: r.r, ph: r.ph, pos: r.pos, req: r.req, p: r.p };
     rebuildView();
     if (bin) {
       const dv = new DataView(bin), hlen = dv.getUint32(0, true);
@@ -258,8 +261,10 @@ async function openRun(id) {
       buffered.forEach(handle);
     }
   }
+  renderConvo(true);
   setCursor(lastRecorded(), "jump");
   if (A.selected != null) renderRunStats();
+  if (A.pendingWord != null && A.runId === id) { const w = A.pendingWord; A.pendingWord = null; if (A.tok[w]) traceWord(w); }
 }
 
 function lastRecorded() {
@@ -273,9 +278,13 @@ function handle(msg) {
   switch (msg.k) {
     case "toks":
       if (msg.run !== A.runId) break;
-      for (const r of msg.items) {
-        A.tok[r.t] = { t: r.t, tx: r.tx, r: r.r, ph: r.ph };
-        if (r.ph !== "replay") { if (!A.view.length || r.t > A.view[A.view.length - 1]) A.view.push(r.t); else rebuildView(); }
+      {
+        let reordered = false;
+        for (const r of msg.items) {
+          A.tok[r.t] = { t: r.t, tx: r.tx, r: r.r, ph: r.ph, pos: r.pos, req: r.req, p: r.p };
+          if (r.ph !== "replay") { if (!A.view.length || r.t > A.view[A.view.length - 1]) A.view.push(r.t); else { rebuildView(); reordered = true; } }
+        }
+        renderConvo(reordered);
       }
       schedule();
       break;
@@ -356,11 +365,12 @@ function setCursor(t, how = "jump") {
     const i = viewIndex(t), x = i * A.colW;
     if (x < A.scrollX || x > A.scrollX + A.plotW - A.colW) A.scrollX = x - A.plotW * 0.8;
   }
-  if (A.attrInfo?.t !== t) A.attrTarget = null;  // a new token explains its own next token by default
+  if (A.attrInfo?.t !== t) { A.attrTarget = null; A.attrOf = null; }  // a new token explains its own next token by default
   pushState();
   renderReadout();
   schedule();
   scheduleTokenWork();
+  markConvo(true);
 }
 
 function setFollow(on) {
@@ -429,6 +439,7 @@ function renderReadout() {
           : `<span class="meta">p ${fmtP(info.target.prob)} · logit ${info.target.logit.toFixed(2)}</span>`}
         <span class="alts">${info.alternatives.filter((a) => a.id !== info.target.id).slice(0, 4).map((a) =>
           `<button type="button" class="alt" data-id="${a.id}" title="Explain this candidate instead (p ${fmtP(a.prob)})">${esc(visTok(a.text))}</button>`).join("")}</span>`;
+      html += `<button type="button" class="tbtn cmp" id="an-why" title="Layer by layer, the units behind this token, and knockout tests">Why?</button>`;
       if (info.weights_edited) {
         html += `<button type="button" class="tbtn cmp" id="an-cmp" aria-pressed="${A.cmp}" title="Color units by how the applied weight edits changed their effect on this token">vs original</button>`;
       }
@@ -438,6 +449,7 @@ function renderReadout() {
   el.innerHTML = html;
   $("#an-explain-btn")?.addEventListener("click", () => setMode("attr"));
   $("#an-cmp")?.addEventListener("click", toggleCompare);
+  $("#an-why")?.addEventListener("click", openTokenPanel);
   el.querySelectorAll(".alt[data-id]").forEach((b) => { b.onclick = () => { A.attrTarget = b.dataset.id; loadExplain(); }; });
 }
 
@@ -486,6 +498,7 @@ async function loadExplain() {
   if (t == null || !A.runId) return;
   A.attrInfo = { loading: true, t };
   renderReadout();
+  renderTokenPanel();
   try {
     const ex = await fetchExplain(t, target);
     if (seq !== A.attrSeq) return;
@@ -503,7 +516,7 @@ async function loadExplain() {
     A.attrInfo = err.status === 409 ? { busy: true, t } : { error: err.message, t };
     if (err.status === 409) A.attrTimer = setTimeout(() => { if (A.cursor === t) loadExplain(); }, 1500);
   }
-  pushState(); renderReadout(); renderLegend();
+  pushState(); renderReadout(); renderLegend(); renderTokenPanel(); markConvo(false);
   if (A.pathsOpen) renderPathControls();
   if (A.pathsOpen && A.pathMode === "explain") runPathSearch(false);
 }
@@ -625,6 +638,7 @@ function renderPathList() {
       <button type="button" class="link" data-act="frame">Frame</button>
       <button type="button" class="link" data-act="select" title="Add the units on the shown paths to the selection">Select units</button>
       <button type="button" class="link" data-act="copy" title="Copy the shown paths as JSON">Copy</button>
+      <button type="button" class="link" data-act="ko" title="Remove the units on the shown paths and see what happens to the next token">Knock out</button>
     </span>`;
   $("#gv-path-list").innerHTML = A.paths.map((p, i) => {
     const chips = p.units.map((g) => `<span class="pchip ${A.units[g].kind}">${shortName(g)}</span>`).join(`<span class="parrow">→</span>`);
@@ -654,6 +668,13 @@ function pathAction(act) {
   if (act === "all" || act === "none") { for (const p of A.paths) p.on = act === "all"; renderPathList(); pathsChanged(); }
   else if (act === "frame") frameShownPaths();
   else if (act === "select") { for (const p of shown) for (const g of p.units) A.sel.add(g); pushState(); renderSelChip(); }
+  else if (act === "ko") {
+    const units = [...new Set(shown.flatMap((p) => p.units))];
+    if (!units.length || A.cursor == null) return;
+    if (A.mode !== "attr") setMode("attr");
+    openTokenPanel();
+    runKnockout(units.slice(0, 64), `${Math.min(units.length, 64)} units on ${shown.length} shown path${shown.length === 1 ? "" : "s"}`);
+  }
   else if (act === "copy") {
     const data = shown.map((p) => ({ path: p.units.map(shortName), units: p.units, score: +p.score.toFixed(5),
       edges_x_chance: p.xs.map((x) => +x.toFixed(3)),
@@ -696,7 +717,13 @@ async function renderTokenSection() {
         <span>edited <b>${fmt(c)}</b></span><span class="attr-val ${c - before >= 0 ? "pos" : "neg"}">Δ ${fmt(c - before)}</span></div>
         <p class="hint">p(${esc(visTok(ex.target.text))}) ${fmtP(orig.target.prob)} → ${fmtP(ex.target.prob)} with the applied edits.
         Below is the edited model.</p>` : ""}
+      <div class="d-actions"><button type="button" class="btn sm" id="an-ko-btn" title="Re-read the context without this unit and compare this token with the intact model">Knock out this unit</button>
+        <button type="button" class="btn sm ghost" id="an-why-btn">Why ${esc(visTok(ex.target.text))}?</button></div>
+      <ul class="ko-list" id="an-ko"></ul>
       ${u.kind === "cluster" ? neuronsHtml(g, more) : attentionHtml(more)}`;
+    box.querySelector("#an-ko-btn").onclick = () => runKnockout([g], shortName(g));
+    box.querySelector("#an-why-btn").onclick = () => { if (A.mode !== "attr") setMode("attr"); openTokenPanel(); };
+    renderKnockouts();
     box.querySelector("#an-expand")?.addEventListener("click", () => toggleExpand(g));
     box.querySelectorAll("[data-t]").forEach((el) => {
       const tt = Number(el.dataset.t);
@@ -757,6 +784,287 @@ async function toggleExpand(g) {
 }
 
 function refreshExpanded() { for (const g of A.expanded.keys()) loadExpanded(g).catch(() => {}); }
+
+// ---------------------------------------------------------------- conversation: the run's text, word by word
+const CV = { rendered: 0, block: null, blockKey: null, showTemplate: false, open: true };
+
+/** How surprising a token was to the model, in [0, 1] (0 to 10 bits). */
+const surprise = (p) => (p == null ? 0 : clamp(-Math.log2(Math.max(p, 1e-9)) / 10, 0, 1));
+const ROLE_LABEL = { reasoning: "thinking", template: "template", assistant: "model" };
+
+function tokenSpan(rec) {
+  const s = surprise(rec.p);
+  const tip = `t${rec.t} · ${rec.p != null ? `p ${fmtP(rec.p)}, ${(-Math.log2(Math.max(rec.p, 1e-9))).toFixed(1)} bits` : "no prediction (start of the context)"}`;
+  return `<span class="ct${s > 0.33 ? " surprising" : ""}" data-t="${rec.t}"${s ? ` style="--s:${s.toFixed(2)}"` : ""} title="${tip}">${esc(rec.tx)}</span>`;
+}
+
+/** Render the run's tokens grouped into turns; `full` redraws, otherwise appends what arrived since. */
+function renderConvo(full) {
+  const body = $("#tv-convo-body");
+  if (!body) return;
+  $("#tv-convo-meta").textContent = A.runId ? (A.meta?.label || A.runId) : "";
+  if (full) { body.innerHTML = ""; CV.rendered = 0; CV.block = null; CV.blockKey = null; }
+  if (!A.runId || !A.view.length) {
+    body.innerHTML = `<p class="empty">${!A.runId ? "No run yet. Ask the model below" : "No tokens in this run yet. Ask the model below"}, or point any harness at <code>${esc(location.origin)}/v1</code>.</p>`;
+    CV.rendered = 0;
+    return;
+  }
+  body.querySelector(".empty")?.remove();
+  const nearBottom = body.scrollHeight - body.scrollTop - body.clientHeight < 80;
+  let html = "";
+  const flush = () => { if (html && CV.block) CV.block.insertAdjacentHTML("beforeend", html); html = ""; };
+  for (let i = CV.rendered; i < A.view.length; i++) {
+    const rec = A.tok[A.view[i]];
+    if (!rec) continue;
+    if (rec.r === "template" && !CV.showTemplate) { flush(); CV.blockKey = null; continue; }
+    const key = `${rec.req}|${rec.r}`;
+    if (key !== CV.blockKey) {
+      flush();
+      const div = document.createElement("div");
+      div.className = `cb role-${rec.r}`;
+      div.innerHTML = `<div class="cb-role">${esc(ROLE_LABEL[rec.r] || rec.r)}</div><div class="cb-text"></div>`;
+      body.appendChild(div);
+      CV.block = div.querySelector(".cb-text"); CV.blockKey = key;
+    }
+    html += tokenSpan(rec);
+  }
+  flush();
+  CV.rendered = A.view.length;
+  if (full) markConvo(true);
+  else if (nearBottom || A.follow) body.scrollTop = body.scrollHeight;
+}
+
+/** The token after slot t in the same request: what explaining t traces by default. */
+function nextSlot(t) {
+  const i = A.view.indexOf(t), rec = A.tok[t];
+  const n = i >= 0 ? A.tok[A.view[i + 1]] : null;
+  return n && rec && n.req === rec.req && n.pos === rec.pos + 1 ? n.t : null;
+}
+
+function markConvo(scroll) {
+  const body = $("#tv-convo-body");
+  if (!body) return;
+  body.querySelectorAll(".ct.cursor, .ct.target").forEach((el) => el.classList.remove("cursor", "target"));
+  if (A.cursor == null) return;
+  const of = A.attrOf ?? nextSlot(A.cursor);
+  const c = body.querySelector(`.ct[data-t="${A.cursor}"]`), g = of != null ? body.querySelector(`.ct[data-t="${of}"]`) : null;
+  c?.classList.add("cursor");
+  g?.classList.add("target");
+  if (scroll && CV.open) (g || c)?.scrollIntoView({ block: "nearest" });
+}
+
+/** Why did the model write token t? Trace the position before it with t as the target. */
+async function traceWord(t) {
+  if (!A.runId) return;
+  let src;
+  try { src = await api(`${tokenUrl(t)}/producer`); } catch (err) { convoNote(err.message); return; }
+  setFollow(false); stopPlay();
+  setCursor(src.t, "jump");  // schedules the trace, which picks up the target set next
+  A.attrTarget = String(src.target.id); A.attrOf = t;
+  if (A.mode !== "attr") { A.mode = "attr"; setSeg("#gv-mode", "mode", "attr"); pushState(); renderLegend(); renderReadout(); }
+  openTokenPanel();
+  markConvo(false);
+}
+
+function convoNote(text) {
+  const el = $("#tv-convo .convo-hint");
+  el.textContent = text; el.classList.add("warn-text");
+  setTimeout(() => { el.textContent = "Click any word to see which units and layers produced it. Underlines mark words the model found surprising."; el.classList.remove("warn-text"); }, 4000);
+}
+
+function setConvo(open) {
+  CV.open = open;
+  $("#view-weights").classList.toggle("convo-hidden", !open);
+  $("#gv-convo-btn").setAttribute("aria-pressed", String(open));
+  try { localStorage.setItem("brainscan-convo", open ? "1" : "0"); } catch { /* storage unavailable */ }
+  schedule();
+  if (open) markConvo(true);
+}
+
+// ---------------------------------------------------------------- why this token: layers, lens, units, knockouts
+function openTokenPanel() {
+  A.detailMode = "token"; A.selected = null; A.detail = null;
+  pushState(); renderLegend(); schedule();
+  openDrawer(true);
+  $("#an-unit-where").textContent = "Why this token";
+  renderTokenPanel();
+}
+
+async function renderTokenPanel() {
+  if (A.detailMode !== "token") return;
+  const box = $("#an-detail"), info = A.attrInfo, t = A.cursor, seq = ++A.panelSeq;
+  if (t == null || !A.runId) { box.innerHTML = `<p class="empty">Click a word in the conversation, or a token on the timeline.</p>`; return; }
+  if (!info || info.t !== t || info.loading) { box.innerHTML = `<p class="empty">Tracing…</p><div class="skeleton"></div><div class="skeleton tall"></div>`; return; }
+  if (info.busy) { box.innerHTML = `<p class="empty">The model is generating; this fills in when it pauses.</p>`; return; }
+  if (info.error) { box.innerHTML = `<p class="empty">${esc(info.error)}</p>`; return; }
+  const of = A.attrOf ?? nextSlot(t);
+  let lens = null;
+  if (of != null) {
+    try { const rec = await api(tokenUrl(of)); if (rec.tok === info.target.id && rec.lens_p) lens = rec; } catch { /* no lens */ }
+  }
+  if (seq !== A.panelSeq || A.detailMode !== "token" || A.attrInfo !== info) return;
+  box.innerHTML = tokenPanelHtml(info, lens);
+  box.querySelectorAll(".alt[data-id]").forEach((b) => { b.onclick = () => { A.attrTarget = b.dataset.id; A.attrOf = null; loadExplain(); }; });
+  box.querySelectorAll("[data-layer]").forEach((el) => { el.onclick = () => graph.flyToLayer(Number(el.dataset.layer)); });
+  box.querySelectorAll(".tp-units li[data-g]").forEach((li) => {
+    li.onclick = (ev) => {
+      const g = Number(li.dataset.g);
+      if (ev.shiftKey) { toggleSelect(g); return; }
+      selectUnit(g); graph.flyTo(g, Math.max(graph.target.s, 1.6));
+    };
+  });
+  $("#tp-circuit").onclick = () => openPaths("explain");
+  $("#tp-ko-top").onclick = () => runKnockout(topUnits(info, 5, true), "top 5 units that pushed it up");
+  $("#tp-ko-sel")?.addEventListener("click", () => runKnockout([...A.sel], `${A.sel.size} selected units`));
+  $("#tp-copy").onclick = () => navigator.clipboard?.writeText(JSON.stringify(traceJson(info, lens), null, 2));
+  renderKnockouts();
+}
+
+function topUnits(info, n, positive) {
+  const c = info.contrib;
+  return [...c.keys()].filter((g) => (positive ? c[g] > 0 : c[g] < 0)).sort((a, b) => (positive ? c[b] - c[a] : c[a] - c[b])).slice(0, n);
+}
+
+function tokenPanelHtml(info, lens) {
+  const o = info.orig, fmtL = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}`;
+  const ctxTok = A.tok[info.t]?.tx ?? info.token;
+  const alts = info.alternatives.filter((a) => a.id !== info.target.id).slice(0, 5).map((a) =>
+    `<button type="button" class="alt" data-id="${a.id}" title="Explain this candidate instead">${esc(visTok(a.text))} <span class="dim">${fmtP(a.prob)}</span></button>`).join("");
+  const unitRows = (gs) => {
+    const max = Math.max(...gs.map((g) => Math.abs(info.contrib[g])), 1e-9);
+    return gs.map((g) => {
+      const c = info.contrib[g], u = A.units[g];
+      return `<li data-g="${g}" title="Open this unit (shift-click to add it to the selection)"><span class="tp-kind ${u.kind}">${u.kind === "head" ? "head" : "MLP"}</span>
+        <span class="tp-name">${shortName(g)}</span><span class="pbar ${c < 0 ? "neg" : ""}"><i style="width:${Math.max(3, Math.abs(c) / max * 100).toFixed(0)}%"></i></span>
+        <span class="v ${c >= 0 ? "pos" : "neg"}">${fmtL(c)}</span></li>`;
+    }).join("");
+  };
+  return `<div class="d-hero">
+      <div class="d-kicker">After <span class="mono">${esc(visTok(ctxTok))}</span> (t${info.t}) the model wrote</div>
+      <div class="tp-target"><span class="tok-chip target big">${esc(visTok(info.target.text))}</span></div>
+      <div class="d-stats">
+        <div><span>probability</span><b>${fmtP(info.target.prob)}</b></div>
+        <div><span>rank</span><b>#${info.target.rank}</b></div>
+        <div><span>logit</span><b>${info.target.logit.toFixed(2)}</b></div>
+      </div>
+      ${o ? `<div class="cmp-line"><span>original weights p <b>${fmtP(o.target.prob)}</b></span><span class="arrow">→</span><span>edited <b>${fmtP(info.target.prob)}</b></span><span class="attr-val ${info.target.logit - o.logit >= 0 ? "pos" : "neg"}">logit ${fmtL(info.target.logit - o.logit)}</span></div>` : ""}
+      ${alts ? `<div class="chips tp-alts"><span class="lbl">runners-up</span>${alts}</div>` : ""}
+      <div class="d-actions wrap">
+        <button type="button" class="btn sm" id="tp-circuit" title="The active units feeding the ones that pushed this token up">Show circuit</button>
+        <button type="button" class="btn sm" id="tp-ko-top" title="Remove the five units that pushed it up most and re-run">Knock out top 5</button>
+        ${A.sel.size ? `<button type="button" class="btn sm" id="tp-ko-sel">Knock out selection (${A.sel.size})</button>` : ""}
+        <button type="button" class="btn sm ghost" id="tp-copy" title="Copy this trace as JSON">Copy JSON</button>
+      </div>
+    </div>
+    <section class="d-sec"><h4>Where the logit came from <span class="dim">direct effect by layer</span></h4>
+      ${layerChart(info)}
+      <p class="hint">Each layer's attention heads and MLP clusters, by how much they wrote toward this token (read through the final norm and the unembedding). The line adds them up from the embedding to the final logit. Click a layer to fly to it.</p></section>
+    <section class="d-sec"><h4>When the model knew <span class="dim">logit lens</span></h4>${lensStrip(lens, info)}</section>
+    <section class="d-sec"><h4>Units that pushed it up</h4><ul class="tp-units">${unitRows(topUnits(info, 8, true))}</ul>
+      <h4 class="sub">Units that pulled it down</h4><ul class="tp-units">${unitRows(topUnits(info, 5, false))}</ul>
+      <p class="hint">Direct effects add up to the logit. They don't show what a unit does through later layers: a knockout does.</p></section>
+    <section class="d-sec"><h4>Knockout tests <span class="dim">remove units, re-run, compare</span></h4>
+      <ul class="ko-list" id="tp-ko-list"></ul>
+      <p class="hint">A knockout reads the whole context again with the units' writes set to zero and compares this token with the intact model. The total effect includes everything that flows through later layers, so the gap to the direct effect shows how much the rest of the network makes up for them. Select units on the graph (shift-click or shift-drag) to test your own set.</p></section>`;
+}
+
+function layerChart(info) {
+  const L = info.layers.length, W = 392, H = 150, pad = 18, top = 10, bottom = H - 20;
+  if (!L) return "";
+  const vals = info.layers.flat(), maxBar = Math.max(...vals.map(Math.abs), 1e-6);
+  const cum = [info.embed];
+  for (const [h, c] of info.layers) cum.push(cum[cum.length - 1] + h + c);
+  const cmin = Math.min(...cum, 0), cmax = Math.max(...cum, 1e-6);
+  const bw = (W - pad * 2) / L, mid = (top + bottom) / 2, half = (bottom - top) / 2;
+  const yb = (v) => mid - (v / maxBar) * half;
+  const yc = (v) => bottom - ((v - cmin) / (cmax - cmin || 1)) * (bottom - top);
+  let bars = "";
+  info.layers.forEach(([h, c], l) => {
+    const x = pad + l * bw;
+    const rect = (v, dx, cls) => { const y0 = yb(Math.max(v, 0)), y1 = yb(Math.min(v, 0)); return `<rect class="${cls}" x="${(x + dx).toFixed(1)}" y="${y0.toFixed(1)}" width="${Math.max(bw * 0.38, 1).toFixed(1)}" height="${Math.max(y1 - y0, 0.5).toFixed(1)}"/>`; };
+    bars += `<g data-layer="${l}" class="lc-layer"><title>Layer ${l}: heads ${h >= 0 ? "+" : ""}${h.toFixed(2)}, MLP ${c >= 0 ? "+" : ""}${c.toFixed(2)}</title>
+      <rect class="lc-hit" x="${x.toFixed(1)}" y="${top}" width="${bw.toFixed(1)}" height="${bottom - top}"/>${rect(h, bw * 0.08, "lc-head")}${rect(c, bw * 0.5, "lc-mlp")}</g>`;
+  });
+  const line = cum.map((v, i) => `${(pad + Math.max(i - 0.5, 0) * bw).toFixed(1)},${yc(v).toFixed(1)}`).join(" ");
+  const ticks = [0, Math.floor(L / 4), Math.floor(L / 2), Math.floor(3 * L / 4), L - 1].filter((v, i, a) => a.indexOf(v) === i)
+    .map((l) => `<text x="${(pad + (l + 0.5) * bw).toFixed(1)}" y="${H - 6}" class="lc-tick">L${l}</text>`).join("");
+  return `<svg class="layer-chart" viewBox="0 0 ${W} ${H}" role="img" aria-label="Direct effect on the token by layer, attention and MLP, with the running total">
+    <line x1="${pad}" x2="${W - pad}" y1="${mid}" y2="${mid}" class="lc-zero"/>${bars}
+    <polyline points="${line}" class="lc-cum"/>
+    <text x="${W - pad}" y="${top + 8}" class="lc-label" text-anchor="end">logit ${cum[cum.length - 1].toFixed(1)}</text>
+    ${ticks}</svg>
+    <div class="lc-legend"><span><i class="lc-head"></i>attention heads</span><span><i class="lc-mlp"></i>MLP clusters</span><span><i class="lc-cum"></i>running total</span></div>`;
+}
+
+function lensStrip(lens, info) {
+  if (!lens) {
+    return `<p class="hint">The logit lens is recorded for the token the model actually produced${A.attrTarget != null && !A.attrOf ? "; this is a different candidate" : ""}.</p>`;
+  }
+  const L = lens.lens_p.length, first = lens.lens_top.findIndex((x) => x === lens.tok);
+  const cells = lens.lens_p.map((p, l) => {
+    const a = clamp((Math.log10(Math.max(p, 1e-6)) + 6) / 6, 0, 1);
+    return `<span class="lens-cell${lens.lens_top[l] === lens.tok ? " top" : ""}" style="--a:${a.toFixed(2)}" data-layer="${l}"
+      title="Layer ${l}: p ${fmtP(p)} · top guess ${esc(visTok(lens.lens_top_text[l]))}"></span>`;
+  }).join("");
+  return `<div class="lens-strip" style="--n:${L}">${cells}</div>
+    <div class="lens-axis"><span>L0</span><span>L${L - 1}</span></div>
+    <p class="hint">${first >= 0 ? `The token is the top guess from layer <b>${first}</b> on (outlined); ` : "No layer has it as the top guess; "}darker means more probable when each layer's residual is read through the final norm and unembedding. Final p ${fmtP(info.target.prob)}.</p>`;
+}
+
+function traceJson(info, lens) {
+  return { run: A.runId, t: info.t, token: info.token, target: info.target, alternatives: info.alternatives,
+    logit: info.logit, embed: info.embed, layers: info.layers,
+    top_units: info.top.map(([g, c]) => ({ unit: shortName(g), g, contrib: c })),
+    lens: lens ? { p: lens.lens_p, top: lens.lens_top_text } : null,
+    knockouts: (A.knockouts || []).filter((k) => k.res).map((k) => ({ label: k.label, units: k.units.map(shortName), ...k.res })) };
+}
+
+async function runKnockout(units, label) {
+  const t = A.cursor;
+  if (t == null || !A.runId || !units.length) return;
+  const key = `${A.runId}|${t}|${A.attrTarget ?? ""}`;
+  if (A.koKey !== key) { A.koKey = key; A.knockouts = []; }
+  const item = { label, units: [...units], pending: true };
+  A.knockouts.unshift(item);
+  renderKnockouts();
+  try {
+    item.res = await post(`${tokenUrl(t)}/knockout`, { units, target: A.attrTarget });
+  } catch (err) {
+    item.error = err.status === 409 ? "The model is generating; try again when it pauses." : err.message;
+  }
+  item.pending = false;
+  if (A.koKey === key) renderKnockouts();
+}
+
+function knockoutHtml(k) {
+  const names = k.units.length <= 4 ? k.units.map(shortName).join(" + ") : `${k.units.slice(0, 3).map(shortName).join(" + ")} + ${k.units.length - 3} more`;
+  if (k.pending) return `<li class="pending"><b>${esc(k.label)}</b><span class="dim">${names}</span><span class="muted">Re-running without them…</span></li>`;
+  if (k.error) return `<li class="err"><b>${esc(k.label)}</b><span class="warn-text">${esc(k.error)}</span></li>`;
+  const r = k.res, d = r.direct_effect, tot = r.total_effect, sgn = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}`;
+  let why;
+  if (Math.abs(d) < 0.05 && Math.abs(tot) < 0.05) why = "Removing them barely changes this token.";
+  else if (d > 0 && tot >= 0 && tot < d) why = `The rest of the network made up ${(d - tot).toFixed(2)} of their ${d.toFixed(2)} direct effect (${Math.round((1 - tot / d) * 100)}%).`;
+  else if (d > 0 && tot > d) why = `Removing them costs more than their direct writes: they also help this token through later layers (+${(tot - d).toFixed(2)}).`;
+  else if (d > 0 && tot < 0) why = "Without them the token gets more likely: their indirect effect outweighs their direct push.";
+  else why = `Direct effect ${sgn(d)}, total ${sgn(tot)}.`;
+  const after = r.top_after.slice(0, 3).map((a) => `${esc(visTok(a.text))} ${fmtP(a.prob)}`).join(" · ");
+  return `<li><div class="ko-head"><b>${esc(k.label)}</b><span class="dim">${names}</span></div>
+    <div class="ko-nums"><span>p ${fmtP(r.before.prob)} → <b>${fmtP(r.after.prob)}</b></span><span>logit ${sgn(-tot)}</span>
+      <span>rank #${r.before.rank} → #${r.after.rank}</span></div>
+    <div class="ko-bars"><span>direct</span>${dbar(d / Math.max(Math.abs(d), Math.abs(tot), 1e-6))}<span class="v">${sgn(d)}</span>
+      <span>total</span>${dbar(tot / Math.max(Math.abs(d), Math.abs(tot), 1e-6))}<span class="v">${sgn(tot)}</span></div>
+    <p class="hint">${why} Most likely now: ${after}.</p></li>`;
+}
+
+function renderKnockouts() {
+  const list = $("#tp-ko-list");
+  if (list) list.innerHTML = (A.knockouts || []).map(knockoutHtml).join("") || `<li class="muted">No tests yet at this token.</li>`;
+  const unitBox = $("#an-ko");
+  if (unitBox && A.selected != null) {
+    const k = (A.knockouts || []).find((x) => x.units.length === 1 && x.units[0] === A.selected);
+    unitBox.innerHTML = k ? knockoutHtml(k) : "";
+  }
+}
 
 // ---------------------------------------------------------------- dock trace
 function schedule() { if (!A.raf && A.visible) A.raf = requestAnimationFrame(() => { A.raf = 0; drawTrace(); overlay(); }); }
@@ -949,7 +1257,10 @@ function setSeg(group, attr, value) {
   document.querySelectorAll(`${group} [data-${attr}]`).forEach((b) => b.setAttribute("aria-pressed", String(b.dataset[attr] === value)));
 }
 
-function updateZoomLabel() { const z = $("#gv-zoom"); if (z && graph) z.textContent = `${graph.zoomPercent()}%`; }
+function updateZoomLabel() {
+  const z = $("#gv-zoom"), text = graph ? `${graph.zoomPercent()}%` : "";
+  if (z && z.textContent !== text) z.textContent = text;  // runs every frame
+}
 
 // ---------------------------------------------------------------- detail drawer
 function openDrawer(on) {
@@ -1003,6 +1314,7 @@ function renderDetail() {
       <div class="d-actions">
         <button type="button" id="an-lesion" class="btn" title="Adds an edit that zeroes this unit's output weights to the edit stack in Tune. Nothing changes until you apply the stack.">Lesion in Tune</button>
         <button type="button" id="an-focus" class="btn ghost">Center in graph</button>
+        ${A.mode === "attr" && A.attrInfo?.target ? `<button type="button" id="an-back-token" class="btn ghost" title="Back to the token this unit helped explain">← ${esc(visTok(A.attrInfo.target.text))}</button>` : ""}
       </div>
       <div class="wb-msg" id="an-lesion-msg" role="status"></div>
     </div>
@@ -1025,6 +1337,7 @@ function renderDetail() {
     </tbody></table></div></section>` : ""}`;
   $("#an-lesion").onclick = lesion;
   $("#an-focus").onclick = () => graph.flyTo(d.g, Math.max(graph.target.s, 2.6));
+  $("#an-back-token")?.addEventListener("click", openTokenPanel);
   renderTokenSection();
   document.querySelectorAll("#an-detail .conn-list li[data-g]").forEach((li) => { li.onclick = () => { const g = Number(li.dataset.g); selectUnit(g); graph.flyTo(g, Math.max(graph.target.s, 1.6)); }; });
   document.querySelectorAll("#an-detail .mtabs button").forEach((b) => { b.onclick = () => openView({ unit: d.g, matrix: b.dataset.key }); });
@@ -1419,6 +1732,18 @@ function setupInput() {
   }, { passive: false });
   $("#an-fit").onclick = () => { A.fit = true; schedule(); };
   document.querySelectorAll("#gv-mode [data-mode]").forEach((b) => { b.onclick = () => setMode(b.dataset.mode); });
+  $("#gv-convo-btn").onclick = () => setConvo(!CV.open);
+  $("#tv-convo-hide").onclick = () => setConvo(false);
+  $("#tv-show-template").onchange = (ev) => { CV.showTemplate = ev.target.checked; renderConvo(true); };
+  $("#tv-convo-body").addEventListener("click", (ev) => {
+    const el = ev.target.closest(".ct[data-t]");
+    if (el) traceWord(Number(el.dataset.t));
+  });
+  $("#gv-selko").onclick = () => {
+    if (A.mode !== "attr") setMode("attr");
+    openTokenPanel();
+    runKnockout([...A.sel].slice(0, 64), `${A.sel.size} selected units`);
+  };
   $("#gv-paths-btn").onclick = () => (A.pathsOpen ? closePaths() : openPaths());
   $("#gv-paths-close").onclick = closePaths;
   $("#gv-selclear").onclick = clearSelection;
@@ -1457,10 +1782,12 @@ function setupInput() {
     else if (ev.key === "Escape") {
       if (!$("#gv-palette").hidden) closePalette();
       else if (A.sel.size) clearSelection();
-      else if (A.selected != null) selectUnit(null);
+      else if (A.selected != null || A.detailMode) selectUnit(null);
       else if (A.pathsOpen) closePaths();
     }
     else if (ev.key === "p" || ev.key === "P") (A.pathsOpen ? closePaths() : openPaths());
+    else if (ev.key === "t" || ev.key === "T") setConvo(!CV.open);
+    else if (ev.key === "w" || ev.key === "W") { if (A.mode !== "attr") setMode("attr"); openTokenPanel(); }
     else if (ev.key === "a" || ev.key === "A") setMode(A.mode === "attr" ? "rel" : "attr");
     else if (ev.key === "f" || ev.key === "F") graph.fit();
     else if (ev.key === "+" || ev.key === "=") graph.zoomAt(graph.W / 2, graph.H / 2, 1.6);
@@ -1531,8 +1858,17 @@ function boot() {
   document.addEventListener("brainscan:run", (ev) => { if (A.atlas && A.visible && ev.detail !== A.runId) openRun(ev.detail); });
   document.addEventListener("brainscan:focus-layer", (ev) => { if (A.atlas) graph.flyToLayer(Number(ev.detail)); });
   document.addEventListener("brainscan:model", resetModel);
+  // A message sent from a composer: follow its tokens live (ui/chat.js).
+  document.addEventListener("brainscan:expect-run", () => { if (A.atlas) setFollow(true); });
+  const convoPref = (() => { try { return localStorage.getItem("brainscan-convo"); } catch { return null; } })();
+  setConvo(convoPref ? convoPref === "1" : innerWidth >= 1000);
+  renderConvo(true);
   document.addEventListener("brainscan:trace", (ev) => {  // from the guide
     const d = ev.detail || {};
+    if (d.word != null) {  // "why this token" for a token picked in another view
+      if (A.atlas && A.runId && A.runId === $("#run-select").value && A.tok[d.word]) traceWord(d.word);
+      else A.pendingWord = d.word;  // traced once the run is open here
+    }
     if (d.mode) setMode(d.mode);
     if (d.paths) openPaths(d.paths === true ? undefined : d.paths);
     if (d.palette) openPalette();

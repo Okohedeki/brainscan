@@ -17,6 +17,7 @@ const STEPS = [
   {
     view: "scanner", n: 1, title: "Watch", lead: "Run any agent on the model and see every token's internals as it works.",
     tools: [
+      { name: "Ask the model", what: "Type a message under the transcript (or in the Trace tab's conversation). Its tokens stream into the transcript, the timeline and the unit graph as they are generated; the chat continues until \"New chat\".", act: go("weights", () => document.querySelector("#tv-convo textarea")?.focus()) },
       { name: "Choose a model", what: "Click the model name in the top bar to switch to any open-weights model already on this machine: Hugging Face checkpoints and Ollama tags. Nothing is downloaded.", act: () => document.dispatchEvent(new CustomEvent("brainscan:models")) },
       { name: "Connect an agent", what: "Point any OpenAI-compatible harness at the endpoint below. Each request becomes a recorded run.", endpoint: true },
       { name: "Transcript and timeline", what: "Messages, tool calls and results lined up with a per-token timeline: events, logit lens by layer, surprisal, projections onto directions.", act: go("scanner") },
@@ -27,6 +28,8 @@ const STEPS = [
   {
     view: "weights", n: 2, title: "Trace", lead: "Open the model as a graph of attention heads and MLP neuron clusters, and follow a token through it.",
     tools: [
+      { name: "Why did it write that?", key: "W", what: "Click any word in the conversation: the graph colors by what each unit did to it, and a panel shows where its logit came from layer by layer, the layer where the model first had it as its top guess, the units that pushed it up or down, and the runners-up.", act: go("weights", () => trace({ mode: "attr" })) },
+      { name: "Knockout tests", what: "Remove units (the top ones, your selection, or the units on shown paths) and re-run: the token's probability before → after, its new rank and the new top guesses, with the units' total effect next to their direct effect.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Live unit graph", what: "Every head and neuron cluster, lit by how much it wrote at the current token. Scroll to zoom, drag to pan, replay the run on the timeline.", act: go("weights") },
       { name: "Explain the next token", key: "A", what: "Color each unit by how much it pushed the next token up or down. Click a runner-up token to explain it instead.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Before and after an edit", what: "With weight edits applied, turn on \"vs original\" in Explain: each unit is colored by how the edit changed its effect on the token, the dock shows the probability before → after, and Paths traces the circuit behind the change.", act: go("weights", () => trace({ mode: "attr" })) },
@@ -48,7 +51,7 @@ const STEPS = [
 
 const KEYS = [
   ["?", "this guide"], ["⌘K or /", "jump to a unit"], ["A", "explain next token"], ["P", "paths"],
-  ["Space", "replay"], ["← →", "step tokens"], ["F", "fit graph"], ["Esc", "clear / close"],
+  ["W", "why this token"], ["T", "show/hide text"], ["Space", "replay"], ["← →", "step tokens"], ["F", "fit graph"], ["Esc", "clear / close"],
 ];
 
 function render() {

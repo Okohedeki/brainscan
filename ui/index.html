@@ -50,6 +50,7 @@
         <span class="muted small" id="run-meta"></span>
       </div>
       <div class="messages" id="messages"></div>
+      <div class="composer" data-composer></div>
     </section>
 
     <div class="right">
@@ -116,11 +117,25 @@
   </main>
 
   <main class="gv" id="view-weights" hidden>
+    <aside class="tv-convo glass" id="tv-convo" aria-labelledby="tv-convo-title">
+      <header class="convo-head">
+        <span class="eyebrow" id="tv-convo-title">Conversation</span>
+        <span class="convo-meta" id="tv-convo-meta"></span>
+        <label class="check small" title="Show the chat template's special tokens"><input type="checkbox" id="tv-show-template"> template</label>
+        <button type="button" class="tbtn icon" id="tv-convo-hide" aria-label="Hide the conversation" title="Hide (T)">‹</button>
+      </header>
+      <p class="convo-hint">Click any word to see which units and layers produced it. Underlines mark words the model found surprising.</p>
+      <div class="convo-body" id="tv-convo-body" aria-live="off"></div>
+      <div class="composer" data-composer></div>
+    </aside>
+    <div class="gv-main">
     <div class="gv-stage" id="gv-stage">
       <canvas id="gv-canvas" aria-label="Weight graph: layers left to right along the residual stream, attention heads above it and MLP neuron clusters below, glowing by activity at the current token. Scroll to zoom, drag to pan, click a node to open it."></canvas>
       <div class="gv-tip tooltip" id="gv-tip" hidden></div>
 
       <div class="gv-bar glass" role="toolbar" aria-label="Graph controls">
+        <button type="button" class="tbtn" id="gv-convo-btn" aria-pressed="true" title="Show the conversation (T)">Text</button>
+        <span class="sep" aria-hidden="true"></span>
         <div class="seg" id="gv-mode" role="group" aria-label="Node color">
           <button type="button" data-mode="rel" aria-pressed="true" title="Each unit against its own average over the run">Activity</button>
           <button type="button" data-mode="abs" aria-pressed="false" title="Activity on one log scale for all units">Absolute</button>
@@ -142,6 +157,7 @@
         <span class="selchip" id="gv-selchip" hidden>
           <span id="gv-selcount"></span>
           <button type="button" class="link" id="gv-selpaths" title="Find paths from the selected units">paths</button>
+          <button type="button" class="link" id="gv-selko" title="Remove the selected units and see what happens to the next token">knock out</button>
           <button type="button" class="tbtn icon" id="gv-selclear" aria-label="Clear selection (Esc)">✕</button>
         </span>
       </div>
@@ -211,6 +227,7 @@
         <div class="tooltip" id="an-trace-tip" hidden></div>
       </div>
     </section>
+    </div>
 
     <div class="palette" id="gv-palette" hidden>
       <div class="palette-box glass" role="dialog" aria-label="Jump to a unit or parameter">
@@ -363,6 +380,7 @@
   </footer>
   <script type="module" src="/ui/guide.js"></script>
   <script type="module" src="/ui/models.js"></script>
+  <script type="module" src="/ui/chat.js"></script>
   <script type="module" src="/ui/app.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
   <script type="module" src="/ui/weights.js"></script>
