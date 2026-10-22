@@ -45,6 +45,7 @@ const A = {
   attrInfo: null, attrTarget: null, attrSeq: 0, attrTimer: 0,
   cmp: false, attrOrig: null, attrDiff: null,  // "vs original": attribution with the weight edits lifted, and the change
   attrOf: null,                      // the slot of the word being explained, when it was clicked in the conversation
+  trace: null, traceOn: true, frameTrace: false, followTimer: 0,  // the explained token's routes, START to END
   panelSeq: 0, knockouts: [], koKey: null,
   paths: [], pathMode: "down", pathHops: 3, pathBranch: 4, pathActivity: true, pathsOpen: false,
   expanded: new Map(),               // cluster g -> Float32Array neuron activity in [-1, 1] at the cursor
@@ -135,6 +136,7 @@ async function loadAtlas() {
       if (e.available) { e.up = Int32Array.from(e.up); e.down = Int32Array.from(e.down); e.up_x = Float32Array.from(e.up_x); e.down_x = Float32Array.from(e.down_x); }
       A.edges = e; graph.setEdges(e); renderLegend();
       if (A.pathsOpen) runPathSearch(true);
+      else updateTrace();  // a word clicked before the edges arrived
     }).catch(() => {});
     return true;
    } catch (err) {
@@ -347,7 +349,9 @@ function pushState() {
   const signed = A.mode === "attr" && A.attrN && A.attrInfo?.t === A.cursor ? A.attrN : null;
   graph.setState({ heat: A.heat, trail: A.trail, trailOn: A.trailOn && A.mode !== "attr", mode: A.mode, normT: A.normT,
     selected: A.selected, edited: A.edited, edgeMode: A.edgeMode, live: isLive(), visible: A.visible,
-    signed, selection: A.sel, paths: A.paths, expanded: A.expanded });
+    signed, selection: A.sel, paths: A.paths, expanded: A.expanded,
+    trace: A.trace && !A.pathsOpen ? { start: A.trace.start, end: A.trace.end } : null,
+    insets: { l: A.pathsOpen ? 396 : 0, r: $("#gv-drawer").hidden ? 0 : 452 } });
 }
 const isLive = () => A.follow && performance.now() - A.lastAnat < 2500;
 
@@ -366,6 +370,7 @@ function setCursor(t, how = "jump") {
     if (x < A.scrollX || x > A.scrollX + A.plotW - A.colW) A.scrollX = x - A.plotW * 0.8;
   }
   if (A.attrInfo?.t !== t) { A.attrTarget = null; A.attrOf = null; }  // a new token explains its own next token by default
+  if (A.trace && A.trace.t !== t) clearTrace();  // redrawn when this token's explanation arrives
   pushState();
   renderReadout();
   schedule();
@@ -457,8 +462,103 @@ function renderReadout() {
 function setMode(mode) {
   A.mode = mode;
   setSeg("#gv-mode", "mode", mode);
+  if (mode !== "attr") clearTrace();
   pushState(); renderLegend(); renderReadout();
   if (mode === "attr") loadExplain();
+}
+
+// ---------------------------------------------------------------- the trace: START (input token) → units → END (output token)
+/** For each of the units that pushed the explained token up the most (or, comparing with the
+ * original weights, that the edits changed most), its strongest route in from earlier layers
+ * through units active at this token. Drawn on the graph from the embedding (START, the input
+ * token) to the unembedding (END, the output token), unless the path explorer is showing its own. */
+function updateTrace() {
+  const info = A.attrInfo;
+  const want = A.mode === "attr" && A.traceOn && A.attr && info?.target && info.t === A.cursor && A.edges?.available;
+  if (!want) { clearTrace(); return; }
+  const scores = A.attrDiff || A.attr, cmp = !!A.attrDiff;
+  const roots = [...scores.keys()].filter((g) => (cmp ? Math.abs(scores[g]) > 1e-6 : scores[g] > 0))
+    .sort((a, b) => (cmp ? Math.abs(scores[b]) - Math.abs(scores[a]) : scores[b] - scores[a])).slice(0, 5);
+  const weight = rowOf(A.cursor) != null ? (g) => 0.15 + 0.85 * activityAt(g) : null;
+  const routes = roots.map((g) => {
+    const best = findPaths(A.edges, [g], { dir: "up", hops: 3, branch: 3, weight, limit: 1 })[0];
+    return { units: best ? best.units : [g], xs: best ? best.xs : [], score: Math.abs(scores[g]), root: g, value: scores[g], ends: true };
+  });
+  stopFollow();
+  A.trace = { t: info.t, start: visTok(A.tok[info.t]?.tx ?? info.token), end: visTok(info.target.text), routes, cmp };
+  if (!A.pathsOpen) {
+    A.paths = routes.map((r) => ({ ...r, on: true, focus: false }));
+    if (A.frameTrace) { A.frameTrace = false; requestAnimationFrame(() => graph.fitTrace(routeUnits())); }
+  }
+  pathsChanged();
+}
+
+const routeUnits = () => [...new Set((A.trace?.routes || []).flatMap((r) => r.units))];
+
+function clearTrace() {
+  stopFollow();
+  if (!A.trace) return;
+  A.trace = null;
+  if (!A.pathsOpen) A.paths = [];
+  pathsChanged();
+}
+
+function focusRoute(i, on) {
+  if (A.pathsOpen || !A.trace) return;
+  A.paths.forEach((p, j) => { p.focus = on && j === i; });
+  pushState();
+}
+
+function stopFollow() {
+  clearTimeout(A.followTimer); A.followTimer = 0;
+  document.querySelectorAll(".routes .now").forEach((el) => el.classList.remove("now"));
+}
+
+/** Walk a route step by step: START, each unit in order, END. */
+function followRoute(i) {
+  stopFollow();
+  const r = A.trace?.routes[i];
+  if (!r) return;
+  focusRoute(i, true);
+  const steps = ["start", ...r.units, "end"];
+  const li = document.querySelector(`.routes li[data-i="${i}"]`);
+  const marks = li ? [...li.querySelectorAll("[data-step]")] : [];
+  let k = 0;
+  const next = () => {
+    marks.forEach((el) => el.classList.toggle("now", Number(el.dataset.step) === k));
+    if (k >= steps.length) { A.followTimer = 0; return; }
+    const st = steps[k];
+    if (st === "start") graph.flyToEnd(0);
+    else if (st === "end") graph.flyToEnd(1);
+    else graph.flyTo(st, 2.2);
+    k++;
+    A.followTimer = setTimeout(next, 1200);
+  };
+  next();
+}
+
+function routesHtml(info) {
+  if (!A.traceOn) return `<section class="d-sec"><h4>The trace</h4><p class="hint">Hidden. <button type="button" class="link" id="tp-trace-on">Draw it on the graph</button></p></section>`;
+  const tr = A.trace;
+  if (!tr || tr.t !== info.t) return A.edges?.available === false ? "" : `<section class="d-sec"><h4>The trace, start to end</h4><p class="hint">Mapping the routes…</p></section>`;
+  const sgn = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}`;
+  const rows = tr.routes.map((r, i) => {
+    let step = 0;
+    const units = r.units.map((g) => `<span class="rt-arrow">→</span><span class="pchip ${A.units[g].kind}${g === r.root ? " root" : ""}" data-g="${g}" data-step="${++step}" title="${esc(unitName(g))}${g === r.root ? " · writes to the output directly" : ""}">${shortName(g)}</span>`).join("");
+    return `<li data-i="${i}"><span class="rt-n">${i + 1}</span><div class="rt-flow">
+        <span class="rt-end start" data-step="0" title="The input token at this position. Every unit reads it from the residual stream (dashed on the graph).">START <code>${esc(tr.start)}</code></span>
+        ${units}<span class="rt-arrow">→</span>
+        <span class="rt-end end" data-step="${step + 1}" title="The output token: the last unit's direct write to it">END <code>${esc(tr.end)}</code></span>
+        <b class="rt-val ${r.value >= 0 ? "pos" : "neg"}" title="${tr.cmp ? "Change in the last unit's direct effect" : "The last unit's direct effect on the output token"}">${tr.cmp ? "Δ" : ""}${sgn(r.value)}</b></div></li>`;
+  }).join("");
+  return `<section class="d-sec"><h4>The trace, start to end <span class="dim">${tr.cmp ? "routes behind the change" : `${tr.routes.length} strongest routes`}</span></h4>
+    <ol class="routes">${rows || `<li class="muted">No unit pushed this token up.</li>`}</ol>
+    <div class="d-actions wrap">
+      ${tr.routes.length ? `<button type="button" class="btn sm" id="tp-follow" title="Walk route 1 on the graph: START, each unit, END">▶ Follow route 1</button>` : ""}
+      <button type="button" class="btn sm ghost" id="tp-frame">Frame the trace</button>
+      <button type="button" class="link" id="tp-trace-off">Hide trace</button>
+    </div>
+    <p class="hint">Read left to right. A route starts at the input token, which every unit reads from the residual stream (dashed on the graph); each hop is a unit whose input weights read the previous unit's output, favoring units active at this token; it ends with the last unit's direct write to the output token. Hover a route to light it up on the graph, click a unit to open it.</p></section>`;
 }
 
 /** Once the cursor settles: refresh the attribution, the open unit's token details and expanded clusters. */
@@ -516,6 +616,7 @@ async function loadExplain() {
     A.attrInfo = err.status === 409 ? { busy: true, t } : { error: err.message, t };
     if (err.status === 409) A.attrTimer = setTimeout(() => { if (A.cursor === t) loadExplain(); }, 1500);
   }
+  updateTrace();
   pushState(); renderReadout(); renderLegend(); renderTokenPanel(); markConvo(false);
   if (A.pathsOpen) renderPathControls();
   if (A.pathsOpen && A.pathMode === "explain") runPathSearch(false);
@@ -560,7 +661,8 @@ function openPaths(mode) {
   runPathSearch(true);
 }
 function closePaths() {
-  A.pathsOpen = false; A.paths = [];
+  A.pathsOpen = false;
+  A.paths = A.trace ? A.trace.routes.map((r) => ({ ...r, on: true, focus: false })) : [];  // the trace comes back
   $("#gv-paths").hidden = true;
   $("#gv-stage").classList.remove("paths-open");
   $("#gv-paths-btn").setAttribute("aria-pressed", "false");
@@ -861,6 +963,7 @@ async function traceWord(t) {
   setFollow(false); stopPlay();
   setCursor(src.t, "jump");  // schedules the trace, which picks up the target set next
   A.attrTarget = String(src.target.id); A.attrOf = t;
+  A.frameTrace = true;  // frame the whole trace, START to END, once it is drawn
   if (A.mode !== "attr") { A.mode = "attr"; setSeg("#gv-mode", "mode", "attr"); pushState(); renderLegend(); renderReadout(); }
   openTokenPanel();
   markConvo(false);
@@ -913,6 +1016,20 @@ async function renderTokenPanel() {
       selectUnit(g); graph.flyTo(g, Math.max(graph.target.s, 1.6));
     };
   });
+  box.querySelectorAll(".routes li[data-i]").forEach((li) => {
+    const i = Number(li.dataset.i), r = A.trace?.routes[i];
+    li.onmouseenter = () => focusRoute(i, true);
+    li.onmouseleave = () => { if (!A.followTimer) focusRoute(i, false); };
+    li.onclick = (ev) => {
+      const chip = ev.target.closest(".pchip[data-g]");
+      if (chip) { const g = Number(chip.dataset.g); selectUnit(g); graph.flyTo(g, Math.max(graph.target.s, 1.6)); return; }
+      if (r) { focusRoute(i, true); graph.fitTrace(r.units); }
+    };
+  });
+  $("#tp-follow")?.addEventListener("click", () => followRoute(0));
+  $("#tp-frame")?.addEventListener("click", () => graph.fitTrace(routeUnits()));
+  $("#tp-trace-off")?.addEventListener("click", () => { A.traceOn = false; clearTrace(); renderTokenPanel(); });
+  $("#tp-trace-on")?.addEventListener("click", () => { A.traceOn = true; updateTrace(); renderTokenPanel(); });
   $("#tp-circuit").onclick = () => openPaths("explain");
   $("#tp-ko-top").onclick = () => runKnockout(topUnits(info, 5, true), "top 5 units that pushed it up");
   $("#tp-ko-sel")?.addEventListener("click", () => runKnockout([...A.sel], `${A.sel.size} selected units`));
@@ -949,8 +1066,11 @@ function tokenPanelHtml(info, lens) {
       </div>
       ${o ? `<div class="cmp-line"><span>original weights p <b>${fmtP(o.target.prob)}</b></span><span class="arrow">→</span><span>edited <b>${fmtP(info.target.prob)}</b></span><span class="attr-val ${info.target.logit - o.logit >= 0 ? "pos" : "neg"}">logit ${fmtL(info.target.logit - o.logit)}</span></div>` : ""}
       ${alts ? `<div class="chips tp-alts"><span class="lbl">runners-up</span>${alts}</div>` : ""}
+    </div>
+    ${routesHtml(info)}
+    <div class="d-sec tp-tools">
       <div class="d-actions wrap">
-        <button type="button" class="btn sm" id="tp-circuit" title="The active units feeding the ones that pushed this token up">Show circuit</button>
+        <button type="button" class="btn sm" id="tp-circuit" title="Open the path explorer on this token: up to 60 routes, with hops and branches to tune">All routes</button>
         <button type="button" class="btn sm" id="tp-ko-top" title="Remove the five units that pushed it up most and re-run">Knock out top 5</button>
         ${A.sel.size ? `<button type="button" class="btn sm" id="tp-ko-sel">Knock out selection (${A.sel.size})</button>` : ""}
         <button type="button" class="btn sm ghost" id="tp-copy" title="Copy this trace as JSON">Copy JSON</button>
@@ -1237,7 +1357,8 @@ function renderLegend() {
   const e = A.edges;
   $("#gv-legend").innerHTML = `
     <div class="lg-row"><span class="lg-grad" style="background:${g}"></span><span>${scale}</span></div>
-    ${A.paths.some((p) => p.on) ? `<div class="lg-row"><span class="lg-line" style="background:${C.path}"></span><span>highlighted paths</span><span class="lg-ring" style="border-color:${C.multiSelect}"></span><span>selected</span></div>` : ""}
+    ${A.trace && !A.pathsOpen ? `<div class="lg-row"><span class="lg-line" style="background:${C.path}"></span><span>trace: START <b>${esc(A.trace.start)}</b> (embedding) → units → END <b>${esc(A.trace.end)}</b> (unembedding)</span></div>`
+      : A.paths.some((p) => p.on) ? `<div class="lg-row"><span class="lg-line" style="background:${C.path}"></span><span>highlighted paths</span><span class="lg-ring" style="border-color:${C.multiSelect}"></span><span>selected</span></div>` : ""}
     ${A.edgeMode !== "off" ? `<div class="lg-row"><span class="lg-line" style="background:${C.edgeCircuit}"></span><span>${A.selected != null ? `<span style="color:${C.edgeIn}">inputs</span> · <span style="color:${C.edgeOut}">outputs</span> of the selected unit` : A.edgeMode === "circuit" ? "composition between units active now" : "edges of the unit under the cursor"}</span></div>` : ""}
     <div class="lg-row"><span class="lg-ring" style="border-color:${C.trail}"></span><span>hit in the last few tokens</span><span class="lg-dot" style="background:${C.edited}"></span><span>edited</span></div>
     <details><summary>How to read this</summary>
@@ -1266,6 +1387,7 @@ function updateZoomLabel() {
 function openDrawer(on) {
   $("#gv-drawer").hidden = !on;
   $("#gv-stage").classList.toggle("drawer-open", on);
+  graph?.setState({ insets: { l: A.pathsOpen ? 396 : 0, r: on ? 452 : 0 } });
 }
 
 async function selectUnit(g, keepView = false) {

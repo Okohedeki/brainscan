@@ -39,6 +39,8 @@ export class WeightGraph {
     this.signed = null;           // Float32Array in [-1, 1]: attribution mode colors nodes on a diverging ramp
     this.expanded = new Map();    // cluster g -> Float32Array of its neurons' activity in [-1, 1]
     this.box = null;              // live box-select rectangle in screen space
+    this.trace = null;            // {start, end}: the input and output token of a traced word, labelled at the ends
+    this.insets = { l: 0, r: 0 }; // screen pixels covered by side panels, kept clear when framing
     this._input();
     new ResizeObserver(() => { const fitAgain = this.fitted; this._size(); if (fitAgain) this.fit(true); this.invalidate(); }).observe(canvas.parentElement);
   }
@@ -209,6 +211,30 @@ export class WeightGraph {
     this.invalidate();
   }
 
+  /** Camera to the embedding (0) or the unembedding (1) node. */
+  flyToEnd(i) {
+    const end = this.ends?.[i]; if (!end) return;
+    this.target = { x: end.x, y: 0, s: Math.max(this.target.s, 1.4) };
+    this.fitted = false;
+    this.invalidate();
+  }
+
+  /** Frame a trace from end to end: both end nodes and the units on its routes, in the part of the
+   * canvas no side panel covers. */
+  fitTrace(units) {
+    if (!this.x) return;
+    let y0 = -50, y1 = 50;  // the residual stream and the end nodes
+    for (const g of units || []) { y0 = Math.min(y0, this.y[g]); y1 = Math.max(y1, this.y[g]); }
+    const x0 = this.ends[0].x, x1 = this.ends[1].x, { l = 0, r = 0 } = this.insets || {};
+    // screen margins wide enough for the START and END labels above the end nodes
+    const w = Math.max(this.W - l - r, 200), margin = 72;
+    const s = clamp(Math.min((w - 2 * margin) / (x1 - x0), (this.H - 150) / (y1 - y0 + 140)), MIN_S, 3.2);
+    // the content's centre lands in the middle of the uncovered part, a little below the toolbar
+    this.target = { x: (x0 + x1) / 2 - (l - r) / 2 / s, y: (y0 + y1) / 2 - 24 / s, s };
+    this.fitted = false;
+    this.invalidate();
+  }
+
   flyToLayer(layer) {
     const p = this.pods?.[layer]; if (!p) return;
     this.target = { x: p.x, y: (this.bounds.y0 + this.bounds.y1) / 2, s: Math.max(this.target.s, 1.4) };
@@ -328,32 +354,53 @@ export class WeightGraph {
       }
     }
 
-    // highlighted paths (path explorer): amber curves unit to unit, the focused one brightest
+    // highlighted paths (path explorer, or a traced word): amber curves unit to unit, the focused one
+    // brightest. A trace's routes also join the ends: dashed from the embedding (the input token's
+    // stream, which every unit reads) into the first unit, solid from the last unit into the
+    // unembedding (its direct write to the output token).
     const shownPaths = this.paths.filter((p) => p.on);
+    const endW = clamp(70 * s, 26, 180);
+    const startPt = [X(this.ends[0].x) + endW / 2, Y(0)], endPt = [X(this.ends[1].x) - endW / 2, Y(0)];
+    const segments = (p) => {
+      const out = [];
+      if (p.ends) out.push([startPt[0], startPt[1], X(this.x[p.units[0]]), Y(this.y[p.units[0]]), "start"]);
+      for (let i = 0; i + 1 < p.units.length; i++) {
+        const a = p.units[i], b = p.units[i + 1];
+        out.push([X(this.x[a]), Y(this.y[a]), X(this.x[b]), Y(this.y[b]), "hop"]);
+      }
+      if (p.ends) { const z = p.units[p.units.length - 1]; out.push([X(this.x[z]), Y(this.y[z]), endPt[0], endPt[1], "end"]); }
+      return out;
+    };
     if (shownPaths.length) {
       const maxScore = Math.max(...shownPaths.map((p) => p.score), 1e-9);
-      for (const p of shownPaths) {
+      const anyFocus = shownPaths.some((p) => p.focus);
+      for (const p of [...shownPaths].sort((a, b) => a.focus - b.focus)) {  // the focused route on top
         const w = clamp(p.score / maxScore, 0.15, 1), focus = p.focus;
         ctx.strokeStyle = focus ? C.pathFocus : C.path;
-        ctx.globalAlpha = focus ? 0.95 : 0.25 + 0.55 * w;
+        ctx.globalAlpha = focus ? 0.95 : (anyFocus ? 0.15 : 0.25 + 0.55 * w);
         ctx.lineWidth = clamp((focus ? 2.6 : 1 + 2 * w) * Math.sqrt(s), 0.8, focus ? 7 : 5);
-        ctx.beginPath();
-        for (let i = 0; i + 1 < p.units.length; i++) {
-          const a = p.units[i], b = p.units[i + 1], x0 = X(this.x[a]), y0 = Y(this.y[a]), x3 = X(this.x[b]), y3 = Y(this.y[b]), dx = (x3 - x0) * 0.5;
-          ctx.moveTo(x0, y0); ctx.bezierCurveTo(x0 + dx, y0, x3 - dx, y3, x3, y3);
+        for (const dashed of [false, true]) {
+          ctx.setLineDash(dashed ? [5, 5] : []);
+          ctx.beginPath();
+          for (const [x0, y0, x3, y3, kind] of segments(p)) {
+            if ((kind === "start") !== dashed) continue;
+            const dx = (x3 - x0) * 0.5;
+            ctx.moveTo(x0, y0); ctx.bezierCurveTo(x0 + dx, y0, x3 - dx, y3, x3, y3);
+          }
+          ctx.stroke();
         }
-        ctx.stroke();
       }
+      ctx.setLineDash([]);
       ctx.globalAlpha = 1;
       if (!reduceMotion()) {  // particles flow downstream along the strongest paths
         ctx.fillStyle = C.pathFocus;
         shownPaths.slice(0, 40).forEach((p, pi) => {
-          for (let i = 0; i + 1 < p.units.length; i++) {
-            const a = p.units[i], b = p.units[i + 1];
-            const t = (now * 0.00035 + i * 0.29 + pi * 0.17) % 1, [px, py] = bez(X(this.x[a]), Y(this.y[a]), X(this.x[b]), Y(this.y[b]), t);
+          if (anyFocus && !p.focus) return;
+          segments(p).forEach(([x0, y0, x3, y3], i) => {
+            const t = (now * 0.00035 + i * 0.29 + pi * 0.17) % 1, [px, py] = bez(x0, y0, x3, y3, t);
             ctx.globalAlpha = 0.85 * Math.sin(Math.PI * t);
             ctx.beginPath(); ctx.arc(px, py, p.focus ? 2.8 : 1.8, 0, Math.PI * 2); ctx.fill();
-          }
+          });
         });
         ctx.globalAlpha = 1;
       }
@@ -535,6 +582,43 @@ export class WeightGraph {
         if (end.sub) { ctx.fillStyle = C.muted; ctx.font = `${clamp(w * 0.085, 8, 11)}px Inter, system-ui, sans-serif`; ctx.fillText(end.sub.join(" × "), x + w / 2, y + hh / 2 + clamp(w * 0.12, 10, 16)); }
       }
     }
+    if (this.trace) this._drawTraceEnds(ctx, s);
+  }
+
+  /** A traced word reads left to right: the input token labelled START at the embedding, the output
+   * token END at the unembedding, and the focused route's units numbered in order. */
+  _drawTraceEnds(ctx, s) {
+    const C = this.C, X = (x) => this.sx(x), Y = (y) => this.sy(y);
+    ctx.save();
+    ctx.textAlign = "center"; ctx.textBaseline = "alphabetic";
+    const clip = (t) => (t.length > 24 ? `${t.slice(0, 23)}…` : t);
+    const label = (end, kicker, text) => {
+      const w = clamp(70 * s, 26, 180), hh = clamp(46 * s, 18, 110), cx = X(end.x), nodeTop = Y(0) - hh / 2;
+      ctx.strokeStyle = C.path; ctx.lineWidth = 2.5;
+      roundRect(ctx, cx - w / 2, nodeTop, w, hh, Math.min(12, hh / 3)); ctx.stroke();
+      ctx.font = "600 12.5px 'JetBrains Mono', ui-monospace, monospace";
+      const shown = clip(text), cw = Math.max(ctx.measureText(shown).width + 20, 92), ch = 38, y = nodeTop - 8 - ch;
+      if (cx > this.W + cw / 2 || cx < -cw / 2) return;  // the end is off screen
+      const x = clamp(cx - cw / 2, 4, this.W - cw - 4);  // keep the label readable at the canvas edge
+      ctx.fillStyle = C.cardBg; roundRect(ctx, x, y, cw, ch, 9); ctx.fill();
+      ctx.strokeStyle = C.path; ctx.lineWidth = 1.5; ctx.stroke();
+      ctx.fillStyle = C.path; ctx.font = "700 9.5px Inter, system-ui, sans-serif";
+      ctx.fillText(kicker, x + cw / 2, y + 13);
+      ctx.fillStyle = C.ink; ctx.font = "600 12.5px 'JetBrains Mono', ui-monospace, monospace";
+      ctx.fillText(shown, x + cw / 2, y + 29);
+    };
+    label(this.ends[0], "START · INPUT", this.trace.start);
+    label(this.ends[1], "END · OUTPUT", this.trace.end);
+    const fp = this.paths.find((p) => p.on && p.focus && p.ends);
+    if (fp) {
+      ctx.font = "700 10px Inter, system-ui, sans-serif"; ctx.textBaseline = "middle";
+      fp.units.forEach((g, i) => {
+        const r = Math.max(this.r[g] * s, 3) + 3, x = X(this.x[g]) + r, y = Y(this.y[g]) - r;
+        ctx.fillStyle = C.pathFocus; ctx.beginPath(); ctx.arc(x, y, 8, 0, Math.PI * 2); ctx.fill();
+        ctx.fillStyle = C.dark ? "#1a1205" : "#fff"; ctx.fillText(String(i + 1), x, y + 0.5);
+      });
+    }
+    ctx.restore();
   }
 
   _drawMinimap() {

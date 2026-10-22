@@ -847,6 +847,28 @@ table.cmp pre { margin: 4px 0 0; white-space: pre-wrap; font: 12px/1.5 var(--mon
 .tp-units .v.neg { color: var(--div-neg); }
 .pbar.neg i { background: var(--div-neg); }
 .d-sec h4.sub { margin-top: 12px; }
+.routes { list-style: none; margin: 4px 0 8px; padding: 0; display: flex; flex-direction: column; gap: 3px; }
+.routes li { display: grid; grid-template-columns: 18px minmax(0, 1fr); gap: 8px; align-items: start; padding: 6px; border-radius: 9px; cursor: pointer; border: 1px solid transparent; }
+.routes li:hover { background: color-mix(in srgb, var(--path) 9%, transparent); border-color: color-mix(in srgb, var(--path) 35%, transparent); }
+.rt-n {
+  width: 18px; height: 18px; border-radius: 50%; margin-top: 2px; display: inline-flex; align-items: center; justify-content: center;
+  background: var(--path); color: var(--surface); font-size: 10.5px; font-weight: 700;
+}
+.rt-flow { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; font-size: 11.5px; min-width: 0; }
+.rt-end {
+  display: inline-flex; align-items: center; gap: 5px; padding: 1px 6px; border-radius: 6px; font: 700 9.5px var(--sans); letter-spacing: 0.05em;
+  color: var(--path); border: 1px solid color-mix(in srgb, var(--path) 55%, transparent);
+}
+.rt-end code { font: 500 11px var(--mono); color: var(--ink); letter-spacing: 0; background: none; padding: 0; }
+.rt-arrow { color: var(--path); font-size: 11px; }
+.routes .pchip { cursor: pointer; }
+.routes .pchip.root { border-color: var(--path); }
+.routes .pchip:hover { border-color: var(--ink-2); }
+.rt-val { margin-left: auto; font: 600 11px var(--mono); }
+.rt-val.pos { color: var(--div-pos); }
+.rt-val.neg { color: var(--div-neg); }
+.routes .now { outline: 2px solid var(--path-focus); outline-offset: 1px; background: color-mix(in srgb, var(--path) 22%, transparent); }
+.tp-tools { padding-top: 4px; }
 .ko-list { list-style: none; margin: 6px 0; padding: 0; display: flex; flex-direction: column; gap: 6px; }
 .ko-list:empty { display: none; }
 .ko-list > li { border: 1px solid var(--border); border-radius: 10px; padding: 8px 10px; font-size: 12px; background: color-mix(in srgb, var(--raised) 60%, transparent); }
