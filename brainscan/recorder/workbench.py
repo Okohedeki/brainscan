@@ -228,8 +228,12 @@ def add_check(recorder, body: dict) -> dict:
         target = answer_token(s, prompt, expect, chat)
         check = {"kind": "text", "prompt": prompt, "expect": expect, "chat": chat, "target": target,
                  "target_text": s.token_str(target), "label": f"{prompt[-60:]} → {s.token_str(target)}"}
-    check["id"] = uuid.uuid4().hex[:8]
     checks = list_checks(recorder)
+    fields = ("kind", "run", "t", "prompt", "chat", "target")
+    same = next((c for c in checks if all(c.get(k) == check.get(k) for k in fields)), None)
+    if same is not None:  # saving the same check twice keeps one
+        return same
+    check["id"] = uuid.uuid4().hex[:8]
     checks.append(check)
     _save_checks(recorder, checks)
     return check

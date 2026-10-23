@@ -126,8 +126,19 @@ def test_measure_then_keep_gives_what_was_measured(rec, clean):
     _, _, body = run_fact(rec)
     units = [u["g"] for u in actions.forget_target(rec, body)["units"][:4]]
     workbench.add_check(rec, {"prompt": "The sky is", "expect": "blue"})
+    workbench.add_check(rec, {"prompt": "The sky is", "expect": "blue"})  # a duplicate is kept once
+    assert len(workbench.list_checks(rec)) == 1
+    workbench.add_check(rec, body)  # the fact's own context: measured once, as the fact
+    # A check asking for the same answer after another context is another way of asking for it.
+    f = actions.fact(rec, body)
+    checks = workbench.list_checks(rec)
+    checks.append({"kind": "text", "prompt": "Roses are", "expect": "x", "chat": False, "target": f.target,
+                   "target_text": "x", "label": "<|im_start|>Roses are → x", "id": "samefact"})
+    workbench._save_checks(rec, checks)
     res = actions.forget_measure(rec, body | {"units": units, "leads": ["Violets are"], "keep": "Grass is → green"})
-    assert len(res["leads"]) == 2 and [k["source"] for k in res["keep"]] == ["typed", "check"]
+    assert [r["source"] for r in res["leads"]] == ["lead", "lead", "check"]
+    assert [k["source"] for k in res["keep"]] == ["typed", "check"]
+    assert res["leads"][2]["prompt"] == "Roses are → x"
     assert res["drift"]["kl_per_token"] >= 0 and res["drift"]["tokens"] > 0
     assert res["control"] == {"seeds": actions.CONTROL_SEEDS, "units": 4}
     assert res["verdict"]["status"] in {"works", "partial", "costly", "kept", "unspecific"}

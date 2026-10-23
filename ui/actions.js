@@ -7,6 +7,7 @@ const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const fmtP = (p) => (p == null ? "–" : p >= 0.001 || p === 0 ? p.toFixed(3) : p.toExponential(1));
 const vis = (s) => (s ?? "").replace(/\n/g, "⏎").replace(/\t/g, "⇥") || "∅";
+const cleanText = (s) => (s || "").replace(/<\|[^|>]*\|>\s*(?:system|user|assistant)?|<\/?think>/g, " ").replace(/\s+/g, " ").trim();
 
 async function api(method, path, body) {
   const res = await fetch(path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
@@ -56,10 +57,24 @@ const parseKeep = (text) => text.split("\n").map((l) => l.trim()).filter(Boolean
 // ---------------------------------------------------------------- views
 function showHome() { $("#act-home").hidden = false; $("#act-flow").hidden = true; }
 function openForget(source = null) {
-  reset(source);
+  reset(source && { ...source, lead: cleanText(source.lead) });
   $("#act-home").hidden = true; $("#act-flow").hidden = false;
   document.dispatchEvent(new CustomEvent("brainscan:show", { detail: "actions" }));
   render();
+  if (F.source && !F.questions) prefillQuestion(F.source);
+}
+
+/** A word from a chat: ask the chat's own question again as one of the tests. */
+async function prefillQuestion(src) {
+  try {
+    const run = await api("GET", `/brainscan/runs/${encodeURIComponent(src.run)}`);
+    const asked = (run.messages || []).filter((m) => m.role === "user" && m.t <= src.t && (m.content || "").trim())
+      .sort((a, b) => a.t - b.t).pop();
+    if (asked && F.source === src && !F.questions) {
+      F.questions = asked.content.trim();
+      if (F.step === "goal" && !F.busy) render();
+    }
+  } catch { /* the question stays empty */ }
 }
 function go(view, then) {
   document.dispatchEvent(new CustomEvent("brainscan:show", { detail: view }));
@@ -209,7 +224,7 @@ function measureHtml() {
     </div>
     <details class="fl-details" open><summary>Every lead-in</summary>
       <table class="m-table"><thead><tr><th>Lead-in</th><th>Before</th><th>After</th><th>Random units</th></tr></thead><tbody>
-      ${m.leads.map((r) => `<tr><td>${esc(r.prompt.slice(-90))} <span class="dim">→ ${esc(vis(r.token))}</span></td><td>${pr(r.before)}</td>
+      ${m.leads.map((r) => `<tr><td>${r.source === "check" ? `<span class="kind">check</span>` : ""}${esc(r.prompt.slice(-90))} <span class="dim">→ ${esc(vis(r.token))}</span></td><td>${pr(r.before)}</td>
         <td class="${r.gone ? "gone" : "still"}">${pr(r.after)}${r.gone ? ` <span class="dim">now “${esc(vis(r.after.top))}”</span>` : ""}</td><td>${pr(r.control)}</td></tr>`).join("")}
       </tbody></table></details>
     ${m.keep.length ? `<details class="fl-details" open><summary>Facts to keep and your checks</summary>
@@ -259,7 +274,7 @@ function bind(body) {
   body.querySelector("#fl-example")?.addEventListener("click", () => { Object.assign(F, EXAMPLE); render(); });
   body.querySelector("#fl-typed")?.addEventListener("click", () => { F.source = null; F.target = null; render(); });
   body.querySelector("#fl-find")?.addEventListener("click", find);
-  body.querySelectorAll("[data-goto]").forEach((b) => { b.onclick = () => goto(b.dataset.goto); });
+  body.querySelectorAll("[data-goto]").forEach((b) => { b.onclick = () => goto(b.dataset.goto); b.disabled = !!F.busy; });
   const k = body.querySelector("#fl-k");
   if (k) {
     k.oninput = () => {

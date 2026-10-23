@@ -26,6 +26,7 @@ request runs while units are knocked out.
 from __future__ import annotations
 
 import math
+import re
 import time
 from dataclasses import dataclass
 
@@ -88,7 +89,7 @@ def fact(recorder, body: dict) -> Fact:
         except ValueError:
             question = None
         return Fact(ids, tid, s.tokenizer.decode([tid]).strip() or s.token_str(tid),
-                    s.tokenizer.decode(ids[-24:], skip_special_tokens=True).strip(), question,
+                    _clean(s.tokenizer.decode(ids[-24:], skip_special_tokens=False)), question,
                     {"run": run.id, "t": t, "target": tid})
     prompt, answer = str(body.get("prompt") or "").rstrip(), str(body.get("answer") or "").strip()
     if not prompt.strip() or not answer:
@@ -205,6 +206,12 @@ def _random_units(an, units: list[int], seed: int) -> list[int]:
     return sorted(int(g) for g in pick)
 
 
+def _clean(label: str) -> str:
+    """A check's label without chat-template markers."""
+    label = re.sub(r"<\|[^|>]*\|>\s*(?:system|user|assistant)?|</?think>", " ", label)
+    return re.sub(r"\s+", " ", label).strip(" …")
+
+
 def _keep_rows(recorder, keep, include_checks: bool) -> list[dict]:
     s, tr = recorder.s, recorder.tracer
     rows = []
@@ -214,7 +221,7 @@ def _keep_rows(recorder, keep, include_checks: bool) -> list[dict]:
                      "target": workbench.answer_token(s, lead, answer)})
     if include_checks:
         for c in workbench.list_checks(recorder):
-            row = {"label": c["label"], "source": "check", "target": c["target"]}
+            row = {"label": _clean(c["label"]), "source": "check", "target": c["target"]}
             try:
                 row["ids"] = workbench._check_ids(s, c) if c["kind"] == "text" else tr.context(tr._run(c["run"]), c["t"])[0]
             except (KeyError, ValueError) as exc:
@@ -274,7 +281,21 @@ def forget_measure(recorder, body: dict) -> dict:
     f = fact(recorder, body)
     units = tr.check_units(body.get("units"))
     leads = _leads(s, f, body.get("leads"))
-    keep = _keep_rows(recorder, body.get("keep"), bool(body.get("checks", True)))
+    for ld in leads:
+        ld["source"] = "lead"
+    # A saved check that asks for the same answer is another way of asking for the fact, not a fact
+    # to keep; and the same context with the same answer is measured once.
+    seen, keep = {(tuple(ld["ids"]), ld["target"]) for ld in leads}, []
+    for k in _keep_rows(recorder, body.get("keep"), bool(body.get("checks", True))):
+        key = (tuple(k["ids"]), k["target"]) if k.get("ids") else None
+        if key in seen:
+            continue
+        if key and k["source"] == "check" and k["target"] == f.target:
+            leads.append({"text": k["label"], "ids": k["ids"], "target": k["target"], "source": "check"})
+        else:
+            keep.append(k)
+        if key:
+            seen.add(key)
     controls = [_random_units(tr.an, units, seed) for seed in range(CONTROL_SEEDS)]
     t0 = time.perf_counter()
     with tr._model():
@@ -283,7 +304,7 @@ def forget_measure(recorder, body: dict) -> dict:
             before = _read(s, tr.last_logits(ld["ids"]), ld["target"])
             after = _read(s, tr.last_logits(ld["ids"], units), ld["target"])
             ctrl = [_read(s, tr.last_logits(ld["ids"], cu), ld["target"]) for cu in controls]
-            lead_rows.append({"prompt": ld["text"], "token": s.token_str(ld["target"]),
+            lead_rows.append({"prompt": ld["text"], "source": ld["source"], "token": s.token_str(ld["target"]),
                               "before": before, "after": after, "gone": gone(before, after),
                               "control": {"prob": round(sum(c["prob"] for c in ctrl) / len(ctrl), 5),
                                           "rank": int(np.median([c["rank"] for c in ctrl]))},
