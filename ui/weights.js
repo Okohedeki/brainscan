@@ -782,7 +782,7 @@ function pathAction(act) {
     if (!units.length || A.cursor == null) return;
     if (A.mode !== "attr") setMode("attr");
     openTokenPanel();
-    runKnockout(units.slice(0, 64), `${Math.min(units.length, 64)} units on ${shown.length} shown path${shown.length === 1 ? "" : "s"}`);
+    knockOutSet(units, `units on ${shown.length} shown path${shown.length === 1 ? "" : "s"}`);
   }
   else if (act === "copy") {
     const data = shown.map((p) => ({ path: p.units.map(shortName), units: p.units, score: +p.score.toFixed(5),
@@ -1040,7 +1040,7 @@ async function renderTokenPanel() {
   $("#tp-trace-on")?.addEventListener("click", () => { A.traceOn = true; updateTrace(); renderTokenPanel(); });
   $("#tp-circuit").onclick = () => openPaths("explain");
   $("#tp-ko-top").onclick = () => runKnockout(topUnits(info, 5, true), "top 5 units that pushed it up");
-  $("#tp-ko-sel")?.addEventListener("click", () => runKnockout([...A.sel], `${A.sel.size} selected units`));
+  $("#tp-ko-sel")?.addEventListener("click", () => knockOutSet([...A.sel], "selected units"));
   $("#tp-add-check").onclick = addCheckFromToken;
   $("#tp-copy").onclick = () => navigator.clipboard?.writeText(JSON.stringify(traceJson(info, lens), null, 2));
   renderKnockouts();
@@ -1173,6 +1173,18 @@ async function runKnockout(units, label) {
   }
   item.pending = false;
   if (A.koKey === key) renderKnockouts();
+}
+
+const MAX_KO = 64;  // the most units one knockout removes (MAX_KNOCKOUT in recorder/tracing.py)
+
+/** Knock out a set of units. Past the limit, the ones with the largest direct effect on the token
+ * are kept, and the label says how many of the set were removed. */
+function knockOutSet(units, what) {
+  if (!units.length) return;
+  if (units.length <= MAX_KO) { runKnockout(units, `${units.length} ${what}`); return; }
+  const c = A.attrInfo?.t === A.cursor ? A.attrInfo.contrib : null;
+  const kept = c ? [...units].sort((a, b) => Math.abs(c[b]) - Math.abs(c[a])).slice(0, MAX_KO) : units.slice(0, MAX_KO);
+  runKnockout(kept, `${MAX_KO} of ${units.length} ${what}${c ? ", the largest direct effects" : ""}`);
 }
 
 /** Remove a knockout's units from the weights for real: one grouped edit, applied now. */
@@ -1938,7 +1950,7 @@ function setupInput() {
   $("#gv-selko").onclick = () => {
     if (A.mode !== "attr") setMode("attr");
     openTokenPanel();
-    runKnockout([...A.sel].slice(0, 64), `${A.sel.size} selected units`);
+    knockOutSet([...A.sel], "selected units");
   };
   $("#gv-paths-btn").onclick = () => (A.pathsOpen ? closePaths() : openPaths());
   $("#gv-paths-close").onclick = closePaths;

@@ -242,6 +242,21 @@ Hardware report and disk estimates:
 wsl -e bash scripts/run.sh -m brainscan.hardware
 ```
 
+### Demo videos
+
+`scripts/demo/` records product videos of the running UI: a headless Chrome is driven over the
+DevTools protocol through scripted scenes (an on-screen cursor, captions and title cards; captions
+quote the numbers the app shows), and ffmpeg joins the frames into 1080p MP4s. It runs on the
+Windows side with Node 22+, against a recorder serving Qwen3.5-9B. The scenes change the
+recorder's state (a chat, a weight edit, checks, steering), so record on a scratch setup:
+
+```bash
+node scripts/demo/recorder.mjs C:/Temp/brainscan-demos
+```
+
+Name scenes after the folder to record only those (`01-overview` … `09-directions-and-steering`).
+`CHROME`, `FFMPEG` and `BRAINSCAN_URL` override the defaults.
+
 ### Switching models
 
 Click the model name in the top bar to see every open-weights model already on this machine and
@@ -339,6 +354,7 @@ brainscan/hardware.py Phase 0 hardware report
 ui/                   Watch (app.js, models.js, chat.js), Trace (graph.js, weights.js, paths.js),
                       Tune (workbench.js) and the guide (guide.js): plain HTML, CSS and canvas
                       JavaScript; no build step
+scripts/demo/         product-video recorder (headless Chrome + ffmpeg) and its scenes
 reports/              research reports
 tests/                unit tests (pytest)
 ```
