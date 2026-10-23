@@ -32,16 +32,26 @@ const EXAMPLE = {
 
 const F = {
   step: "goal", source: null, prompt: "", answer: "", leads: "", questions: "", keep: "", checks: true,
-  target: null, k: 1, tried: null, measured: null, kept: null, busy: null, msg: null,
+  target: null, ranking: "direct", k: 1, tried: null, measured: null, kept: null, busy: null, msg: null,
 };
 
 function reset(source = null) {
   Object.assign(F, { step: "goal", source, prompt: "", answer: "", leads: "", questions: "", keep: "", checks: true,
-    target: null, k: 1, tried: null, measured: null, kept: null, busy: null, msg: null });
+    target: null, ranking: "direct", k: 1, tried: null, measured: null, kept: null, busy: null, msg: null });
   if (source?.question) F.questions = source.question;
 }
 
-const units = () => (F.target?.units || []).slice(0, F.k).map((u) => u.g);
+// Target ranks the units two ways: "direct" (what they wrote toward the answer) and, with facts to
+// keep, "specific" (toward the answer more than toward any fact to keep, added only while every fact
+// to keep is spared). The chosen ranking and size are what Try, Measure and Keep use.
+const RANKINGS = { direct: "Most direct", specific: "Most specific" };
+const ranking = () => F.target?.rankings[F.ranking] || F.target?.rankings.direct;
+const units = () => (ranking()?.units || []).slice(0, F.k).map((u) => u.g);
+const pick = () => `${F.ranking}:${F.k}`;
+const plural = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+// The same test as Measure's verdict: lost first place, or more than 0.2 of its probability.
+const broke = (before, after) => (before.rank === 1 && after.rank > 1) || before.prob - after.prob > 0.2;
+const shortLabel = (label) => cleanText(label).split("→").pop().trim() || cleanText(label);
 const answerText = () => F.target?.fact.answer || (F.source ? F.source.word?.trim() : F.answer.trim()) || "the answer";
 function factBody() {
   const fact = F.source ? { run: F.source.run, t: F.source.t, target: F.source.target } : { prompt: F.prompt, answer: F.answer };
@@ -113,7 +123,7 @@ function summaryHtml() {
   if (!F.target) return "";
   const f = F.target.fact;
   return `<span class="sum-chip"><span class="lbl">Fact</span>…${esc(f.lead.slice(-50))} → <b>${esc(f.answer)}</b></span>
-    <span class="sum-chip"><span class="lbl">Units</span>${F.k} of ${F.target.units.length} ranked</span>
+    <span class="sum-chip"><span class="lbl">Units</span>${F.k} of ${ranking().units.length} ${F.target.rankings.specific ? esc(RANKINGS[F.ranking].toLowerCase()) : "ranked"}</span>
     ${F.target.weights_edited ? `<span class="sum-chip warn"><span class="lbl">Weights</span>already edited: measured on top of your applied edits</span>` : ""}`;
 }
 
@@ -139,17 +149,61 @@ function goalHtml() {
   <div class="fl-actions"><button type="button" class="primary" id="fl-find" ${F.busy ? "disabled" : ""}>Find where it lives →</button></div>`;
 }
 
-function curveHtml() {
-  const t = F.target;
-  return `<ul class="curve">${t.curve.map((p) => `<li data-k="${p.k}" class="${p.k === t.suggested ? "sugg" : ""} ${p.k === F.k ? "sel" : ""}" title="Knock out the top ${p.k}">
-      <span class="k">${p.k} unit${p.k === 1 ? "" : "s"}</span>
+/** The facts to keep that broke with a curve point's units knocked out. */
+const lostAt = (p) => F.target.keep.filter((k, i) => p.keep[i] && broke(k, p.keep[i]));
+
+function keepCell(p) {
+  const keep = F.target.keep;
+  if (!keep.length) return "";
+  const lost = lostAt(p);
+  const tip = keep.map((k, i) => `${shortLabel(k.label)}: ${fmtP(k.prob)} → ${fmtP(p.keep[i]?.prob)}`).join("\n");
+  return `<span class="kc ${lost.length ? "bad" : "ok"}" title="${esc(tip)}">${lost.length
+    ? `breaks ${esc(lost.map((k) => shortLabel(k.label)).join(", "))}` : `spares ${keep.length === 1 ? "the fact" : `all ${keep.length}`} to keep`}</span>`;
+}
+
+function curveHtml(name) {
+  const r = F.target.rankings[name], on = name === F.ranking;
+  return `<ul class="curve">${r.curve.map((p) => `<li data-rank="${name}" data-k="${p.k}" class="${p.k === r.suggested ? "sugg" : ""} ${on && p.k === F.k ? "sel" : ""}" title="Knock out the top ${p.k}">
+      <span class="k">${plural(p.k, "unit")}</span>
       <span class="pbar"><i style="width:${Math.max(1, p.prob * 100).toFixed(1)}%"></i></span>
       <span class="v">p ${fmtP(p.prob)}</span>
-      <span class="dim">${p.gone ? `gone: now answers <b>${esc(vis(p.top))}</b>` : p.rank === 1 ? "still its first answer" : `still #${p.rank}`}</span></li>`).join("")}</ul>`;
+      <span class="st"><span class="dim">${p.gone ? `gone: now answers <b>${esc(vis(p.top))}</b>` : p.rank === 1 ? "still its first answer" : `still #${p.rank}`}</span>${keepCell(p)}</span></li>`).join("")}</ul>`;
+}
+
+/** One line on a ranking: how many units remove the answer, and what that costs the facts to keep. */
+function rankLine(name) {
+  const r = F.target.rankings[name];
+  if (!r.units.length) return "Every unit that pushes the answer pushes a fact to keep as much, or hurts one.";
+  const p = r.curve.find((x) => x.k === r.suggested) || r.curve[r.curve.length - 1];
+  const lost = lostAt(p);
+  return `${r.flipped ? `${plural(r.suggested, "unit")} remove it` : `${plural(p.k, "unit")} don't remove it`}${F.target.keep.length
+    ? (lost.length ? `, and ${esc(lost.map((k) => shortLabel(k.label)).join(", "))} break${lost.length === 1 ? "s" : ""}` : ", and every fact to keep is spared") : ""}.`;
+}
+
+function rankingsHtml() {
+  const t = F.target, spec = t.rankings.specific;
+  if (!spec) {
+    return `<h3>How many units it takes</h3>${curveHtml("direct")}
+      ${t.keep.length ? "" : `<p class="hint">Add facts to keep in Goal to also rank the units by how specific they are to this answer.</p>`}`;
+  }
+  const skipped = spec.skipped.length
+    ? ` <span title="${esc(spec.skipped.map((u) => u.name).join(", "))}">Skipped ${plural(spec.skipped.length, "unit")} that hurt a fact to keep.</span>` : "";
+  const col = (name, how) => {
+    const r = t.rankings[name], on = name === F.ranking;
+    return `<div class="rank-col ${on ? "on" : ""}">
+      <button type="button" class="rank-head" data-rank="${name}" aria-pressed="${on}" ${r.units.length ? "" : "disabled"}>
+        <b>${RANKINGS[name]}</b><span class="rank-line">${rankLine(name)}</span><span class="dim">${how}</span></button>
+      ${r.units.length ? curveHtml(name) : ""}</div>`;
+  };
+  return `<h3>How many units it takes, ranked two ways</h3>
+    <div class="rank-cols">
+      ${col("direct", "By how much each unit wrote toward the answer.")}
+      ${col("specific", `By how much more it wrote toward the answer than toward any fact to keep, each added only if every fact to keep keeps first place and ${Math.round(spec.guard * 100)}% of its probability.${skipped}`)}
+    </div>`;
 }
 
 function kSlider() {
-  const n = F.target.units.length;
+  const n = ranking().units.length;
   return `<div class="fl-k"><label for="fl-k">Units to remove</label>
     <input type="range" id="fl-k" min="1" max="${n}" step="1" value="${F.k}"><b id="fl-kv">${F.k}</b>
     <span class="dim">of ${n} ranked</span></div>`;
@@ -159,19 +213,19 @@ function targetHtml() {
   const t = F.target, f = t.fact;
   const alts = f.alternatives.filter((a) => a.text !== f.token).slice(0, 4)
     .map((a) => `<span class="chip">${esc(vis(a.text))} <span class="dim">${fmtP(a.prob)}</span></span>`).join("");
-  const last = t.curve[t.curve.length - 1];
+  const r = ranking(), last = r.curve[r.curve.length - 1];
   return `<p class="fl-lead">After <q>…${esc(f.lead.slice(-80))}</q> the model answers <span class="tok-chip target">${esc(vis(f.token))}</span>
       with probability <b>${fmtP(f.prob)}</b>${f.rank > 1 ? ` (ranked #${f.rank})` : ""}.</p>
     ${f.first ? "" : `<div class="verdict partial">After this lead-in the model's first answer is “${esc(vis(f.alternatives[0]?.text))}”, not “${esc(f.answer)}”:
       it isn't stating this fact here. Pick a lead-in it answers with “${esc(f.answer)}” first, or start from a word in a chat. Here, “gone” means under a tenth of its probability.</div>`}
     ${alts ? `<div class="chips"><span class="lbl">also considered</span>${alts}</div>` : ""}
-    <h3>How many units it takes</h3>${curveHtml()}
-    <p class="hint">${t.flipped
-      ? `Suggested: <b>${t.suggested} unit${t.suggested === 1 ? "" : "s"}</b>, the smallest set here after which the model no longer gives “${esc(f.answer)}”.`
+    ${rankingsHtml()}
+    <p class="hint">${r.flipped
+      ? `Suggested${t.rankings.specific ? ` (${esc(RANKINGS[F.ranking].toLowerCase())})` : ""}: <b>${plural(r.suggested, "unit")}</b>, the smallest set here after which the model no longer gives “${esc(f.answer)}”.`
       : `Even ${last.k} units don't remove it: the answer is spread widely, or other units take over. You can still try.`}
-      Units are ranked by how much they wrote toward the answer; each row removes the top ones together.</p>
+      Each row removes the top units together${t.keep.length ? " and reads the facts to keep with them removed" : ""}. Measure judges the set you pick.</p>
     ${kSlider()}
-    <div class="unit-chips">${t.units.map((u, i) => `<span class="uchip ${u.kind} ${i < F.k ? "on" : ""}" title="${u.kind === "head" ? "attention head" : "MLP neuron cluster"} · wrote ${u.direct >= 0 ? "+" : ""}${u.direct} toward the answer">${esc(u.name)}</span>`).join("")}</div>
+    <div class="unit-chips">${r.units.map((u, i) => `<span class="uchip ${u.kind} ${i < F.k ? "on" : ""}" title="${u.kind === "head" ? "attention head" : "MLP neuron cluster"} · wrote ${u.direct >= 0 ? "+" : ""}${u.direct} toward the answer${u.keep != null ? `, up to +${u.keep} toward a fact to keep` : ""}">${esc(u.name)}</span>`).join("")}</div>
     ${F.source ? `<button type="button" class="link" id="fl-why">See the trace behind this word →</button>` : ""}
     <div class="fl-actions"><button type="button" class="btn" data-goto="goal">← Goal</button>
       <button type="button" class="primary" data-goto="try">Try it →</button></div>`;
@@ -187,7 +241,7 @@ function highlight(text) {
 
 function tryHtml() {
   const r = F.tried;
-  const stale = r && r.k !== F.k;
+  const stale = r && r.pick !== pick();
   const rows = r ? r.rows.map((x) => `<tr><td><span class="kind">${x.kind === "lead" ? "lead-in" : "question"}</span>${esc(x.prompt.slice(-120))}</td>
       <td>${highlight(x.original)}${x.said_before ? "" : ` <span class="dim small">(didn't say it)</span>`}</td>
       <td class="${x.says_now ? "still" : "gone"}">${highlight(x.edited)}
@@ -196,7 +250,7 @@ function tryHtml() {
     ${r ? `<table class="try-table${stale ? " stale" : ""}"><thead><tr><th>Asked</th><th>Original</th><th>Without the ${r.units} unit${r.units === 1 ? "" : "s"}</th></tr></thead><tbody>${rows}</tbody></table>`
       : `<p class="empty">Running both versions…</p>`}
     <p class="hint">The same prompts, greedy, with and without the units. Nothing is changed in the weights yet.
-      ${stale ? "<b>You changed the number of units: run it again.</b>" : ""}</p>
+      ${stale ? "<b>You changed the units: run it again.</b>" : ""}</p>
     <div class="fl-actions"><button type="button" class="btn" data-goto="target">← Target</button>
       <button type="button" class="btn" id="fl-rerun" ${F.busy ? "disabled" : ""}>Run again</button>
       <button type="button" class="primary" data-goto="measure">Measure it →</button></div>`;
@@ -208,14 +262,14 @@ const pr = (x) => (x ? `${fmtP(x.prob)} <span class="dim">#${x.rank}</span>` : "
 function measureHtml() {
   const m = F.measured;
   if (!m) return `<p class="empty">Measuring…</p><div class="skeleton"></div><div class="skeleton tall"></div>`;
-  const stale = m.k !== F.k;
+  const stale = m.pick !== pick();
   const n = m.leads.length, gone = m.leads.filter((r) => r.gone).length;
   const ctrlGone = m.leads.filter((r) => r.control_gone >= 0.5).length;
   const main = m.leads[0];
   const kept = m.keep.filter((k) => k.before);
-  const broken = kept.filter((k) => (k.before.rank === 1 && k.after.rank > 1) || k.before.prob - k.after.prob > 0.2);
+  const broken = kept.filter((k) => broke(k.before, k.after));
   const d = m.drift;
-  return `<div class="verdict ${m.verdict.status}">${esc(m.verdict.text)}${stale ? " <b>(measured with a different number of units: measure again.)</b>" : ""}</div>
+  return `<div class="verdict ${m.verdict.status}">${esc(m.verdict.text)}${stale ? " <b>(measured with different units: measure again.)</b>" : ""}</div>
     <div class="tiles">
       ${tile("The fact", `gone after ${gone} of ${n}`, `main lead-in p ${fmtP(main.before.prob)} → ${fmtP(main.after.prob)}${main.gone ? `, now “${esc(vis(main.after.top))}”` : ""}`, gone === n ? "good" : gone ? "warn" : "bad")}
       ${tile(`Random units (${m.control.units}, ${m.control.seeds} sets)`, ctrlGone ? `removed it on ${ctrlGone} of ${n}` : "left it alone", `main lead-in p ${fmtP(main.before.prob)} → ${fmtP(main.control.prob)}`, ctrlGone ? "bad" : "good")}
@@ -241,7 +295,7 @@ function measureHtml() {
 }
 
 function keepHtml() {
-  const names = (F.target?.units || []).slice(0, F.k).map((u) => u.name);
+  const names = (ranking()?.units || []).slice(0, F.k).map((u) => u.name);
   if (F.kept) {
     return `<div class="verdict works">Done: the ${names.length} unit${names.length === 1 ? "" : "s"} behind “${esc(answerText())}” are removed from the weights, and the edit is applied now.</div>
       <p class="hint">${F.kept.checks ? `Saved ${F.kept.checks} behavior check${F.kept.checks === 1 ? "" : "s"}; they show before → after on every edit from now on. ` : ""}
@@ -251,11 +305,11 @@ function keepHtml() {
         <button type="button" class="btn" id="fl-revert">Restore original weights</button>
         <button type="button" class="link" id="fl-home">Back to all actions</button></div>`;
   }
-  const m = F.measured, measuredHere = m && m.k === F.k;
+  const m = F.measured, measuredHere = m && m.pick === pick();
   return `<p class="fl-lead">Remove these ${names.length} unit${names.length === 1 ? "" : "s"} from the weights:</p>
     <div class="unit-chips">${names.map((n) => `<span class="uchip on">${esc(n)}</span>`).join("")}</div>
     ${measuredHere ? `<div class="verdict ${m.verdict.status}">${esc(m.verdict.text)}</div>`
-      : `<div class="verdict kept">Not measured with ${names.length} unit${names.length === 1 ? "" : "s"} yet. Measure before keeping it.</div>`}
+      : `<div class="verdict kept">Not measured with these ${plural(names.length, "unit")} yet. Measure before keeping it.</div>`}
     <p class="hint">Their output weights are set to zero, as one edit in your model's stack, applied now. Nothing on disk changes until you export,
       and the original weights can be restored exactly at any time.</p>
     <label class="check"><input type="checkbox" id="fl-save-keep" ${parseKeep(F.keep).length ? "checked" : "disabled"}> Save the facts to keep as behavior checks</label>
@@ -281,12 +335,15 @@ function bind(body) {
       F.k = Number(k.value);
       body.querySelector("#fl-kv").textContent = F.k;
       body.querySelectorAll(".unit-chips .uchip").forEach((c, i) => c.classList.toggle("on", i < F.k));
-      body.querySelectorAll(".curve li").forEach((li) => li.classList.toggle("sel", Number(li.dataset.k) === F.k));
+      body.querySelectorAll(".curve li").forEach((li) => li.classList.toggle("sel", li.dataset.rank === F.ranking && Number(li.dataset.k) === F.k));
       $("#fl-summary").innerHTML = summaryHtml();
     };
     k.onchange = () => { if (F.step === "try") runTry(); };
   }
-  body.querySelectorAll(".curve li[data-k]").forEach((li) => { li.onclick = () => { F.k = Number(li.dataset.k); render(); }; });
+  body.querySelectorAll(".curve li[data-k]").forEach((li) => { li.onclick = () => { F.ranking = li.dataset.rank; F.k = Number(li.dataset.k); render(); }; });
+  body.querySelectorAll(".rank-head[data-rank]").forEach((b) => {
+    b.onclick = () => { if (F.ranking !== b.dataset.rank) { F.ranking = b.dataset.rank; F.k = ranking().suggested || 1; render(); } };
+  });
   body.querySelector("#fl-why")?.addEventListener("click", () => openRunInTrace(F.source.run, F.source.of));
   body.querySelector("#fl-rerun")?.addEventListener("click", runTry);
   body.querySelector("#fl-remeasure")?.addEventListener("click", runMeasure);
@@ -302,8 +359,8 @@ function goto(step) {
   if (!reachable(step) || F.busy) return;
   F.step = step; F.msg = null;
   render();
-  if (step === "try" && (!F.tried || F.tried.k !== F.k)) runTry();
-  if (step === "measure" && (!F.measured || F.measured.k !== F.k)) runMeasure();
+  if (step === "try" && (!F.tried || F.tried.pick !== pick())) runTry();
+  if (step === "measure" && (!F.measured || F.measured.pick !== pick())) runMeasure();
 }
 
 async function work(label, fn) {
@@ -318,22 +375,22 @@ function find() {
   }
   work("Finding the units behind the answer", async () => {
     F.target = await api("POST", "/brainscan/actions/forget/target", factBody());
-    F.k = F.target.suggested; F.tried = null; F.measured = null; F.kept = null;
+    F.ranking = F.target.ranking; F.k = ranking().suggested || 1; F.tried = null; F.measured = null; F.kept = null;
     F.step = "target";
   });
 }
 
 function runTry() {
-  const k = F.k;
-  return work(`Answering with and without ${k} unit${k === 1 ? "" : "s"}`, async () => {
-    F.tried = { ...(await api("POST", "/brainscan/actions/forget/try", { ...factBody(), units: units() })), k };
+  const k = F.k, p = pick();
+  return work(`Answering with and without ${plural(k, "unit")}`, async () => {
+    F.tried = { ...(await api("POST", "/brainscan/actions/forget/try", { ...factBody(), units: units() })), k, pick: p };
   });
 }
 
 function runMeasure() {
-  const k = F.k;
+  const k = F.k, p = pick();
   return work("Measuring: the fact, random units, facts to keep, neutral text", async () => {
-    F.measured = { ...(await api("POST", "/brainscan/actions/forget/measure", { ...factBody(), units: units() })), k };
+    F.measured = { ...(await api("POST", "/brainscan/actions/forget/measure", { ...factBody(), units: units() })), k, pick: p };
   });
 }
 

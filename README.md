@@ -80,9 +80,24 @@ The flow has five steps (`brainscan/recorder/actions.py`, `POST /brainscan/actio
 
 1. **Goal**: the fact, other lead-ins and questions to test it with, and facts it should keep
    (`lead-in → answer`, one per line). Saved behavior checks are measured too.
-2. **Target**: units are ranked by their direct effect on the answer at the lead-in's last token,
-   and the top 1, 2, 4 … 32 are knocked out together. The smallest set that knocks the answer off
-   first place is suggested; the slider picks any number.
+2. **Target**: units are ranked two ways, and the top 1, 2, 4 … 32 of each are knocked out
+   together. The smallest set that knocks the answer off first place is suggested; the slider
+   picks any number, and a click on either curve switches ranking.
+   - *Most direct*: by direct effect on the answer at the lead-in's last token.
+   - *Most specific* (with facts to keep or saved checks): each fact to keep is attributed the same
+     way at its own lead-in, and a unit scores its effect on the answer minus the most it pushes
+     any fact to keep. A greedy pass then adds units in that order, knocking out the set so far,
+     and skips any unit after which a fact to keep loses first place, more than 0.2 of its
+     probability, or half of it. Its curve includes the exact size at which the answer goes.
+
+   Every point on both curves also reads the facts to keep, so the curves show what each set
+   costs before Measure judges it. On Qwen3.5-9B, forgetting "Canberra" with Paris, Sydney and Au
+   to keep: the direct ranking needs 4 units after "The capital city of Australia is" (8 in a
+   chat) and breaks Paris (0.21 → 0.04) and Sydney (0.49 → 0.07; 0.03 in the chat). The specific
+   ranking needs 13 (12 in the chat) and keeps all three first (Paris 0.26, Sydney 0.56; 0.16
+   and 0.45 in the chat); the model then answers "Sydney". It is not free: Canberra stays second
+   (0.24, or 0.42 in the chat), the typed set leaves the chat question answered "Canberra", and
+   the larger set drifts neutral text more (KL 0.087 typed, 0.026 chat).
 3. **Try**: greedy answers with and without the units, for every lead-in and question. Nothing
    in the weights changes.
 4. **Measure**: the answer's probability before and after on every lead-in; the same number of

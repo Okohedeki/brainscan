@@ -17,7 +17,7 @@ const STEPS = [
   {
     view: "actions", n: "▶", title: "Act", lead: "Start from what you want to do to the model. Each action is tried and measured before anything is kept.",
     tools: [
-      { name: "Make it forget a fact", what: "Name a fact (a lead-in and the answer the model gives) or pick a word in Trace. Brainscan finds the units that carry it, shows answers with and without them, measures the fact against random units, facts to keep and neutral text, then removes the units from the weights if you keep it.", act: () => document.querySelector('#view-actions [data-act="forget"]')?.click() },
+      { name: "Make it forget a fact", what: "Name a fact (a lead-in and the answer the model gives) or pick a word in Trace. Brainscan finds the units that carry it, ranked two ways: the most direct, and, given facts it should keep, the most specific (units that push the answer more than any fact to keep, added only while every fact to keep survives). It shows answers with and without them, measures the fact against random units, facts to keep and neutral text, then removes the units from the weights if you keep it.", act: () => document.querySelector('#view-actions [data-act="forget"]')?.click() },
       { name: "Your model", what: "Every change made to the model, applied or not, with apply and restore. Export the edited model from Tune.", act: go("actions", () => document.querySelector(".act-ledger")?.scrollIntoView({ behavior: "smooth", block: "start" })) },
     ],
   },
