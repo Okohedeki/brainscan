@@ -8,7 +8,12 @@ Australia is" -> "Canberra"), typed, or a word the model wrote in a recorded run
            many it takes before the model no longer gives the answer. The smallest such set is
            suggested. "No longer gives it": the answer loses first place; for an answer that wasn't
            first to begin with, it keeps under a tenth of its probability (and the UI says the
-           model wasn't stating the fact after that lead-in).
+           model wasn't stating the fact after that lead-in). With facts to keep, a second, more
+           specific ranking: each fact to keep is attributed the same way, a unit scores its
+           effect on the answer minus the most it pushes any fact to keep, and a greedy pass adds
+           units in that order, knocking out the set so far, and skips any unit after which a fact
+           to keep broke or kept under half its probability. Every point on both curves reads the
+           facts to keep too.
   try      greedy answers with and without the units for every way of asking: lead-ins continued
            as text, and questions asked as chat (thinking off).
   measure  the answer's probability before and after on every lead-in; the same number of random
@@ -37,6 +42,9 @@ from . import workbench
 
 CURVE = (1, 2, 4, 8, 16, 32)   # set sizes tried when locating a fact
 CANDIDATES = 32                # units ranked for removal
+POOL = 64                      # units the specific ranking's greedy pass considers, best score first
+SPECIFIC_WEIGHT = 1.0          # how much a unit's push toward a fact to keep counts against it
+GUARD = 0.5                    # the greedy pass skips a unit that leaves a fact to keep under this share of its probability
 CONTROL_SEEDS = 3              # random unit sets per measurement
 MAX_LEADS, MAX_QUESTIONS, MAX_KEEP = 8, 4, 16
 LEAD_TOKENS, QUESTION_TOKENS = 20, 48
@@ -113,10 +121,24 @@ def gone(before: dict, after: dict) -> bool:
     return after["prob"] < before["prob"] * FADED
 
 
-def _unit(an, g: int, direct: float) -> dict:
+def broke(before: dict, after: dict) -> bool:
+    """A fact to keep broke: it lost first place, or more than BROKEN_DROP of its probability."""
+    return (before["rank"] == 1 and after["rank"] > 1) or before["prob"] - after["prob"] > BROKEN_DROP
+
+
+def spared(before: dict, after: dict, p0: float, p1: float) -> bool:
+    """The greedy pass's test for a fact to keep: it didn't break, and kept GUARD of its probability
+    (p0 before, p1 after, unrounded)."""
+    return not broke(before, after) and p1 >= GUARD * p0
+
+
+def _unit(an, g: int, direct: float, push: float | None = None) -> dict:
     lm, kind, i = an.locate(g)
-    return {"g": int(g), "name": f"L{lm.index} {'h' if kind == 'head' else 'c'}{i}", "kind": kind,
-            "layer": lm.index, "direct": round(float(direct), 4)}
+    out = {"g": int(g), "name": f"L{lm.index} {'h' if kind == 'head' else 'c'}{i}", "kind": kind,
+           "layer": lm.index, "direct": round(float(direct), 4)}
+    if push is not None:
+        out["keep"] = round(float(push), 4)
+    return out
 
 
 def _leads(s, f: Fact, extra) -> list[dict]:
@@ -131,26 +153,85 @@ def _leads(s, f: Fact, extra) -> list[dict]:
 
 # ---- target -------------------------------------------------------------------------------------
 
+def _point(s, tr, f: Fact, before: dict, keep: list[dict], units: list[int], reads: list[dict] | None = None) -> dict:
+    """The fact, and every fact to keep, with these units knocked out. The caller holds the model."""
+    after = _read(s, tr.last_logits(f.ids, units), f.target)
+    if reads is None:
+        reads = [_read(s, tr.last_logits(k["ids"], units), k["target"]) for k in keep]
+    return {"k": len(units), "gone": gone(before, after)} | after | {
+        "keep": reads, "broken": sum(broke(k["before"], r) for k, r in zip(keep, reads))}
+
+
+def _greedy(s, tr, f: Fact, before: dict, keep: list[dict], pool: list[int]) -> tuple[list[int], list[dict], list[int]]:
+    """Add the pool's units in order, knocking out the set so far, and skip any unit after which a
+    fact to keep isn't spared. The units taken, the point after each one, and the units skipped.
+    The caller holds the model."""
+    chosen, points, skipped = [], [], []
+    for g in pool:
+        if len(chosen) >= CANDIDATES:
+            break
+        trial, reads = chosen + [g], []
+        for k in keep:
+            logits = tr.last_logits(k["ids"], trial)
+            r = _read(s, logits, k["target"])
+            if not spared(k["before"], r, k["p"], float(torch.softmax(logits, -1)[k["target"]])):
+                break
+            reads.append(r)
+        if len(reads) < len(keep):
+            skipped.append(g)
+            continue
+        chosen = trial
+        points.append(_point(s, tr, f, before, keep, chosen, reads))
+    return chosen, points, skipped
+
+
+def _ranking(an, order: list[int], curve: list[dict], c: np.ndarray, push: np.ndarray | None, **extra) -> dict:
+    flip = next((p["k"] for p in curve if p["gone"]), None)
+    return {"units": [_unit(an, g, c[g], None if push is None else push[g]) for g in order], "curve": curve,
+            "suggested": flip or (curve[-1]["k"] if curve else 0), "flipped": flip is not None} | extra
+
+
 def forget_target(recorder, body: dict) -> dict:
-    """Rank the units that push the answer up, and how many it takes to knock it off first place."""
+    """Rank the units that push the answer up, and how many it takes to knock it off first place.
+
+    direct    by direct effect on the answer at the lead-in's last token.
+    specific  only with facts to keep (typed, or saved checks): each fact to keep is attributed at its
+              own lead-in's last token the same way; a unit scores its effect on the answer minus
+              SPECIFIC_WEIGHT x the most it pushes any fact to keep, and the greedy pass takes the
+              units in that order, skipping any that leave a fact to keep broken or under GUARD of
+              its probability. Its curve adds the exact size at which the answer goes.
+    """
     s, tr = recorder.s, recorder.tracer
     f = fact(recorder, body)
     t0 = time.perf_counter()
     cap = tr.capture_ids(f.ids)
-    contrib, _, _ = tr.attribute(cap, f.target)
-    c = contrib.cpu().numpy()
+    c = tr.attribute(cap, f.target)[0].cpu().numpy()
     ranked = [int(g) for g in np.argsort(-c) if c[g] > 0][:CANDIDATES]
     if not ranked:
         raise ValueError("no unit pushes this answer up, so there is nothing to remove")
     before = _read(s, cap.logits, f.target)
-    curve = []
+    keep = [k for k in _sort_keep(recorder, f, [{"ids": f.ids, "target": f.target}], body) if not k.get("error")]
+    push = np.zeros_like(c) if keep else None
+    for k in keep:
+        kcap = tr.capture_ids(k["ids"])
+        k["before"] = _read(s, kcap.logits, k["target"])
+        k["p"] = float(torch.softmax(kcap.logits, -1)[k["target"]])
+        push = np.maximum(push, tr.attribute(kcap, k["target"])[0].cpu().numpy())
     with tr._model():
-        for k in CURVE:
-            if k > len(ranked):
-                break
-            after = _read(s, tr.last_logits(f.ids, ranked[:k]), f.target)
-            curve.append({"k": k, "gone": gone(before, after)} | after)
-    flip = next((p["k"] for p in curve if p["gone"]), None)
+        curve = [_point(s, tr, f, before, keep, ranked[:k]) for k in CURVE if k <= len(ranked)]
+        rankings = {"direct": _ranking(tr.an, ranked, curve, c, push, seconds=round(time.perf_counter() - t0, 2)),
+                    "specific": None}
+        if keep:
+            t1 = time.perf_counter()
+            score = c - SPECIFIC_WEIGHT * push
+            pool = [int(g) for g in np.argsort(-score) if score[g] > 0][:POOL]
+            chosen, points, skipped = _greedy(s, tr, f, before, keep, pool)
+            flip = next((p["k"] for p in points if p["gone"]), None)
+            rankings["specific"] = _ranking(
+                tr.an, chosen, [p for p in points if p["k"] in CURVE or p["k"] == flip], c, push,
+                skipped=[_unit(tr.an, g, c[g], push[g]) for g in skipped], pool=len(pool),
+                weight=SPECIFIC_WEIGHT, guard=GUARD, seconds=round(time.perf_counter() - t1, 2))
+    spec = rankings["specific"]
     probs = torch.softmax(cap.logits, -1)
     top_p, top_i = probs.topk(5)
     return {
@@ -158,8 +239,9 @@ def forget_target(recorder, body: dict) -> dict:
                  "source": f.source, **before, "first": before["rank"] == 1,
                  "alternatives": [{"text": s.token_str(int(i)), "prob": round(float(p), 5)}
                                   for p, i in zip(top_p.tolist(), top_i.tolist())]},
-        "units": [_unit(tr.an, g, c[g]) for g in ranked],
-        "curve": curve, "suggested": flip or curve[-1]["k"], "flipped": flip is not None,
+        "keep": [{"label": k["label"], "source": k["source"], "token": s.token_str(k["target"])} | k["before"] for k in keep],
+        "rankings": rankings,
+        "ranking": "specific" if spec and spec["flipped"] else "direct",
         "weights_edited": bool(recorder.edits.applied),
         "seconds": round(time.perf_counter() - t0, 2),
     }
@@ -230,6 +312,24 @@ def _keep_rows(recorder, keep, include_checks: bool) -> list[dict]:
     return rows
 
 
+def _sort_keep(recorder, f: Fact, leads: list[dict], body: dict) -> list[dict]:
+    """The facts to keep, typed and (unless turned off) the saved checks. A saved check that asks for
+    the same answer is another way of asking for the fact, not a fact to keep: it is added to leads.
+    The same context with the same answer is read once."""
+    seen, keep = {(tuple(ld["ids"]), ld["target"]) for ld in leads}, []
+    for k in _keep_rows(recorder, body.get("keep"), bool(body.get("checks", True))):
+        key = (tuple(k["ids"]), k["target"]) if k.get("ids") else None
+        if key in seen:
+            continue
+        if key and k["source"] == "check" and k["target"] == f.target:
+            leads.append({"text": k["label"], "ids": k["ids"], "target": k["target"], "source": "check"})
+        else:
+            keep.append(k)
+        if key:
+            seen.add(key)
+    return keep
+
+
 @torch.no_grad()
 def _drift(recorder, units: list[int]) -> dict:
     """KL(intact || without the units) per token, and perplexity, on neutral reference text."""
@@ -254,8 +354,7 @@ def _drift(recorder, units: list[int]) -> dict:
 def _verdict(leads: list[dict], keep: list[dict], drift: dict) -> dict:
     n, n_gone = len(leads), sum(r["gone"] for r in leads)
     control = sum(r["control_gone"] for r in leads) / max(n, 1)
-    broken = [k for k in keep if k.get("before") and (
-        (k["before"]["rank"] == 1 and k["after"]["rank"] > 1) or k["before"]["prob"] - k["after"]["prob"] > BROKEN_DROP)]
+    broken = [k for k in keep if k.get("before") and broke(k["before"], k["after"])]
     kl = drift["kl_per_token"]
     if not n_gone:
         return {"status": "kept", "text": "The model still gives the answer. Remove more units, or pick a different fact."}
@@ -283,19 +382,7 @@ def forget_measure(recorder, body: dict) -> dict:
     leads = _leads(s, f, body.get("leads"))
     for ld in leads:
         ld["source"] = "lead"
-    # A saved check that asks for the same answer is another way of asking for the fact, not a fact
-    # to keep; and the same context with the same answer is measured once.
-    seen, keep = {(tuple(ld["ids"]), ld["target"]) for ld in leads}, []
-    for k in _keep_rows(recorder, body.get("keep"), bool(body.get("checks", True))):
-        key = (tuple(k["ids"]), k["target"]) if k.get("ids") else None
-        if key in seen:
-            continue
-        if key and k["source"] == "check" and k["target"] == f.target:
-            leads.append({"text": k["label"], "ids": k["ids"], "target": k["target"], "source": "check"})
-        else:
-            keep.append(k)
-        if key:
-            seen.add(key)
+    keep = _sort_keep(recorder, f, leads, body)
     controls = [_random_units(tr.an, units, seed) for seed in range(CONTROL_SEEDS)]
     t0 = time.perf_counter()
     with tr._model():

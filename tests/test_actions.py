@@ -7,6 +7,7 @@ units zeroed in the weights agree to float precision.
 
 from pathlib import Path
 
+import numpy as np
 import pytest
 import torch
 from fastapi.testclient import TestClient
@@ -61,24 +62,138 @@ def plain_prob(rec, ids, target):
 
 def test_target_ranks_units_and_matches_the_run_knockout(rec, clean):
     run, t, body = run_fact(rec)
-    res = actions.forget_target(rec, body)
-    directs = [u["direct"] for u in res["units"]]
+    res = actions.forget_target(rec, body | {"checks": False})
+    # No facts to keep: only the direct ranking.
+    assert res["rankings"]["specific"] is None and res["ranking"] == "direct" and res["keep"] == []
+    r = res["rankings"]["direct"]
+    directs = [u["direct"] for u in r["units"]]
     assert directs == sorted(directs, reverse=True) and all(d > 0 for d in directs)
-    assert len(res["units"]) <= actions.CANDIDATES
+    assert len(r["units"]) <= actions.CANDIDATES and "keep" not in r["units"][0]
     ex = rec.tracer.explain(run.id, t, target=str(body["target"]))
     assert res["fact"]["prob"] == pytest.approx(ex["target"]["prob"], abs=1e-5)
-    ks = [p["k"] for p in res["curve"]]
-    assert ks == sorted(ks) and ks[0] == 1
+    ks = [p["k"] for p in r["curve"]]
+    assert ks == sorted(ks) and ks[0] == 1 and set(ks) <= set(actions.CURVE)
     # The typed-prompt path and the run's own knockout agree on the same units.
-    for p in res["curve"][:3]:
-        units = [u["g"] for u in res["units"][:p["k"]]]
+    for p in r["curve"][:3]:
+        units = [u["g"] for u in r["units"][:p["k"]]]
         ko = rec.tracer.knockout(run.id, t, units, target=str(body["target"]))
         assert p["prob"] == pytest.approx(ko["after"]["prob"], abs=1e-5)
         assert p["rank"] == ko["after"]["rank"]
-    assert res["suggested"] in ks
-    if res["flipped"]:
-        assert next(p for p in res["curve"] if p["k"] == res["suggested"])["gone"]
+        assert p["keep"] == [] and p["broken"] == 0
+    assert r["suggested"] in ks
+    if r["flipped"]:
+        assert next(p for p in r["curve"] if p["k"] == r["suggested"])["gone"]
     assert res["fact"]["first"] == (res["fact"]["rank"] == 1)
+
+
+KEEP = "Grass is → green\nThe sky is → blue\nOne, two, → three"
+
+
+def keep_facts(rec):
+    s = rec.s
+    return [(workbench.prompt_ids(s, lead), workbench.answer_token(s, lead, answer))
+            for lead, answer in (actions._pair(line) for line in KEEP.splitlines())]
+
+
+def read(rec, ids, target, units=None):
+    """The reading _read gives, plus the unrounded probability the greedy pass's guard compares."""
+    logits = rec.tracer.last_logits(ids, units)
+    return actions._read(rec.s, logits, target) | {"p": float(torch.softmax(logits, -1)[target])}
+
+
+def spared(before, after):
+    return actions.spared(before, after, before["p"], after["p"])
+
+
+def effects(rec, f, keep):
+    """Each unit's direct effect on the fact, the most it pushes any fact to keep, and the order the
+    greedy pass walks the units in."""
+    tr = rec.tracer
+    c = tr.attribute(tr.capture_ids(f.ids), f.target)[0].cpu().numpy()
+    push = np.maximum(0, np.max([tr.attribute(tr.capture_ids(ids), tid)[0].cpu().numpy() for ids, tid in keep], 0))
+    score = c - actions.SPECIFIC_WEIGHT * push
+    return c, push, [int(g) for g in np.argsort(-score) if score[g] > 0][:actions.POOL]
+
+
+def test_specific_ranking_attributes_the_facts_to_keep(rec, clean, monkeypatch):
+    _, _, body = run_fact(rec)
+    tr, f = rec.tracer, actions.fact(rec, body)
+    attributed = []
+    attribute = tr.attribute
+    monkeypatch.setattr(tr, "attribute", lambda cap, tid: attributed.append((tuple(cap.ids), tid)) or attribute(cap, tid))
+    res = actions.forget_target(rec, body | {"keep": KEEP, "checks": False})
+    keep = keep_facts(rec)
+    # The fact, then each fact to keep, attributed at its own lead-in's last token.
+    assert attributed == [(tuple(f.ids), f.target)] + [(tuple(ids), tid) for ids, tid in keep]
+    assert [k["label"] for k in res["keep"]] == ["Grass is → green", "The sky is → blue", "One, two, → three"]
+    with tr._model():
+        for k, (ids, tid) in zip(res["keep"], keep):
+            assert k["prob"] == pytest.approx(read(rec, ids, tid)["prob"], abs=1e-5)
+    # A unit's push toward the facts to keep is the most it pushes any of them, never below zero.
+    monkeypatch.undo()
+    c, push, pool = effects(rec, f, keep)
+    spec, direct = res["rankings"]["specific"], res["rankings"]["direct"]
+    for u in direct["units"] + spec["units"] + spec["skipped"]:
+        assert u["direct"] == pytest.approx(c[u["g"]], abs=1e-3) and u["keep"] == pytest.approx(push[u["g"]], abs=1e-3)
+    assert push.min() >= 0 and push.max() > 0
+    # The greedy pass walks the units in order of effect minus push, taking or skipping each.
+    taken, skipped = [u["g"] for u in spec["units"]], {u["g"] for u in spec["skipped"]}
+    walked = sorted(taken + list(skipped), key=pool.index)
+    assert walked == pool[:len(walked)] and spec["pool"] == len(pool)
+    assert taken == [g for g in walked if g not in skipped]
+    assert all(c[g] - actions.SPECIFIC_WEIGHT * push[g] > 0 for g in walked)
+
+
+def test_specific_ranking_spares_the_facts_to_keep(rec, clean, monkeypatch):
+    _, _, body = run_fact(rec)
+    f, keep = actions.fact(rec, body), keep_facts(rec)
+    # A strict guard makes the greedy pass skip units on the tiny model too.
+    monkeypatch.setattr(actions, "GUARD", 0.97)
+    res = actions.forget_target(rec, body | {"keep": KEEP, "checks": False})
+    spec = res["rankings"]["specific"]
+    assert spec["guard"] == 0.97 and spec["skipped"]
+    units = [u["g"] for u in spec["units"]]
+    _, _, pool = effects(rec, f, keep)
+    with rec.tracer._model():
+        befores = [read(rec, ids, tid) for ids, tid in keep]
+        fact_before = read(rec, f.ids, f.target)
+        for p in spec["curve"]:
+            # Every point reads the fact and the facts to keep with the first k units knocked out.
+            assert p["prob"] == pytest.approx(read(rec, f.ids, f.target, units[:p["k"]])["prob"], abs=1e-5)
+            for b, r, (ids, tid) in zip(befores, p["keep"], keep):
+                now = read(rec, ids, tid, units[:p["k"]])
+                assert r["prob"] == pytest.approx(now["prob"], abs=1e-5) and r["rank"] == now["rank"]
+                assert spared(b, now) and now["p"] >= 0.97 * b["p"]
+            assert p["broken"] == 0 and p["gone"] == actions.gone(fact_before, p)
+        # Each skipped unit hurt a fact to keep when added to the units taken before it.
+        for u in spec["skipped"][:3]:
+            taken = [x for x in units if pool.index(x) < pool.index(u["g"])]
+            assert not all(spared(b, read(rec, ids, tid, taken + [u["g"]])) for b, (ids, tid) in zip(befores, keep))
+    ks = [p["k"] for p in spec["curve"]]
+    assert ks == sorted(ks) and all(k in actions.CURVE or k == spec["suggested"] for k in ks)
+    if spec["flipped"]:
+        # The exact smallest set: one fewer unit still gives the answer.
+        assert spec["suggested"] in ks and next(p for p in spec["curve"] if p["k"] == spec["suggested"])["gone"]
+        with rec.tracer._model():
+            assert not actions.gone(fact_before, read(rec, f.ids, f.target, units[:spec["suggested"] - 1] or None))
+    assert res["ranking"] == ("specific" if spec["flipped"] else "direct")
+    # The direct curve reads the facts to keep at every point too.
+    assert all(len(p["keep"]) == len(keep) for p in res["rankings"]["direct"]["curve"])
+
+
+def test_target_sorts_saved_checks_like_measure(rec, clean):
+    _, _, body = run_fact(rec)
+    f = actions.fact(rec, body)
+    workbench.add_check(rec, {"prompt": "The sky is", "expect": "blue"})
+    workbench.add_check(rec, body)  # the fact itself: not a fact to keep
+    checks = workbench.list_checks(rec)
+    checks.append({"kind": "text", "prompt": "Roses are", "expect": "x", "chat": False, "target": f.target,
+                   "target_text": "x", "label": "Roses are → x", "id": "samefact"})
+    workbench._save_checks(rec, checks)
+    res = actions.forget_target(rec, body | {"keep": "The sky is → blue\nGrass is → green"})
+    # The typed sky fact and the saved sky check are one fact; checks asking for the answer are leads.
+    assert [(k["label"], k["source"]) for k in res["keep"]] == [("The sky is → blue", "typed"), ("Grass is → green", "typed")]
+    assert actions.forget_target(rec, body | {"keep": "", "checks": True})["keep"][0]["source"] == "check"
 
 
 def test_typed_fact_reads_like_a_check(rec, clean):
@@ -94,7 +209,7 @@ def test_typed_fact_reads_like_a_check(rec, clean):
 
 def test_try_answers_with_and_without_the_units(rec, clean):
     _, _, body = run_fact(rec)
-    units = [u["g"] for u in actions.forget_target(rec, body)["units"][:4]]
+    units = [u["g"] for u in actions.forget_target(rec, body)["rankings"]["direct"]["units"][:4]]
     res = actions.forget_try(rec, body | {"units": units, "leads": "Violets are", "questions": ["Name a color."]})
     assert [r["kind"] for r in res["rows"]] == ["lead", "lead", "question"]
     ids = workbench.prompt_ids(rec.s, "Violets are")
@@ -124,7 +239,7 @@ def test_random_controls_match_the_set(rec):
 
 def test_measure_then_keep_gives_what_was_measured(rec, clean):
     _, _, body = run_fact(rec)
-    units = [u["g"] for u in actions.forget_target(rec, body)["units"][:4]]
+    units = [u["g"] for u in actions.forget_target(rec, body)["rankings"]["direct"]["units"][:4]]
     workbench.add_check(rec, {"prompt": "The sky is", "expect": "blue"})
     workbench.add_check(rec, {"prompt": "The sky is", "expect": "blue"})  # a duplicate is kept once
     assert len(workbench.list_checks(rec)) == 1
@@ -184,7 +299,7 @@ def test_forget_endpoints(rec, clean):
         _, _, body = run_fact(rec)
         r = client.post("/brainscan/actions/forget/target", json=body)
         assert r.status_code == 200
-        units = [u["g"] for u in r.json()["units"][:2]]
+        units = [u["g"] for u in r.json()["rankings"]["direct"]["units"][:2]]
         r = client.post("/brainscan/actions/forget/try", json=body | {"units": units})
         assert r.status_code == 200 and r.json()["rows"][0]["kind"] == "lead"
         r = client.post("/brainscan/actions/forget/measure", json=body | {"units": units, "checks": False})
