@@ -209,7 +209,18 @@ class Tracer:
 
     def capture(self, run, t: int) -> Capture:
         ids, pos, _ = self.context(run, t)
-        key = self._key(run, t, len(ids))
+        return self._capture(ids, pos, self._key(run, t, len(ids)))
+
+    def capture_ids(self, ids: list[int]) -> Capture:
+        """The same capture for a context given as token ids (a typed prompt rather than a run slot)."""
+        ids = [int(i) for i in ids]
+        if not ids:
+            raise ValueError("the context is empty")
+        edits = self.rec.edits
+        state = ("edited", edits.version) if edits.applied else "original"
+        return self._capture(ids, len(ids) - 1, ("ids", tuple(ids), state))
+
+    def _capture(self, ids: list[int], pos: int, key: tuple) -> Capture:
         if key in self._cache:
             self._cache.move_to_end(key)
             return self._cache[key]
@@ -297,26 +308,7 @@ class Tracer:
         _, pos, req = self.context(run, t)
         cap = self.capture(run, t)
         tid = self._resolve_target(run, req, pos, cap, target)
-        u = self._direction(cap, tid)
-        U = self.an.n_units
-        contrib = torch.zeros(U, device=self.s.device)
-        layer_sum = []
-        for lm in self.an.layers:
-            heads = clusters = 0.0
-            if lm.heads and lm.index in cap.head_in:
-                o, H, hd = lm.heads
-                z = cap.head_in[lm.index].view(H, hd)
-                w = (u @ o.weight.float()).view(H, hd)
-                c = (z * w).sum(-1)
-                contrib[lm.offset:lm.offset + H] = c
-                heads = float(c.sum())
-            if lm.down is not None and lm.index in cap.mlp_in and lm.assign is not None:
-                cn = self._neuron_contrib(lm, cap.mlp_in[lm.index], u)
-                cc = torch.zeros(lm.n_clusters, device=cn.device).index_add_(0, lm.assign, cn)
-                contrib[lm.offset + lm.n_heads:lm.offset + lm.n_units] = cc
-                clusters = float(cc.sum())
-            layer_sum.append([round(heads, 4), round(clusters, 4)])
-        embed = float(cap.embed @ u) if cap.embed is not None else 0.0
+        contrib, layer_sum, embed = self.attribute(cap, tid)
         bias = self.s.lm_head.bias
         logit = float(cap.logits[tid])
         total = embed + float(contrib.sum()) + (float(bias[tid]) if bias is not None else 0.0)
@@ -337,6 +329,32 @@ class Tracer:
             "top": [[int(g), round(float(c[g]), 4)] for g in order],
             "context_tokens": len(cap.ids), "seconds": cap.seconds,
         }
+
+    @torch.no_grad()
+    def attribute(self, cap: Capture, tid: int) -> tuple[torch.Tensor, list, float]:
+        """Each unit's direct effect on token tid's logit at the capture's position:
+        (per-unit tensor, [[heads, clusters]] per layer, the embedding's share)."""
+        u = self._direction(cap, tid)
+        U = self.an.n_units
+        contrib = torch.zeros(U, device=self.s.device)
+        layer_sum = []
+        for lm in self.an.layers:
+            heads = clusters = 0.0
+            if lm.heads and lm.index in cap.head_in:
+                o, H, hd = lm.heads
+                z = cap.head_in[lm.index].view(H, hd)
+                w = (u @ o.weight.float()).view(H, hd)
+                c = (z * w).sum(-1)
+                contrib[lm.offset:lm.offset + H] = c
+                heads = float(c.sum())
+            if lm.down is not None and lm.index in cap.mlp_in and lm.assign is not None:
+                cn = self._neuron_contrib(lm, cap.mlp_in[lm.index], u)
+                cc = torch.zeros(lm.n_clusters, device=cn.device).index_add_(0, lm.assign, cn)
+                contrib[lm.offset + lm.n_heads:lm.offset + lm.n_units] = cc
+                clusters = float(cc.sum())
+            layer_sum.append([round(heads, 4), round(clusters, 4)])
+        embed = float(cap.embed @ u) if cap.embed is not None else 0.0
+        return contrib, layer_sum, embed
 
     def _conditions(self, run, req: int) -> dict:
         recorded = next((e["edits"] for e in run.meta.get("weight_edits", []) if e.get("req") == req), [])
@@ -411,8 +429,8 @@ class Tracer:
             handles.append(down.register_forward_pre_hook(zero(torch.cat(parts).to(down.weight.device))))
         return handles
 
-    def knockout(self, run_id: str, t: int, units, target=None, weights: str = "current") -> dict:
-        run = self._run(run_id)
+    def check_units(self, units) -> list[int]:
+        """Validate a set of units to knock out: sorted, unique, existing, within the limit."""
         units = sorted({int(g) for g in units or []})
         if not units:
             raise ValueError("pick at least one unit to knock out")
@@ -420,6 +438,35 @@ class Tracer:
             raise ValueError(f"knock out at most {MAX_KNOCKOUT} units at a time")
         for g in units:
             self.an.locate(g)  # KeyError for a unit that doesn't exist
+        return units
+
+    @contextlib.contextmanager
+    def knocked_out(self, units: list[int] | None):
+        """Run the model with these units' writes zeroed everywhere (nothing when units is empty).
+        The caller holds the model (_model()), so no request runs with the units missing."""
+        handles = self._knockout_hooks(units) if units else []
+        try:
+            yield
+        finally:
+            for h in handles:
+                h.remove()
+
+    def last_logits(self, ids: list[int], units: list[int] | None = None) -> torch.Tensor:
+        """fp32 logits at the last position of ids, optionally with units knocked out. The caller
+        holds the model."""
+        with self.knocked_out(units):
+            kv, chunk = None, self.s.prefill_chunk
+            for cs in range(0, len(ids), chunk):
+                out = self.s.model(input_ids=torch.tensor([ids[cs:cs + chunk]], device=self.s.device),
+                                   past_key_values=kv, use_cache=True, logits_to_keep=1)
+                kv = out.past_key_values
+            logits = out.logits[0, -1].float()
+            del out, kv
+        return logits
+
+    def knockout(self, run_id: str, t: int, units, target=None, weights: str = "current") -> dict:
+        run = self._run(run_id)
+        units = self.check_units(units)
         with self._weights(weights):
             return self._knockout(run, t, units, target) | {"model_weights": weights}
 
@@ -431,18 +478,7 @@ class Tracer:
         base = self.capture(run, t).logits
         t0 = time.perf_counter()
         with self._model():
-            handles = self._knockout_hooks(units)
-            try:
-                kv, chunk = None, self.s.prefill_chunk
-                for cs in range(0, len(ids), chunk):
-                    out = self.s.model(input_ids=torch.tensor([ids[cs:cs + chunk]], device=self.s.device),
-                                       past_key_values=kv, use_cache=True, logits_to_keep=1)
-                    kv = out.past_key_values
-                after = out.logits[0, -1].float()
-                del out, kv
-            finally:
-                for h in handles:
-                    h.remove()
+            after = self.last_logits(ids, units)
 
         def summary(logits):
             probs = torch.softmax(logits, -1)

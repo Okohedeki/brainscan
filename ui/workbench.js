@@ -39,7 +39,7 @@ async function busy(btn, label, fn) {
 }
 
 // ---------------------------------------------------------------- tabs
-const VIEWS = ["scanner", "weights", "workbench"];
+const VIEWS = ["actions", "scanner", "weights", "workbench"];
 
 function show(view) {
   for (const v of VIEWS) {
@@ -271,7 +271,10 @@ function boot() {
   $("#wb-run").onclick = runCompare;
   $("#wb-export").onclick = exportModel;
   syncForm();
-  const saved = (() => { try { return localStorage.getItem("brainscan-view"); } catch { return null; } })();
-  show(VIEWS.includes(saved) ? saved : "scanner");
+  // Actions are home: shown on a first visit, and once to everyone who saved a view before they existed.
+  const stored = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
+  const saved = stored("brainscan-view"), seen = stored("brainscan-actions-seen");
+  try { localStorage.setItem("brainscan-actions-seen", "1"); } catch { /* storage unavailable */ }
+  show(VIEWS.includes(saved) && seen ? saved : "actions");
 }
 boot();

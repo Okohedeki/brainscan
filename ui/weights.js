@@ -1042,6 +1042,7 @@ async function renderTokenPanel() {
   $("#tp-ko-top").onclick = () => runKnockout(topUnits(info, 5, true), "top 5 units that pushed it up");
   $("#tp-ko-sel")?.addEventListener("click", () => knockOutSet([...A.sel], "selected units"));
   $("#tp-add-check").onclick = addCheckFromToken;
+  $("#tp-forget").onclick = () => forgetFromToken(info);
   $("#tp-copy").onclick = () => navigator.clipboard?.writeText(JSON.stringify(traceJson(info, lens), null, 2));
   renderKnockouts();
 }
@@ -1089,6 +1090,7 @@ function tokenPanelHtml(info, lens) {
     <div class="d-sec tp-tools">
       <div class="d-actions wrap">
         <button type="button" class="btn sm" id="tp-circuit" title="Open the path explorer on this token: up to 60 routes, with hops and branches to tune">All routes</button>
+        <button type="button" class="btn sm" id="tp-forget" title="Act on it: find the units that carry this word, remove them, and measure what else changed">Forget this fact →</button>
         <button type="button" class="btn sm" id="tp-ko-top" title="Remove the five units that pushed it up most and re-run">Knock out top 5</button>
         ${A.sel.size ? `<button type="button" class="btn sm" id="tp-ko-sel">Knock out selection (${A.sel.size})</button>` : ""}
         <button type="button" class="btn sm ghost" id="tp-add-check" title="Save as a behavior check: after this context, this word. Checks show what an edit changes.">Add as a check</button>
@@ -1253,6 +1255,15 @@ function setEditsPanel(open) {
   $("#gv-edits-btn").setAttribute("aria-pressed", String(open));
   if (open) document.dispatchEvent(new CustomEvent("brainscan:workbench"));
   pushState();
+}
+
+/** Hand the traced word to the Actions view's "Make it forget a fact". */
+function forgetFromToken(info) {
+  const i = A.view.indexOf(info.t);
+  const lead = i < 0 ? "" : A.view.slice(Math.max(0, i - 14), i + 1).map((t) => A.tok[t]?.tx ?? "").join("");
+  document.dispatchEvent(new CustomEvent("brainscan:action", { detail: {
+    action: "forget", run: A.runId, t: info.t, target: info.target.id, of: A.attrOf ?? nextSlot(info.t),
+    word: info.target.text, lead } }));
 }
 
 async function addCheckFromToken() {

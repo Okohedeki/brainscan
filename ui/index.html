@@ -22,6 +22,9 @@
       <span class="live-dot" id="live-dot" title="Live feed"></span>
     </div>
     <nav class="tabs" role="tablist" aria-label="View">
+      <button role="tab" data-view="actions" aria-selected="false" class="tab-act" title="Things to do to the model, each tried and measured before it is kept">
+        <svg viewBox="0 0 16 16" width="13" height="13" aria-hidden="true"><path d="M9.2 1.5 3 9h4.3l-.9 5.5L12.8 7H8.4z" fill="currentColor"/></svg>Actions</button>
+      <span class="tabs-sep" aria-hidden="true">Explore</span>
       <button role="tab" data-view="scanner" aria-selected="true" class="active" title="Watch a run: transcript, per-token timeline, logit lens, steering"><span class="tab-n">1</span>Watch</button>
       <button role="tab" data-view="weights" aria-selected="false" title="Trace a token through the model's heads and neuron clusters"><span class="tab-n">2</span>Trace</button>
       <button role="tab" data-view="workbench" aria-selected="false" title="Tune the weights: find directions, edit, compare, export"><span class="tab-n">3</span>Tune</button>
@@ -42,6 +45,63 @@
       <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zm0 1.5v10a5 5 0 0 1 0-10z" fill="currentColor"/></svg>
     </button>
   </header>
+
+  <main class="actions" id="view-actions" hidden>
+    <section class="act-home" id="act-home" aria-labelledby="act-title">
+      <header class="act-hero">
+        <h1 id="act-title">What do you want to do to the model?</h1>
+        <p class="hint">Each action is tried and measured before anything is kept: what changed, what it cost, and a
+          random control that shows the change is real. The graphs and traces are there when you want to see why.</p>
+      </header>
+      <div class="act-groups">
+        <section class="act-group" aria-labelledby="ag-change">
+          <h2 id="ag-change">Change the model</h2>
+          <button type="button" class="act-card main" data-act="forget">
+            <span class="act-icon" aria-hidden="true">
+              <svg viewBox="0 0 24 24" width="22" height="22"><path d="M4 7h16M10 11v6M14 11v6M5 7l1 12a2 2 0 0 0 2 2h8a2 2 0 0 0 2-2l1-12M9 7V4h6v3" fill="none" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/></svg></span>
+            <span class="act-text"><b>Make it forget a fact</b>
+              <span>Find the units that carry an answer, remove them, and check what else changed.</span></span>
+            <span class="act-go" aria-hidden="true">Start →</span>
+          </button>
+        </section>
+        <section class="act-group" aria-labelledby="ag-test">
+          <h2 id="ag-test">Experiment: nothing is kept</h2>
+          <button type="button" class="act-card" data-act="knockout">
+            <span class="act-text"><b>Knock out units behind a word</b><span>Click any word the model wrote and remove the units that pushed it up.</span></span>
+            <span class="act-go" aria-hidden="true">Opens Trace →</span></button>
+          <button type="button" class="act-card" data-act="steer">
+            <span class="act-text"><b>Steer while it writes</b><span>Push a saved direction at a layer and watch the answer change.</span></span>
+            <span class="act-go" aria-hidden="true">Opens Watch →</span></button>
+        </section>
+        <section class="act-group" aria-labelledby="ag-check">
+          <h2 id="ag-check">Check and compare</h2>
+          <button type="button" class="act-card" data-act="checks">
+            <span class="act-text"><b>Check behavior</b><span>Save what the model should say, and see it before and after every edit.</span></span>
+            <span class="act-go" aria-hidden="true">Opens Tune →</span></button>
+          <button type="button" class="act-card" data-act="compare">
+            <span class="act-text"><b>Compare original and edited</b><span>Ask the same question on both, and trace the first word that changed.</span></span>
+            <span class="act-go" aria-hidden="true">Opens Tune →</span></button>
+        </section>
+      </div>
+      <p class="act-next"><span class="dim">Next to build:</span> compare two models (what a fine-tune changed) ·
+        alert on a state while an agent runs · plant a concept and ask the model about it</p>
+      <section class="panel act-ledger" aria-labelledby="ag-model">
+        <div class="panel-head"><h2 id="ag-model">Your model</h2>
+          <button type="button" class="link" data-act="export">Export the edited model →</button></div>
+        <div class="edits-body" data-edits="stack"></div>
+      </section>
+    </section>
+
+    <section class="act-flow" id="act-flow" hidden aria-labelledby="fl-title">
+      <header class="flow-head">
+        <button type="button" class="link" id="fl-back">← All actions</button>
+        <h1 id="fl-title">Make it forget a fact</h1>
+        <ol class="stepper" id="fl-steps"></ol>
+      </header>
+      <div class="flow-summary" id="fl-summary"></div>
+      <div class="flow-body panel" id="fl-body" aria-live="polite"></div>
+    </section>
+  </main>
 
   <main class="layout" id="view-scanner">
     <section class="panel transcript" aria-labelledby="h-transcript">
@@ -383,8 +443,8 @@
         <div>
           <span class="eyebrow">Guide</span>
           <h2 id="guide-title">Trace and tune open-weights models</h2>
-          <p class="hint">Record a model's internals while it works, follow any token through its heads and neurons,
-            then change the weights and measure what changed. Three steps, left to right in the tabs.</p>
+          <p class="hint">Start from an action: what you want to do to the model. Each one is tried and measured before
+            anything is kept. To look around instead, Watch, Trace and Tune show a model's internals while it works.</p>
         </div>
         <button type="button" class="tbtn icon" id="guide-close" aria-label="Close guide">✕</button>
       </header>
@@ -401,6 +461,7 @@
   <script type="module" src="/ui/models.js"></script>
   <script type="module" src="/ui/chat.js"></script>
   <script type="module" src="/ui/edits.js"></script>
+  <script type="module" src="/ui/actions.js"></script>
   <script type="module" src="/ui/app.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
   <script type="module" src="/ui/weights.js"></script>

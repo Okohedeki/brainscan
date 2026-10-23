@@ -1,0 +1,370 @@
+// Actions: things to do to the model, each tried and measured before it is kept. The home lists
+// them; "Make it forget a fact" runs as a five-step flow (Goal, Target, Try, Measure, Keep) on
+// /brainscan/actions/forget/* (see brainscan/recorder/actions.py). The other cards open the tool
+// that does that job today. Trace hands a traced word over with "Forget this fact" (brainscan:action).
+
+const $ = (sel) => document.querySelector(sel);
+const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
+const fmtP = (p) => (p == null ? "–" : p >= 0.001 || p === 0 ? p.toFixed(3) : p.toExponential(1));
+const vis = (s) => (s ?? "").replace(/\n/g, "⏎").replace(/\t/g, "⇥") || "∅";
+
+async function api(method, path, body) {
+  const res = await fetch(path, { method, headers: { "Content-Type": "application/json" }, body: body ? JSON.stringify(body) : undefined });
+  const text = await res.text();
+  let data = null;
+  try { data = text ? JSON.parse(text) : null; } catch { /* not JSON */ }
+  if (!res.ok) {
+    const err = new Error(res.status === 409 ? "The model is busy answering a request. Try again when it finishes." : data?.detail || text || `${res.status}`);
+    err.status = res.status;
+    throw err;
+  }
+  return data;
+}
+
+const STEPS = [["goal", "Goal"], ["target", "Target"], ["try", "Try"], ["measure", "Measure"], ["keep", "Keep"]];
+const EXAMPLE = {
+  prompt: "The capital city of Australia is", answer: "Canberra",
+  leads: "Australia's capital city is",
+  questions: "What is the capital of Australia? Answer in one sentence.",
+  keep: "The capital of France is → Paris\nThe largest city in Australia is → Sydney\nThe chemical symbol for gold is → Au",
+};
+
+const F = {
+  step: "goal", source: null, prompt: "", answer: "", leads: "", questions: "", keep: "", checks: true,
+  target: null, k: 1, tried: null, measured: null, kept: null, busy: null, msg: null,
+};
+
+function reset(source = null) {
+  Object.assign(F, { step: "goal", source, prompt: "", answer: "", leads: "", questions: "", keep: "", checks: true,
+    target: null, k: 1, tried: null, measured: null, kept: null, busy: null, msg: null });
+  if (source?.question) F.questions = source.question;
+}
+
+const units = () => (F.target?.units || []).slice(0, F.k).map((u) => u.g);
+const answerText = () => F.target?.fact.answer || (F.source ? F.source.word?.trim() : F.answer.trim()) || "the answer";
+function factBody() {
+  const fact = F.source ? { run: F.source.run, t: F.source.t, target: F.source.target } : { prompt: F.prompt, answer: F.answer };
+  return { ...fact, leads: F.leads, questions: F.questions, keep: F.keep, checks: F.checks };
+}
+const parseKeep = (text) => text.split("\n").map((l) => l.trim()).filter(Boolean).map((l) => {
+  const sep = ["→", "->", "=>", "|"].find((x) => l.includes(x));
+  if (!sep) return null;
+  const [a, ...b] = l.split(sep);
+  return a.trim() && b.join(sep).trim() ? { prompt: a.trim(), expect: b.join(sep).trim() } : null;
+}).filter(Boolean);
+
+// ---------------------------------------------------------------- views
+function showHome() { $("#act-home").hidden = false; $("#act-flow").hidden = true; }
+function openForget(source = null) {
+  reset(source);
+  $("#act-home").hidden = true; $("#act-flow").hidden = false;
+  document.dispatchEvent(new CustomEvent("brainscan:show", { detail: "actions" }));
+  render();
+}
+function go(view, then) {
+  document.dispatchEvent(new CustomEvent("brainscan:show", { detail: view }));
+  if (then) requestAnimationFrame(() => setTimeout(then, 60));
+}
+const scrollTo = (sel) => () => $(sel)?.scrollIntoView({ behavior: "smooth", block: "start" });
+
+function openRunInTrace(run, word) {
+  const sel = $("#run-select");
+  go("weights");
+  if (sel && sel.value !== run) {
+    if (![...sel.options].some((o) => o.value === run)) sel.insertAdjacentHTML("beforeend", `<option value="${esc(run)}">${esc(run)}</option>`);
+    sel.value = run;
+    sel.dispatchEvent(new Event("change"));
+  }
+  if (word != null) document.dispatchEvent(new CustomEvent("brainscan:trace", { detail: { word } }));
+}
+
+// ---------------------------------------------------------------- the flow
+const reachable = (step) => step === "goal" || !!F.target;
+
+function render() {
+  const i = STEPS.findIndex(([k]) => k === F.step);
+  $("#fl-steps").innerHTML = STEPS.map(([k, label], j) => `<li class="${j < i ? "done" : j === i ? "now" : ""}">
+    <button type="button" data-step="${k}" ${reachable(k) && !F.busy ? "" : "disabled"} ${j === i ? 'aria-current="step"' : ""}>
+      <span class="n">${j + 1}</span>${label}</button></li>`).join("");
+  $("#fl-steps").querySelectorAll("[data-step]").forEach((b) => { b.onclick = () => goto(b.dataset.step); });
+  $("#fl-summary").innerHTML = summaryHtml();
+  const body = $("#fl-body");
+  body.innerHTML = ({ goal: goalHtml, target: targetHtml, try: tryHtml, measure: measureHtml, keep: keepHtml })[F.step]() +
+    `<div class="fl-msg ${F.msg?.tone || ""}" role="status">${F.busy ? `<span class="spinner sm"></span>${esc(F.busy)}…` : esc(F.msg?.text || "")}</div>`;
+  bind(body);
+}
+
+function summaryHtml() {
+  if (!F.target) return "";
+  const f = F.target.fact;
+  return `<span class="sum-chip"><span class="lbl">Fact</span>…${esc(f.lead.slice(-50))} → <b>${esc(f.answer)}</b></span>
+    <span class="sum-chip"><span class="lbl">Units</span>${F.k} of ${F.target.units.length} ranked</span>
+    ${F.target.weights_edited ? `<span class="sum-chip warn"><span class="lbl">Weights</span>already edited: measured on top of your applied edits</span>` : ""}`;
+}
+
+function goalHtml() {
+  const fact = F.source
+    ? `<div class="fact-card"><span class="lbl">From your chat</span>
+        <p class="mono">…${esc(F.source.lead || "")}<mark>${esc(vis(F.source.word))}</mark></p>
+        <button type="button" class="link" id="fl-typed">Type a fact instead</button></div>`
+    : `<label>Lead-in<input id="fl-prompt" type="text" spellcheck="false" placeholder="The capital of Australia is" value="${esc(F.prompt)}"></label>
+       <label>The answer it gives next<input id="fl-answer" type="text" spellcheck="false" placeholder="Canberra" value="${esc(F.answer)}"></label>
+       <button type="button" class="link" id="fl-example">Load an example</button>`;
+  return `<div class="fl-grid">
+    <div class="fl-col"><h3>The fact to remove</h3>${fact}
+      <p class="hint">The answer is the word the model writes right after the lead-in. You can also start from any word in a chat:
+        click it in Trace and press <b>Forget this fact</b>.</p></div>
+    <div class="fl-col"><h3>How to test it <span class="dim">optional</span></h3>
+      <label>Other lead-ins to the same answer, one per line<textarea id="fl-leads" rows="3" spellcheck="false" placeholder="Australia's capital city is">${esc(F.leads)}</textarea></label>
+      <label>Questions to ask it, one per line<textarea id="fl-questions" rows="2" spellcheck="false" placeholder="What is the capital of Australia?">${esc(F.questions)}</textarea></label>
+      <h3>Facts it should keep <span class="dim">optional</span></h3>
+      <label>One per line, as lead-in → answer<textarea id="fl-keep" rows="3" spellcheck="false" placeholder="The capital of France is → Paris">${esc(F.keep)}</textarea></label>
+      <label class="check"><input type="checkbox" id="fl-checks" ${F.checks ? "checked" : ""}> Also measure my saved behavior checks</label></div>
+  </div>
+  <div class="fl-actions"><button type="button" class="primary" id="fl-find" ${F.busy ? "disabled" : ""}>Find where it lives →</button></div>`;
+}
+
+function curveHtml() {
+  const t = F.target;
+  return `<ul class="curve">${t.curve.map((p) => `<li data-k="${p.k}" class="${p.k === t.suggested ? "sugg" : ""} ${p.k === F.k ? "sel" : ""}" title="Knock out the top ${p.k}">
+      <span class="k">${p.k} unit${p.k === 1 ? "" : "s"}</span>
+      <span class="pbar"><i style="width:${Math.max(1, p.prob * 100).toFixed(1)}%"></i></span>
+      <span class="v">p ${fmtP(p.prob)}</span>
+      <span class="dim">${p.gone ? `gone: now answers <b>${esc(vis(p.top))}</b>` : p.rank === 1 ? "still its first answer" : `still #${p.rank}`}</span></li>`).join("")}</ul>`;
+}
+
+function kSlider() {
+  const n = F.target.units.length;
+  return `<div class="fl-k"><label for="fl-k">Units to remove</label>
+    <input type="range" id="fl-k" min="1" max="${n}" step="1" value="${F.k}"><b id="fl-kv">${F.k}</b>
+    <span class="dim">of ${n} ranked</span></div>`;
+}
+
+function targetHtml() {
+  const t = F.target, f = t.fact;
+  const alts = f.alternatives.filter((a) => a.text !== f.token).slice(0, 4)
+    .map((a) => `<span class="chip">${esc(vis(a.text))} <span class="dim">${fmtP(a.prob)}</span></span>`).join("");
+  const last = t.curve[t.curve.length - 1];
+  return `<p class="fl-lead">After <q>…${esc(f.lead.slice(-80))}</q> the model answers <span class="tok-chip target">${esc(vis(f.token))}</span>
+      with probability <b>${fmtP(f.prob)}</b>${f.rank > 1 ? ` (ranked #${f.rank})` : ""}.</p>
+    ${f.first ? "" : `<div class="verdict partial">After this lead-in the model's first answer is “${esc(vis(f.alternatives[0]?.text))}”, not “${esc(f.answer)}”:
+      it isn't stating this fact here. Pick a lead-in it answers with “${esc(f.answer)}” first, or start from a word in a chat. Here, “gone” means under a tenth of its probability.</div>`}
+    ${alts ? `<div class="chips"><span class="lbl">also considered</span>${alts}</div>` : ""}
+    <h3>How many units it takes</h3>${curveHtml()}
+    <p class="hint">${t.flipped
+      ? `Suggested: <b>${t.suggested} unit${t.suggested === 1 ? "" : "s"}</b>, the smallest set here after which the model no longer gives “${esc(f.answer)}”.`
+      : `Even ${last.k} units don't remove it: the answer is spread widely, or other units take over. You can still try.`}
+      Units are ranked by how much they wrote toward the answer; each row removes the top ones together.</p>
+    ${kSlider()}
+    <div class="unit-chips">${t.units.map((u, i) => `<span class="uchip ${u.kind} ${i < F.k ? "on" : ""}" title="${u.kind === "head" ? "attention head" : "MLP neuron cluster"} · wrote ${u.direct >= 0 ? "+" : ""}${u.direct} toward the answer">${esc(u.name)}</span>`).join("")}</div>
+    ${F.source ? `<button type="button" class="link" id="fl-why">See the trace behind this word →</button>` : ""}
+    <div class="fl-actions"><button type="button" class="btn" data-goto="goal">← Goal</button>
+      <button type="button" class="primary" data-goto="try">Try it →</button></div>`;
+}
+
+function highlight(text) {
+  const a = answerText();
+  const safe = esc(text || "(nothing)");
+  if (!a) return safe;
+  const re = new RegExp(esc(a).replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "gi");
+  return safe.replace(re, (m) => `<mark>${m}</mark>`);
+}
+
+function tryHtml() {
+  const r = F.tried;
+  const stale = r && r.k !== F.k;
+  const rows = r ? r.rows.map((x) => `<tr><td><span class="kind">${x.kind === "lead" ? "lead-in" : "question"}</span>${esc(x.prompt.slice(-120))}</td>
+      <td>${highlight(x.original)}${x.said_before ? "" : ` <span class="dim small">(didn't say it)</span>`}</td>
+      <td class="${x.says_now ? "still" : "gone"}">${highlight(x.edited)}
+        <span class="badge ${x.says_now ? "serious" : "good"}">${x.says_now ? `still says ${esc(answerText())}` : "doesn't say it"}</span></td></tr>`).join("") : "";
+  return `${kSlider()}
+    ${r ? `<table class="try-table${stale ? " stale" : ""}"><thead><tr><th>Asked</th><th>Original</th><th>Without the ${r.units} unit${r.units === 1 ? "" : "s"}</th></tr></thead><tbody>${rows}</tbody></table>`
+      : `<p class="empty">Running both versions…</p>`}
+    <p class="hint">The same prompts, greedy, with and without the units. Nothing is changed in the weights yet.
+      ${stale ? "<b>You changed the number of units: run it again.</b>" : ""}</p>
+    <div class="fl-actions"><button type="button" class="btn" data-goto="target">← Target</button>
+      <button type="button" class="btn" id="fl-rerun" ${F.busy ? "disabled" : ""}>Run again</button>
+      <button type="button" class="primary" data-goto="measure">Measure it →</button></div>`;
+}
+
+const tile = (label, value, sub, tone = "") => `<div class="tile ${tone}"><div class="label">${label}</div><div class="value">${value}</div><div class="sub">${sub}</div></div>`;
+const pr = (x) => (x ? `${fmtP(x.prob)} <span class="dim">#${x.rank}</span>` : "–");
+
+function measureHtml() {
+  const m = F.measured;
+  if (!m) return `<p class="empty">Measuring…</p><div class="skeleton"></div><div class="skeleton tall"></div>`;
+  const stale = m.k !== F.k;
+  const n = m.leads.length, gone = m.leads.filter((r) => r.gone).length;
+  const ctrlGone = m.leads.filter((r) => r.control_gone >= 0.5).length;
+  const main = m.leads[0];
+  const kept = m.keep.filter((k) => k.before);
+  const broken = kept.filter((k) => (k.before.rank === 1 && k.after.rank > 1) || k.before.prob - k.after.prob > 0.2);
+  const d = m.drift;
+  return `<div class="verdict ${m.verdict.status}">${esc(m.verdict.text)}${stale ? " <b>(measured with a different number of units: measure again.)</b>" : ""}</div>
+    <div class="tiles">
+      ${tile("The fact", `gone after ${gone} of ${n}`, `main lead-in p ${fmtP(main.before.prob)} → ${fmtP(main.after.prob)}${main.gone ? `, now “${esc(vis(main.after.top))}”` : ""}`, gone === n ? "good" : gone ? "warn" : "bad")}
+      ${tile(`Random units (${m.control.units}, ${m.control.seeds} sets)`, ctrlGone ? `removed it on ${ctrlGone} of ${n}` : "left it alone", `main lead-in p ${fmtP(main.before.prob)} → ${fmtP(main.control.prob)}`, ctrlGone ? "bad" : "good")}
+      ${tile("Facts to keep", kept.length ? `${kept.length - broken.length} of ${kept.length} intact` : "none given", kept.length ? (broken.length ? `broke: ${broken.map((k) => esc(k.label.slice(-40))).join("; ")}` : "none lost first place") : "add some in Goal to catch side effects", !kept.length ? "" : broken.length ? "bad" : "good")}
+      ${tile("Neutral text", `KL ${d.kl_per_token.toFixed(3)}`, `perplexity ${d.perplexity_before} → ${d.perplexity_after} over ${d.tokens} tokens`, d.kl_per_token > 0.05 ? "warn" : "good")}
+    </div>
+    <details class="fl-details" open><summary>Every lead-in</summary>
+      <table class="m-table"><thead><tr><th>Lead-in</th><th>Before</th><th>After</th><th>Random units</th></tr></thead><tbody>
+      ${m.leads.map((r) => `<tr><td>${esc(r.prompt.slice(-90))} <span class="dim">→ ${esc(vis(r.token))}</span></td><td>${pr(r.before)}</td>
+        <td class="${r.gone ? "gone" : "still"}">${pr(r.after)}${r.gone ? ` <span class="dim">now “${esc(vis(r.after.top))}”</span>` : ""}</td><td>${pr(r.control)}</td></tr>`).join("")}
+      </tbody></table></details>
+    ${m.keep.length ? `<details class="fl-details" open><summary>Facts to keep and your checks</summary>
+      <table class="m-table"><thead><tr><th>Fact</th><th>Before</th><th>After</th></tr></thead><tbody>
+      ${m.keep.map((k) => `<tr><td><span class="kind">${k.source === "check" ? "check" : "typed"}</span>${esc(vis(k.label).slice(-90))}</td>
+        ${k.error ? `<td colspan="2" class="dim">${esc(k.error)}</td>` : `<td>${pr(k.before)}</td><td class="${broken.includes(k) ? "still" : ""}">${pr(k.after)}</td>`}</tr>`).join("")}
+      </tbody></table></details>` : ""}
+    <p class="hint">Measured with the units knocked out at run time, which is exactly what keeping them as a weight edit does.
+      Random units: the same number of heads and clusters drawn at random, three times; if they remove the fact too, it wasn't found in these units.
+      Neutral text: KL between the next-token distributions with and without the units, on five reference paragraphs.</p>
+    <div class="fl-actions"><button type="button" class="btn" data-goto="try">← Try</button>
+      <button type="button" class="btn" id="fl-remeasure" ${F.busy ? "disabled" : ""}>Measure again</button>
+      <button type="button" class="primary" data-goto="keep">Keep it →</button></div>`;
+}
+
+function keepHtml() {
+  const names = (F.target?.units || []).slice(0, F.k).map((u) => u.name);
+  if (F.kept) {
+    return `<div class="verdict works">Done: the ${names.length} unit${names.length === 1 ? "" : "s"} behind “${esc(answerText())}” are removed from the weights, and the edit is applied now.</div>
+      <p class="hint">${F.kept.checks ? `Saved ${F.kept.checks} behavior check${F.kept.checks === 1 ? "" : "s"}; they show before → after on every edit from now on. ` : ""}
+        The edit is listed under Your model. Restoring the original weights undoes every applied edit; the edits stay listed so you can apply them again.</p>
+      <div class="fl-actions"><button type="button" class="btn" id="fl-ask">Ask the edited model</button>
+        <button type="button" class="btn" id="fl-export">Export the edited model</button>
+        <button type="button" class="btn" id="fl-revert">Restore original weights</button>
+        <button type="button" class="link" id="fl-home">Back to all actions</button></div>`;
+  }
+  const m = F.measured, measuredHere = m && m.k === F.k;
+  return `<p class="fl-lead">Remove these ${names.length} unit${names.length === 1 ? "" : "s"} from the weights:</p>
+    <div class="unit-chips">${names.map((n) => `<span class="uchip on">${esc(n)}</span>`).join("")}</div>
+    ${measuredHere ? `<div class="verdict ${m.verdict.status}">${esc(m.verdict.text)}</div>`
+      : `<div class="verdict kept">Not measured with ${names.length} unit${names.length === 1 ? "" : "s"} yet. Measure before keeping it.</div>`}
+    <p class="hint">Their output weights are set to zero, as one edit in your model's stack, applied now. Nothing on disk changes until you export,
+      and the original weights can be restored exactly at any time.</p>
+    <label class="check"><input type="checkbox" id="fl-save-keep" ${parseKeep(F.keep).length ? "checked" : "disabled"}> Save the facts to keep as behavior checks</label>
+    <label class="check"><input type="checkbox" id="fl-save-fact" checked> Track the forgotten fact as a check too</label>
+    <div class="fl-actions"><button type="button" class="btn" data-goto="measure">← Measure</button>
+      <button type="button" class="btn" id="fl-discard">Discard</button>
+      <button type="button" class="primary" id="fl-apply" ${F.busy ? "disabled" : ""}>Remove from the weights</button></div>`;
+}
+
+// ---------------------------------------------------------------- behavior
+function bind(body) {
+  const val = (id, key) => { const el = body.querySelector(id); if (el) el.oninput = () => { F[key] = el.value; }; };
+  val("#fl-prompt", "prompt"); val("#fl-answer", "answer"); val("#fl-leads", "leads"); val("#fl-questions", "questions"); val("#fl-keep", "keep");
+  const checks = body.querySelector("#fl-checks");
+  if (checks) checks.onchange = () => { F.checks = checks.checked; };
+  body.querySelector("#fl-example")?.addEventListener("click", () => { Object.assign(F, EXAMPLE); render(); });
+  body.querySelector("#fl-typed")?.addEventListener("click", () => { F.source = null; F.target = null; render(); });
+  body.querySelector("#fl-find")?.addEventListener("click", find);
+  body.querySelectorAll("[data-goto]").forEach((b) => { b.onclick = () => goto(b.dataset.goto); });
+  const k = body.querySelector("#fl-k");
+  if (k) {
+    k.oninput = () => {
+      F.k = Number(k.value);
+      body.querySelector("#fl-kv").textContent = F.k;
+      body.querySelectorAll(".unit-chips .uchip").forEach((c, i) => c.classList.toggle("on", i < F.k));
+      body.querySelectorAll(".curve li").forEach((li) => li.classList.toggle("sel", Number(li.dataset.k) === F.k));
+      $("#fl-summary").innerHTML = summaryHtml();
+    };
+    k.onchange = () => { if (F.step === "try") runTry(); };
+  }
+  body.querySelectorAll(".curve li[data-k]").forEach((li) => { li.onclick = () => { F.k = Number(li.dataset.k); render(); }; });
+  body.querySelector("#fl-why")?.addEventListener("click", () => openRunInTrace(F.source.run, F.source.of));
+  body.querySelector("#fl-rerun")?.addEventListener("click", runTry);
+  body.querySelector("#fl-remeasure")?.addEventListener("click", runMeasure);
+  body.querySelector("#fl-apply")?.addEventListener("click", keep);
+  body.querySelector("#fl-discard")?.addEventListener("click", () => { reset(); showHome(); });
+  body.querySelector("#fl-home")?.addEventListener("click", () => { reset(); showHome(); });
+  body.querySelector("#fl-ask")?.addEventListener("click", () => go("weights", () => $("#tv-convo textarea")?.focus()));
+  body.querySelector("#fl-export")?.addEventListener("click", () => go("workbench", scrollTo("#h-export")));
+  body.querySelector("#fl-revert")?.addEventListener("click", revert);
+}
+
+function goto(step) {
+  if (!reachable(step) || F.busy) return;
+  F.step = step; F.msg = null;
+  render();
+  if (step === "try" && (!F.tried || F.tried.k !== F.k)) runTry();
+  if (step === "measure" && (!F.measured || F.measured.k !== F.k)) runMeasure();
+}
+
+async function work(label, fn) {
+  F.busy = label; F.msg = null; render();
+  try { await fn(); } catch (err) { F.msg = { text: err.message, tone: "error" }; }
+  F.busy = null; render();
+}
+
+function find() {
+  if (!F.source && (!F.prompt.trim() || !F.answer.trim())) {
+    F.msg = { text: "Write the lead-in and the answer the model gives after it.", tone: "error" }; render(); return;
+  }
+  work("Finding the units behind the answer", async () => {
+    F.target = await api("POST", "/brainscan/actions/forget/target", factBody());
+    F.k = F.target.suggested; F.tried = null; F.measured = null; F.kept = null;
+    F.step = "target";
+  });
+}
+
+function runTry() {
+  const k = F.k;
+  return work(`Answering with and without ${k} unit${k === 1 ? "" : "s"}`, async () => {
+    F.tried = { ...(await api("POST", "/brainscan/actions/forget/try", { ...factBody(), units: units() })), k };
+  });
+}
+
+function runMeasure() {
+  const k = F.k;
+  return work("Measuring: the fact, random units, facts to keep, neutral text", async () => {
+    F.measured = { ...(await api("POST", "/brainscan/actions/forget/measure", { ...factBody(), units: units() })), k };
+  });
+}
+
+function keep() {
+  const saveKeep = $("#fl-save-keep")?.checked, saveFact = $("#fl-save-fact")?.checked;
+  const f = F.target.fact;
+  work("Removing the units from the weights", async () => {
+    await api("POST", "/brainscan/anatomy/lesion", { units: units(), apply: true, note: `forget “${f.answer}” after “${f.lead.slice(-40)}”` });
+    let saved = 0;
+    if (saveKeep) for (const c of parseKeep(F.keep)) { await api("POST", "/brainscan/checks", { ...c, chat: false }); saved++; }
+    if (saveFact) {
+      await api("POST", "/brainscan/checks", F.source ? { run: F.source.run, t: F.source.t, target: F.source.target } : { prompt: F.prompt, expect: F.answer });
+      saved++;
+    }
+    F.kept = { checks: saved };
+    document.dispatchEvent(new CustomEvent("brainscan:workbench"));
+    document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } }));
+  });
+}
+
+function revert() {
+  work("Restoring the original weights", async () => {
+    await api("POST", "/brainscan/workbench/revert", {});
+    document.dispatchEvent(new CustomEvent("brainscan:workbench"));
+    F.msg = { text: "Original weights restored.", tone: "ok" };
+  });
+}
+
+// ---------------------------------------------------------------- boot
+function boot() {
+  const cards = {
+    forget: () => openForget(),
+    knockout: () => go("weights", () => document.dispatchEvent(new CustomEvent("brainscan:trace", { detail: { mode: "attr" } }))),
+    steer: () => go("scanner", scrollTo("#h-steer")),
+    checks: () => go("workbench", scrollTo("#h-checks")),
+    compare: () => go("workbench", scrollTo("#h-compare")),
+    export: () => go("workbench", scrollTo("#h-export")),
+  };
+  document.querySelectorAll("#view-actions [data-act]").forEach((b) => { b.onclick = () => cards[b.dataset.act]?.(); });
+  $("#fl-back").onclick = () => { if (!F.busy) showHome(); };
+  // A word traced in Trace: "Forget this fact".
+  document.addEventListener("brainscan:action", (ev) => {
+    const d = ev.detail || {};
+    if (d.action === "forget") openForget({ run: d.run, t: d.t, target: d.target, of: d.of, word: d.word, lead: d.lead, question: d.question });
+  });
+  // Units belong to one model: a switch starts over.
+  document.addEventListener("brainscan:model", () => { if (!$("#act-flow").hidden && !F.busy) { reset(); showHome(); } });
+}
+boot();

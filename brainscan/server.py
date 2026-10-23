@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
-from .recorder import catalog, workbench
+from .recorder import actions, catalog, workbench
 from .recorder.model import Subject, display_name
 from .recorder.session import Cancelled, GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
@@ -790,6 +790,31 @@ async def token_knockout(run_id: str, t: int, body: dict):
 async def token_attention(run_id: str, t: int, unit: int, weights: str = "current"):
     """A softmax-attention head's attention over the earlier tokens at tape slot t."""
     return await _trace("attention", run_id, t, unit, weights)
+
+
+FORGET_STEPS = {"target": actions.forget_target, "try": actions.forget_try, "measure": actions.forget_measure}
+
+
+@app.post("/brainscan/actions/forget/{step}")
+async def forget_step(step: str, request: Request):
+    """Make the model forget a fact (see recorder/actions.py): target ranks the units behind the
+    answer, try shows answers with and without them, measure checks the effect against random units,
+    facts to keep and neutral text. Keeping it is a grouped lesion (/brainscan/anatomy/lesion)."""
+    fn = FORGET_STEPS.get(step)
+    if fn is None:
+        raise HTTPException(404, f"no step {step}; use one of {sorted(FORGET_STEPS)}")
+    body = await request.json()
+    rec = recorder()
+    if getattr(rec, "tracer", None) is None:
+        raise HTTPException(404, "actions need weight anatomy (BRAINSCAN_ANATOMY=1)")
+    try:
+        return await asyncio.to_thread(fn, rec, body)
+    except Busy as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
 
 
 @app.websocket("/brainscan/live")

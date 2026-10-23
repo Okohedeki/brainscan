@@ -6,7 +6,12 @@ internals are recorded and lined up with what the agent does: tool calls, tool r
 test outcomes, file edits, verdicts. You can then trace any token back through the model's
 attention heads and neurons, and change the weights and measure what changed.
 
-The UI follows that workflow in three tabs:
+The UI opens on **Actions**: what you want to do to the model. Each action is tried and measured
+before anything is kept, and the traces are evidence you open when a result needs explaining.
+The first is **Make it forget a fact** (see [Actions](#actions-forget-a-fact)). The cards for
+other jobs open the tool that does them today.
+
+To look around instead, three tabs show the model at work:
 
 1. **Watch**: the run live: transcript, a per-token timeline (logit lens, surprisal,
    projections onto directions), a token inspector, and runtime steering. Ask the model directly
@@ -66,6 +71,32 @@ experience.
 - **Reasoning models** (Qwen3.5): thinking tokens are recorded as their own role and shown as
   collapsible thinking in the transcript; `--thinking on|off` on the harness, or
   `chat_template_kwargs` per request.
+
+## Actions: forget a fact
+
+A fact is a lead-in and the answer the model gives after it ("The capital of Australia is" →
+"Canberra"), typed, or picked from a chat: click a word in Trace and press **Forget this fact**.
+The flow has five steps (`brainscan/recorder/actions.py`, `POST /brainscan/actions/forget/{step}`):
+
+1. **Goal**: the fact, other lead-ins and questions to test it with, and facts it should keep
+   (`lead-in → answer`, one per line). Saved behavior checks are measured too.
+2. **Target**: units are ranked by their direct effect on the answer at the lead-in's last token,
+   and the top 1, 2, 4 … 32 are knocked out together. The smallest set that knocks the answer off
+   first place is suggested; the slider picks any number.
+3. **Try**: greedy answers with and without the units, for every lead-in and question. Nothing
+   in the weights changes.
+4. **Measure**: the answer's probability before and after on every lead-in; the same number of
+   random heads and clusters removed instead, three times (if random units remove the fact too,
+   it wasn't found in these units); the facts to keep and saved checks before and after; and drift
+   on neutral reference text (KL and perplexity). A verdict sums it up: works, partly, kept (still
+   answers) or unspecific.
+5. **Keep**: the units' output weights are zeroed as one edit in the stack and applied now, and
+   the facts to keep (and the forgotten fact) can be saved as behavior checks. Knocking out a unit
+   at run time is the same as zeroing its output weights, so what was measured is what is kept.
+   Restore the original weights, or export the edited model, from **Your model** on the Actions
+   home and from Tune.
+
+Everything is measured on the weights as they are, including any edits already applied.
 
 ## Tune: edit the weights
 
@@ -347,12 +378,14 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 brainscan/recorder/   model loading, hooks, chat rendering, events, storage, session, directions,
                       weight edits (edits.py), workbench checks (workbench.py), models on disk (catalog.py), the weight
                       graph's units, activity probe and edges (anatomy.py), and token tracing:
-                      attribution, neurons and attention at a token (tracing.py)
+                      attribution, neurons and attention at a token (tracing.py), and actions:
+                      forget a fact (actions.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
-ui/                   Watch (app.js, models.js, chat.js), Trace (graph.js, weights.js, paths.js),
-                      Tune (workbench.js) and the guide (guide.js): plain HTML, CSS and canvas
+ui/                   Actions (actions.js, the home), Watch (app.js, models.js, chat.js), Trace
+                      (graph.js, weights.js, paths.js), Tune (workbench.js), the edit stack and
+                      checks (edits.js) and the guide (guide.js): plain HTML, CSS and canvas
                       JavaScript; no build step
 scripts/demo/         product-video recorder (headless Chrome + ffmpeg) and its scenes
 reports/              research reports

@@ -225,13 +225,9 @@ def add_check(recorder, body: dict) -> dict:
         prompt, expect, chat = str(body.get("prompt") or ""), str(body.get("expect") or ""), bool(body.get("chat"))
         if not prompt.strip() or not expect.strip():
             raise ValueError("a check needs a prompt and the token you expect after it")
-        # "The capital of Australia is" => "Canberra" means the token " Canberra"
-        text = expect if chat or expect[:1].isspace() or prompt[-1:].isspace() else " " + expect
-        enc = tok.encode(text, add_special_tokens=False)
-        if not enc:
-            raise ValueError(f"{expect!r} does not tokenize to anything")
-        check = {"kind": "text", "prompt": prompt, "expect": expect, "chat": chat, "target": enc[0],
-                 "target_text": s.token_str(enc[0]), "label": f"{prompt[-60:]} → {s.token_str(enc[0])}"}
+        target = answer_token(s, prompt, expect, chat)
+        check = {"kind": "text", "prompt": prompt, "expect": expect, "chat": chat, "target": target,
+                 "target_text": s.token_str(target), "label": f"{prompt[-60:]} → {s.token_str(target)}"}
     check["id"] = uuid.uuid4().hex[:8]
     checks = list_checks(recorder)
     checks.append(check)
@@ -248,11 +244,27 @@ def remove_check(recorder, cid: str) -> list[dict]:
     return checks
 
 
-def _check_ids(s, c: dict) -> list[int]:
-    if c["chat"]:
-        return render(s.tokenizer, [{"role": "user", "content": c["prompt"]}], None,
+def answer_token(s, prompt: str, expect: str, chat: bool = False) -> int:
+    """The token the model should write next: the first token of `expect`, with the space a
+    continuation needs ("The capital of Australia is" + "Canberra" means the token " Canberra")."""
+    text = expect if chat or expect[:1].isspace() or prompt[-1:].isspace() else " " + expect
+    enc = s.tokenizer.encode(text, add_special_tokens=False)
+    if not enc:
+        raise ValueError(f"{expect!r} does not tokenize to anything")
+    return enc[0]
+
+
+def prompt_ids(s, prompt: str, chat: bool = False) -> list[int]:
+    """Token ids for a typed prompt: plain text after the model's start token, or a one-message chat
+    with the assistant's turn opened (thinking off)."""
+    if chat:
+        return render(s.tokenizer, [{"role": "user", "content": prompt}], None,
                       template_kwargs={"enable_thinking": False}).ids
-    return [s.sink_id] + s.tokenizer(c["prompt"], add_special_tokens=False).input_ids
+    return [s.sink_id] + s.tokenizer(prompt, add_special_tokens=False).input_ids
+
+
+def _check_ids(s, c: dict) -> list[int]:
+    return prompt_ids(s, c["prompt"], c["chat"])
 
 
 @torch.no_grad()
