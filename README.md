@@ -80,24 +80,36 @@ The flow has five steps (`brainscan/recorder/actions.py`, `POST /brainscan/actio
 
 1. **Goal**: the fact, other lead-ins and questions to test it with, and facts it should keep
    (`lead-in → answer`, one per line). Saved behavior checks are measured too.
-2. **Target**: units are ranked two ways, and the top 1, 2, 4 … 32 of each are knocked out
-   together. The smallest set that knocks the answer off first place is suggested; the slider
-   picks any number, and a click on either curve switches ranking.
-   - *Most direct*: by direct effect on the answer at the lead-in's last token.
+2. **Target**: units are ranked against every way of asking for the fact: its lead-in, the other
+   lead-ins, and saved checks that ask for the same answer (the lead-ins Measure checks). Each is
+   attributed at its last token, and a unit's direct effects are combined across them by the mean
+   (or the min, with `"combine": "min"` in the request, which counts a unit by the way of asking
+   where it pushes least). The top 1, 2, 4 … 32 of each ranking are knocked out together, and each
+   point counts the ways of asking it removes the answer after. The smallest set that removes it
+   after all of them is suggested; the slider picks any number, and a click on either curve
+   switches ranking.
+   - *Most direct*: by the combined direct effect on the answer.
    - *Most specific* (with facts to keep or saved checks): each fact to keep is attributed the same
-     way at its own lead-in, and a unit scores its effect on the answer minus the most it pushes
-     any fact to keep. A greedy pass then adds units in that order, knocking out the set so far,
-     and skips any unit after which a fact to keep loses first place, more than 0.2 of its
-     probability, or half of it. Its curve includes the exact size at which the answer goes.
+     way at its own lead-in, and a unit scores its combined effect on the answer minus the most it
+     pushes any fact to keep. A greedy pass then adds units in that order, knocking out the set so
+     far, and skips any unit after which a fact to keep loses first place, more than 0.2 of its
+     probability, or half of it. Its curve includes the exact size at which the answer is gone
+     after every way of asking.
 
    Every point on both curves also reads the facts to keep, so the curves show what each set
-   costs before Measure judges it. On Qwen3.5-9B, forgetting "Canberra" with Paris, Sydney and Au
-   to keep: the direct ranking needs 4 units after "The capital city of Australia is" (8 in a
-   chat) and breaks Paris (0.21 → 0.04) and Sydney (0.49 → 0.07; 0.03 in the chat). The specific
-   ranking needs 13 (12 in the chat) and keeps all three first (Paris 0.26, Sydney 0.56; 0.16
-   and 0.45 in the chat); the model then answers "Sydney". It is not free: Canberra stays second
-   (0.24, or 0.42 in the chat), the typed set leaves the chat question answered "Canberra", and
-   the larger set drifts neutral text more (KL 0.087 typed, 0.026 chat).
+   costs before Measure judges it. On Qwen3.5-9B, forgetting "Canberra" after "The capital city of
+   Australia is" and "Australia's capital city is" and in the saved chat check (the answer to
+   "What is the capital of Australia? Answer in one sentence."), with Paris, Sydney and Au to
+   keep: the direct ranking needs 8 units and breaks Paris (0.21 → 0.04) and Sydney
+   (0.49 → 0.02), KL 0.077. The specific ranking needs 15 and Measure says it works: Canberra
+   loses first place after all three (0.74 → 0.27, 0.27 → 0.02, and 0.999 → 0.40 in the chat),
+   Paris, Sydney and Au stay first (0.21, 0.50, 0.79), random units of the same size leave
+   Canberra alone, KL 0.041, and asked in a chat the model now answers "The capital of Australia
+   is Sydney." Ranked against the first lead-in alone, the specific set (13 units) left the chat
+   check at 0.55, still answering "Canberra". The min gives 13 units that also work (KL 0.035) at
+   a little more cost to the facts to keep (Paris 0.15). Either way it is knocked off first place,
+   not erased: Canberra stays second after the first lead-in and in the chat. Target takes about
+   a minute on Qwen with three ways of asking and three facts to keep.
 3. **Try**: greedy answers with and without the units, for every lead-in and question. Nothing
    in the weights changes.
 4. **Measure**: the answer's probability before and after on every lead-in; the same number of

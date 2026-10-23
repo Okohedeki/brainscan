@@ -4,16 +4,18 @@ Forget a fact. The fact is a lead-in and the answer the model gives after it ("T
 Australia is" -> "Canberra"), typed, or a word the model wrote in a recorded run. Four steps:
 
   target   rank the units (attention heads, MLP neuron clusters) by their direct effect on the
-           answer at the lead-in's last token, then knock out the top 1, 2, 4 ... 32 to see how
-           many it takes before the model no longer gives the answer. The smallest such set is
+           answer at the last token of every way of asking for it (the fact's lead-in, the other
+           lead-ins, and saved checks that ask for the same answer), combined across them (the mean
+           by default, or the min), then knock out the top 1, 2, 4 ... 32 to see how many it takes
+           before the model no longer gives the answer after any of them. The smallest such set is
            suggested. "No longer gives it": the answer loses first place; for an answer that wasn't
            first to begin with, it keeps under a tenth of its probability (and the UI says the
            model wasn't stating the fact after that lead-in). With facts to keep, a second, more
            specific ranking: each fact to keep is attributed the same way, a unit scores its
-           effect on the answer minus the most it pushes any fact to keep, and a greedy pass adds
-           units in that order, knocking out the set so far, and skips any unit after which a fact
-           to keep broke or kept under half its probability. Every point on both curves reads the
-           facts to keep too.
+           combined effect on the answer minus the most it pushes any fact to keep, and a greedy
+           pass adds units in that order, knocking out the set so far, and skips any unit after
+           which a fact to keep broke or kept under half its probability. Every point on both
+           curves reads every lead-in and the facts to keep.
   try      greedy answers with and without the units for every way of asking: lead-ins continued
            as text, and questions asked as chat (thinking off).
   measure  the answer's probability before and after on every lead-in; the same number of random
@@ -51,6 +53,7 @@ LEAD_TOKENS, QUESTION_TOKENS = 20, 48
 BROKEN_DROP = 0.2              # a fact to keep "broke" if it lost first place or this much probability
 DRIFT_NOTICEABLE = 0.05        # KL per token on neutral text, in nats
 FADED = 0.1                    # an answer that wasn't first counts as gone below this share of its probability
+COMBINE = "mean"               # how Target combines a unit's effects across the ways of asking: "mean" or "min"
 
 
 @dataclass
@@ -132,41 +135,55 @@ def spared(before: dict, after: dict, p0: float, p1: float) -> bool:
     return not broke(before, after) and p1 >= GUARD * p0
 
 
-def _unit(an, g: int, direct: float, push: float | None = None) -> dict:
+def _unit(an, g: int, direct: float, push: float | None = None, by_lead=None) -> dict:
     lm, kind, i = an.locate(g)
     out = {"g": int(g), "name": f"L{lm.index} {'h' if kind == 'head' else 'c'}{i}", "kind": kind,
            "layer": lm.index, "direct": round(float(direct), 4)}
+    if by_lead is not None and len(by_lead) > 1:
+        out["by_lead"] = [round(float(x), 4) for x in by_lead]
     if push is not None:
         out["keep"] = round(float(push), 4)
     return out
 
 
 def _leads(s, f: Fact, extra) -> list[dict]:
-    """The fact's own lead-in, then the other ways of leading into the same answer."""
-    out = [{"text": f.lead, "ids": f.ids, "target": f.target}]
+    """The fact's own lead-in, then the other ways of leading into the same answer, each once."""
+    out, seen = [{"text": f.lead, "ids": f.ids, "target": f.target, "source": "lead"}], {(tuple(f.ids), f.target)}
     for line in _lines(extra, MAX_LEADS, "other lead-ins"):
         line = line.rstrip()
-        out.append({"text": line, "ids": workbench.prompt_ids(s, line),
-                    "target": workbench.answer_token(s, line, f.answer)})
+        ld = {"text": line, "ids": workbench.prompt_ids(s, line), "target": workbench.answer_token(s, line, f.answer),
+              "source": "lead"}
+        if (tuple(ld["ids"]), ld["target"]) not in seen:
+            seen.add((tuple(ld["ids"]), ld["target"]))
+            out.append(ld)
     return out
 
 
 # ---- target -------------------------------------------------------------------------------------
 
-def _point(s, tr, f: Fact, before: dict, keep: list[dict], units: list[int], reads: list[dict] | None = None) -> dict:
-    """The fact, and every fact to keep, with these units knocked out. The caller holds the model."""
-    after = _read(s, tr.last_logits(f.ids, units), f.target)
+def _combine(effects: np.ndarray, how: str) -> np.ndarray:
+    """One effect per unit from its effect after each way of asking (one row each): the mean, or the
+    min, which counts a unit only as much as it pushes the answer where it pushes it least."""
+    return effects.min(0) if how == "min" else effects.mean(0)
+
+
+def _point(s, tr, leads: list[dict], keep: list[dict], units: list[int], reads: list[dict] | None = None) -> dict:
+    """Every lead-in, and every fact to keep, with these units knocked out. "gone" means gone after
+    every lead-in; prob, rank and top are the fact's own lead-in. The caller holds the model."""
+    after = [_read(s, tr.last_logits(ld["ids"], units), ld["target"]) for ld in leads]
     if reads is None:
         reads = [_read(s, tr.last_logits(k["ids"], units), k["target"]) for k in keep]
-    return {"k": len(units), "gone": gone(before, after)} | after | {
-        "keep": reads, "broken": sum(broke(k["before"], r) for k, r in zip(keep, reads))}
+    n_gone = sum(gone(ld["before"], a) for ld, a in zip(leads, after))
+    return {"k": len(units), "gone": n_gone == len(leads), "leads_gone": n_gone} | after[0] | {
+        "leads": after, "keep": reads, "broken": sum(broke(k["before"], r) for k, r in zip(keep, reads))}
 
 
-def _greedy(s, tr, f: Fact, before: dict, keep: list[dict], pool: list[int]) -> tuple[list[int], list[dict], list[int]]:
+def _greedy(s, tr, leads: list[dict], keep: list[dict], pool: list[int]) -> tuple[list[int], list[dict], list[int]]:
     """Add the pool's units in order, knocking out the set so far, and skip any unit after which a
-    fact to keep isn't spared. The units taken, the point after each one, and the units skipped.
+    fact to keep isn't spared. The units taken, the point after each one up to the first where the
+    answer is gone after every lead-in and at the curve's sizes past it, and the units skipped.
     The caller holds the model."""
-    chosen, points, skipped = [], [], []
+    chosen, points, skipped, flipped = [], [], [], False
     for g in pool:
         if len(chosen) >= CANDIDATES:
             break
@@ -181,36 +198,56 @@ def _greedy(s, tr, f: Fact, before: dict, keep: list[dict], pool: list[int]) -> 
             skipped.append(g)
             continue
         chosen = trial
-        points.append(_point(s, tr, f, before, keep, chosen, reads))
+        if flipped and len(chosen) not in CURVE:
+            continue
+        points.append(_point(s, tr, leads, keep, chosen, reads))
+        flipped = flipped or points[-1]["gone"]
     return chosen, points, skipped
 
 
-def _ranking(an, order: list[int], curve: list[dict], c: np.ndarray, push: np.ndarray | None, **extra) -> dict:
+def _ranking(an, order: list[int], curve: list[dict], c: np.ndarray, push: np.ndarray | None,
+             effects: np.ndarray, **extra) -> dict:
     flip = next((p["k"] for p in curve if p["gone"]), None)
-    return {"units": [_unit(an, g, c[g], None if push is None else push[g]) for g in order], "curve": curve,
-            "suggested": flip or (curve[-1]["k"] if curve else 0), "flipped": flip is not None} | extra
+    return {"units": [_unit(an, g, c[g], None if push is None else push[g], effects[:, g]) for g in order],
+            "curve": curve, "suggested": flip or (curve[-1]["k"] if curve else 0), "flipped": flip is not None} | extra
 
 
 def forget_target(recorder, body: dict) -> dict:
-    """Rank the units that push the answer up, and how many it takes to knock it off first place.
+    """Rank the units that push the answer up after every way of asking for it, and how many it takes
+    before the model no longer gives it after any of them.
 
-    direct    by direct effect on the answer at the lead-in's last token.
+    The ways of asking are the fact's lead-in, the other lead-ins, and the saved checks that ask for
+    the same answer (Measure's lead-ins). Each is attributed at its last token, and a unit's effects
+    are combined across them: COMBINE, or body "combine" ("mean" or "min").
+
+    direct    by that combined direct effect.
     specific  only with facts to keep (typed, or saved checks): each fact to keep is attributed at its
-              own lead-in's last token the same way; a unit scores its effect on the answer minus
+              own lead-in's last token the same way; a unit scores its combined effect minus
               SPECIFIC_WEIGHT x the most it pushes any fact to keep, and the greedy pass takes the
               units in that order, skipping any that leave a fact to keep broken or under GUARD of
-              its probability. Its curve adds the exact size at which the answer goes.
+              its probability. Its curve adds the exact size at which the answer is gone after every
+              lead-in.
     """
     s, tr = recorder.s, recorder.tracer
     f = fact(recorder, body)
+    how = str(body.get("combine") or COMBINE)
+    if how not in ("mean", "min"):
+        raise ValueError("combine the effects across lead-ins by mean or min")
     t0 = time.perf_counter()
-    cap = tr.capture_ids(f.ids)
-    c = tr.attribute(cap, f.target)[0].cpu().numpy()
+    leads = _leads(s, f, body.get("leads"))
+    keep = [k for k in _sort_keep(recorder, f, leads, body) if not k.get("error")]
+    caps, effects = [], []
+    for ld in leads:
+        caps.append(tr.capture_ids(ld["ids"]))
+        ld["before"] = _read(s, caps[-1].logits, ld["target"])
+        effects.append(tr.attribute(caps[-1], ld["target"])[0].cpu().numpy())
+    effects = np.stack(effects)
+    c = _combine(effects, how)
     ranked = [int(g) for g in np.argsort(-c) if c[g] > 0][:CANDIDATES]
     if not ranked:
-        raise ValueError("no unit pushes this answer up, so there is nothing to remove")
-    before = _read(s, cap.logits, f.target)
-    keep = [k for k in _sort_keep(recorder, f, [{"ids": f.ids, "target": f.target}], body) if not k.get("error")]
+        raise ValueError("no unit pushes this answer up" + (" after every lead-in" if how == "min" and len(leads) > 1 else "")
+                         + ", so there is nothing to remove")
+    before = leads[0]["before"]
     push = np.zeros_like(c) if keep else None
     for k in keep:
         kcap = tr.capture_ids(k["ids"])
@@ -218,27 +255,30 @@ def forget_target(recorder, body: dict) -> dict:
         k["p"] = float(torch.softmax(kcap.logits, -1)[k["target"]])
         push = np.maximum(push, tr.attribute(kcap, k["target"])[0].cpu().numpy())
     with tr._model():
-        curve = [_point(s, tr, f, before, keep, ranked[:k]) for k in CURVE if k <= len(ranked)]
-        rankings = {"direct": _ranking(tr.an, ranked, curve, c, push, seconds=round(time.perf_counter() - t0, 2)),
+        curve = [_point(s, tr, leads, keep, ranked[:k]) for k in CURVE if k <= len(ranked)]
+        rankings = {"direct": _ranking(tr.an, ranked, curve, c, push, effects, seconds=round(time.perf_counter() - t0, 2)),
                     "specific": None}
         if keep:
             t1 = time.perf_counter()
             score = c - SPECIFIC_WEIGHT * push
             pool = [int(g) for g in np.argsort(-score) if score[g] > 0][:POOL]
-            chosen, points, skipped = _greedy(s, tr, f, before, keep, pool)
+            chosen, points, skipped = _greedy(s, tr, leads, keep, pool)
             flip = next((p["k"] for p in points if p["gone"]), None)
             rankings["specific"] = _ranking(
-                tr.an, chosen, [p for p in points if p["k"] in CURVE or p["k"] == flip], c, push,
-                skipped=[_unit(tr.an, g, c[g], push[g]) for g in skipped], pool=len(pool),
+                tr.an, chosen, [p for p in points if p["k"] in CURVE or p["k"] == flip], c, push, effects,
+                skipped=[_unit(tr.an, g, c[g], push[g], effects[:, g]) for g in skipped], pool=len(pool),
                 weight=SPECIFIC_WEIGHT, guard=GUARD, seconds=round(time.perf_counter() - t1, 2))
     spec = rankings["specific"]
-    probs = torch.softmax(cap.logits, -1)
+    probs = torch.softmax(caps[0].logits, -1)
     top_p, top_i = probs.topk(5)
     return {
         "fact": {"lead": f.lead, "answer": f.answer, "token": s.token_str(f.target), "question": f.question,
                  "source": f.source, **before, "first": before["rank"] == 1,
                  "alternatives": [{"text": s.token_str(int(i)), "prob": round(float(p), 5)}
                                   for p, i in zip(top_p.tolist(), top_i.tolist())]},
+        "leads": [{"text": ld["text"], "source": ld["source"], "token": s.token_str(ld["target"])} | ld["before"]
+                  | {"first": ld["before"]["rank"] == 1} for ld in leads],
+        "combine": how,
         "keep": [{"label": k["label"], "source": k["source"], "token": s.token_str(k["target"])} | k["before"] for k in keep],
         "rankings": rankings,
         "ranking": "specific" if spec and spec["flipped"] else "direct",
@@ -289,8 +329,9 @@ def _random_units(an, units: list[int], seed: int) -> list[int]:
 
 
 def _clean(label: str) -> str:
-    """A check's label without chat-template markers."""
+    """A check's label without chat-template markers, including one the label's "…" cut into."""
     label = re.sub(r"<\|[^|>]*\|>\s*(?:system|user|assistant)?|</?think>", " ", label)
+    label = re.sub(r"^[\s…]*[^\s<|>]*\|>\s*(?:system|user|assistant)?", " ", label)
     return re.sub(r"\s+", " ", label).strip(" …")
 
 
@@ -380,8 +421,6 @@ def forget_measure(recorder, body: dict) -> dict:
     f = fact(recorder, body)
     units = tr.check_units(body.get("units"))
     leads = _leads(s, f, body.get("leads"))
-    for ld in leads:
-        ld["source"] = "lead"
     keep = _sort_keep(recorder, f, leads, body)
     controls = [_random_units(tr.an, units, seed) for seed in range(CONTROL_SEEDS)]
     t0 = time.perf_counter()

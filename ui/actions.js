@@ -167,17 +167,47 @@ function curveHtml(name) {
       <span class="k">${plural(p.k, "unit")}</span>
       <span class="pbar"><i style="width:${Math.max(1, p.prob * 100).toFixed(1)}%"></i></span>
       <span class="v">p ${fmtP(p.prob)}</span>
-      <span class="st"><span class="dim">${p.gone ? `gone: now answers <b>${esc(vis(p.top))}</b>` : p.rank === 1 ? "still its first answer" : `still #${p.rank}`}</span>${keepCell(p)}</span></li>`).join("")}</ul>`;
+      <span class="st">${leadCell(p)}${keepCell(p)}</span></li>`).join("")}</ul>`;
 }
+
+/** Whether the answer is gone at a curve point, after the fact's lead-in or after every way of asking. */
+function leadCell(p) {
+  const leads = F.target.leads, n = leads.length;
+  if (n < 2) return `<span class="dim">${p.gone ? `gone: now answers <b>${esc(vis(p.top))}</b>` : p.rank === 1 ? "still its first answer" : `still #${p.rank}`}</span>`;
+  const tip = leads.map((ld, i) => `${cleanText(ld.text).slice(-50)}: ${fmtP(ld.prob)} → ${fmtP(p.leads[i]?.prob)} (#${p.leads[i]?.rank})`).join("\n");
+  return `<span class="dim" title="${esc(tip)}">${p.gone ? `gone after all ${n} ways of asking: now answers <b>${esc(vis(p.top))}</b>`
+    : `gone after ${p.leads_gone} of ${n} ways of asking`}</span>`;
+}
+
+/** "after every way of asking" when the fact is asked for more than one way. */
+const everyWay = () => (F.target.leads.length > 1 ? ` after all ${F.target.leads.length} ways of asking` : "");
 
 /** One line on a ranking: how many units remove the answer, and what that costs the facts to keep. */
 function rankLine(name) {
   const r = F.target.rankings[name];
   if (!r.units.length) return "Every unit that pushes the answer pushes a fact to keep as much, or hurts one.";
   const p = r.curve.find((x) => x.k === r.suggested) || r.curve[r.curve.length - 1];
-  const lost = lostAt(p);
-  return `${r.flipped ? `${plural(r.suggested, "unit")} remove it` : `${plural(p.k, "unit")} don't remove it`}${F.target.keep.length
+  const lost = lostAt(p), n = F.target.leads.length;
+  const removes = r.flipped ? `${plural(r.suggested, "unit")} remove it${everyWay()}`
+    : n > 1 && p.leads_gone ? `${plural(p.k, "unit")} remove it after ${p.leads_gone} of ${n} ways of asking` : `${plural(p.k, "unit")} don't remove it`;
+  return `${removes}${F.target.keep.length
     ? (lost.length ? `, and ${esc(lost.map((k) => shortLabel(k.label)).join(", "))} break${lost.length === 1 ? "s" : ""}` : ", and every fact to keep is spared") : ""}.`;
+}
+
+/** How a unit's effects were combined over the ways of asking ("" for one lead-in). */
+function combinedHow() {
+  const n = F.target.leads.length;
+  if (n < 2) return "";
+  return F.target.combine === "min" ? `at the one of the ${n} ways of asking where it wrote least` : `averaged over the ${n} ways of asking`;
+}
+
+/** Every way of asking for the fact that Target ranks against: the lead-ins and saved checks for the same answer. */
+function leadsHtml() {
+  const leads = F.target.leads;
+  if (leads.length < 2) return "";
+  return `<div class="chips"><span class="lbl">ranked against ${leads.length} ways of asking</span>${leads.map((ld) => `<span class="chip" title="${esc(cleanText(ld.text))}">
+    ${ld.source === "check" ? `<span class="dim">check</span> ` : ""}…${esc(cleanText(ld.text).replace(/\s*→.*$/, "").slice(-40))}
+    <span class="dim">${fmtP(ld.prob)}${ld.first ? "" : ` #${ld.rank}`}</span></span>`).join("")}</div>`;
 }
 
 function rankingsHtml() {
@@ -186,6 +216,7 @@ function rankingsHtml() {
     return `<h3>How many units it takes</h3>${curveHtml("direct")}
       ${t.keep.length ? "" : `<p class="hint">Add facts to keep in Goal to also rank the units by how specific they are to this answer.</p>`}`;
   }
+  const how = combinedHow();
   const skipped = spec.skipped.length
     ? ` <span title="${esc(spec.skipped.map((u) => u.name).join(", "))}">Skipped ${plural(spec.skipped.length, "unit")} that hurt a fact to keep.</span>` : "";
   const col = (name, how) => {
@@ -197,8 +228,8 @@ function rankingsHtml() {
   };
   return `<h3>How many units it takes, ranked two ways</h3>
     <div class="rank-cols">
-      ${col("direct", "By how much each unit wrote toward the answer.")}
-      ${col("specific", `By how much more it wrote toward the answer than toward any fact to keep, each added only if every fact to keep keeps first place and ${Math.round(spec.guard * 100)}% of its probability.${skipped}`)}
+      ${col("direct", `By how much each unit wrote toward the answer${how ? `, ${how}` : ""}.`)}
+      ${col("specific", `By how much more it wrote toward the answer than toward any fact to keep${how ? ` (${how})` : ""}, each added only if every fact to keep keeps first place and ${Math.round(spec.guard * 100)}% of its probability.${skipped}`)}
     </div>`;
 }
 
@@ -219,13 +250,14 @@ function targetHtml() {
     ${f.first ? "" : `<div class="verdict partial">After this lead-in the model's first answer is “${esc(vis(f.alternatives[0]?.text))}”, not “${esc(f.answer)}”:
       it isn't stating this fact here. Pick a lead-in it answers with “${esc(f.answer)}” first, or start from a word in a chat. Here, “gone” means under a tenth of its probability.</div>`}
     ${alts ? `<div class="chips"><span class="lbl">also considered</span>${alts}</div>` : ""}
+    ${leadsHtml()}
     ${rankingsHtml()}
     <p class="hint">${r.flipped
-      ? `Suggested${t.rankings.specific ? ` (${esc(RANKINGS[F.ranking].toLowerCase())})` : ""}: <b>${plural(r.suggested, "unit")}</b>, the smallest set here after which the model no longer gives “${esc(f.answer)}”.`
-      : `Even ${last.k} units don't remove it: the answer is spread widely, or other units take over. You can still try.`}
-      Each row removes the top units together${t.keep.length ? " and reads the facts to keep with them removed" : ""}. Measure judges the set you pick.</p>
+      ? `Suggested${t.rankings.specific ? ` (${esc(RANKINGS[F.ranking].toLowerCase())})` : ""}: <b>${plural(r.suggested, "unit")}</b>, the smallest set here after which the model no longer gives “${esc(f.answer)}”${everyWay()}.`
+      : `Even ${last.k} units don't remove it${everyWay()}: the answer is spread widely, or other units take over. You can still try.`}
+      Each row removes the top units together and reads ${t.leads.length > 1 ? "every way of asking" : "the lead-in"}${t.keep.length ? " and the facts to keep" : ""} with them removed. Measure judges the set you pick.</p>
     ${kSlider()}
-    <div class="unit-chips">${r.units.map((u, i) => `<span class="uchip ${u.kind} ${i < F.k ? "on" : ""}" title="${u.kind === "head" ? "attention head" : "MLP neuron cluster"} · wrote ${u.direct >= 0 ? "+" : ""}${u.direct} toward the answer${u.keep != null ? `, up to +${u.keep} toward a fact to keep` : ""}">${esc(u.name)}</span>`).join("")}</div>
+    <div class="unit-chips">${r.units.map((u, i) => `<span class="uchip ${u.kind} ${i < F.k ? "on" : ""}" title="${u.kind === "head" ? "attention head" : "MLP neuron cluster"} · wrote ${u.direct >= 0 ? "+" : ""}${u.direct} toward the answer${u.by_lead ? `, ${combinedHow()} (${u.by_lead.map((x) => (x >= 0 ? "+" : "") + x).join(", ")})` : ""}${u.keep != null ? `, up to +${u.keep} toward a fact to keep` : ""}">${esc(u.name)}</span>`).join("")}</div>
     ${F.source ? `<button type="button" class="link" id="fl-why">See the trace behind this word →</button>` : ""}
     <div class="fl-actions"><button type="button" class="btn" data-goto="goal">← Goal</button>
       <button type="button" class="primary" data-goto="try">Try it →</button></div>`;

@@ -181,6 +181,95 @@ def test_specific_ranking_spares_the_facts_to_keep(rec, clean, monkeypatch):
     assert all(len(p["keep"]) == len(keep) for p in res["rankings"]["direct"]["curve"])
 
 
+LEADS = "Violets are\nRoses are"
+
+
+def ways_of_asking(rec, f):
+    """The fact's lead-in, the typed LEADS, and a saved check asking for the same answer, as
+    (ids, target) in the order Target and Measure list them."""
+    s = rec.s
+    checks = workbench.list_checks(rec)
+    checks.append({"kind": "text", "prompt": "The sky is", "expect": "x", "chat": False, "target": f.target,
+                   "target_text": "x", "label": "The sky is → x", "id": "samefact"})
+    workbench._save_checks(rec, checks)
+    typed = [(workbench.prompt_ids(s, line), workbench.answer_token(s, line, f.answer)) for line in LEADS.splitlines()]
+    return [(f.ids, f.target)] + typed + [(workbench.prompt_ids(s, "The sky is"), f.target)]
+
+
+def test_target_ranks_against_every_way_of_asking(rec, clean, monkeypatch):
+    _, _, body = run_fact(rec)
+    tr, f = rec.tracer, actions.fact(rec, body)
+    ways = ways_of_asking(rec, f)
+    attributed = []
+    attribute = tr.attribute
+    monkeypatch.setattr(tr, "attribute", lambda cap, tid: attributed.append((tuple(cap.ids), tid)) or attribute(cap, tid))
+    res = actions.forget_target(rec, body | {"leads": LEADS, "keep": ""})
+    monkeypatch.undo()
+    # Every lead-in and the saved check for the same answer are attributed, in Measure's order.
+    assert attributed == [(tuple(ids), tid) for ids, tid in ways]
+    assert [ld["source"] for ld in res["leads"]] == ["lead", "lead", "lead", "check"] and res["keep"] == []
+    assert res["combine"] == actions.COMBINE == "mean" and res["rankings"]["specific"] is None
+    effects = np.stack([tr.attribute(tr.capture_ids(ids), tid)[0].cpu().numpy() for ids, tid in ways])
+    r = res["rankings"]["direct"]
+    # A unit's effect is its mean effect over the ways of asking, and the ranking is by it.
+    for u in r["units"]:
+        assert u["direct"] == pytest.approx(effects[:, u["g"]].mean(), abs=1e-3)
+        assert u["by_lead"] == pytest.approx(effects[:, u["g"]].tolist(), abs=1e-3)
+    assert [u["g"] for u in r["units"]] == [int(g) for g in np.argsort(-effects.mean(0)) if effects.mean(0)[g] > 0][:actions.CANDIDATES]
+    with tr._model():
+        befores = [read(rec, ids, tid) for ids, tid in ways]
+        for ld, b in zip(res["leads"], befores):
+            assert ld["prob"] == pytest.approx(b["prob"], abs=1e-5) and ld["rank"] == b["rank"]
+        for p in r["curve"]:
+            # Each point reads every way of asking; it is gone only when gone after all of them.
+            units = [u["g"] for u in r["units"][:p["k"]]]
+            now = [read(rec, ids, tid, units) for ids, tid in ways]
+            assert [x["prob"] for x in p["leads"]] == pytest.approx([x["prob"] for x in now], abs=1e-5)
+            assert p["leads_gone"] == sum(actions.gone(b, x) for b, x in zip(befores, now))
+            assert p["gone"] == (p["leads_gone"] == len(ways))
+            assert (p["prob"], p["rank"]) == (p["leads"][0]["prob"], p["leads"][0]["rank"])
+    flip = next((p["k"] for p in r["curve"] if p["gone"]), None)
+    assert r["flipped"] == (flip is not None) and r["suggested"] == (flip or r["curve"][-1]["k"])
+    # The min counts a unit by the way of asking where it pushes the answer least.
+    res = actions.forget_target(rec, body | {"leads": LEADS, "keep": "", "combine": "min"})
+    assert res["combine"] == "min"
+    for u in res["rankings"]["direct"]["units"]:
+        assert u["direct"] == pytest.approx(effects[:, u["g"]].min(), abs=1e-3) and u["direct"] >= 0
+    with pytest.raises(ValueError):
+        actions.forget_target(rec, body | {"combine": "max"})
+    # A lead-in typed twice, or the fact's own lead-in typed again, is one way of asking.
+    typed = actions.fact(rec, {"prompt": "Roses are", "answer": "red"})
+    assert [ld["text"] for ld in actions._leads(rec.s, typed, "Roses are\nViolets are\nViolets are ")] == ["Roses are", "Violets are"]
+
+
+def test_specific_ranking_counts_the_fact_gone_after_every_way_of_asking(rec, clean, monkeypatch):
+    _, _, body = run_fact(rec)
+    f = actions.fact(rec, body)
+    ways, keep = ways_of_asking(rec, f), keep_facts(rec)
+    # The tiny model's probabilities are near uniform, so here "gone" is any drop in rank.
+    monkeypatch.setattr(actions, "gone", lambda before, after: after["rank"] > before["rank"])
+    res = actions.forget_target(rec, body | {"leads": LEADS, "keep": KEEP})
+    spec = res["rankings"]["specific"]
+    assert len(res["keep"]) == 3 and len(res["leads"]) == len(ways)
+    units = [u["g"] for u in spec["units"]]
+    with rec.tracer._model():
+        befores = [read(rec, ids, tid) for ids, tid in ways]
+        held = lambda k: [not actions.gone(b, read(rec, ids, tid, units[:k] or None)) for b, (ids, tid) in zip(befores, ways)]
+        for p in spec["curve"]:
+            still = held(p["k"])
+            assert p["leads_gone"] == still.count(False) and p["gone"] == (not any(still))
+            assert len(p["keep"]) == len(keep)
+        # The exact smallest set gone after every way of asking: one fewer leaves one holding it.
+        assert spec["flipped"] and any(held(spec["suggested"] - 1)) and not any(held(spec["suggested"]))
+    assert all(not p["gone"] for p in spec["curve"] if p["k"] < spec["suggested"])
+    # Counting the fact's own lead-in alone would have stopped sooner.
+    assert any(actions.gone(befores[0], p["leads"][0]) for p in spec["curve"] if p["k"] < spec["suggested"])
+    for name in ("direct", "specific"):
+        r = res["rankings"][name]
+        assert r["flipped"] and next(p for p in r["curve"] if p["k"] == r["suggested"])["leads_gone"] == len(ways)
+    assert res["ranking"] == "specific"
+
+
 def test_target_sorts_saved_checks_like_measure(rec, clean):
     _, _, body = run_fact(rec)
     f = actions.fact(rec, body)
@@ -275,6 +364,14 @@ def test_gone():
     # An answer that wasn't first must lose most of its probability.
     assert not actions.gone({"rank": 2, "prob": 0.2}, {"rank": 5, "prob": 0.05})
     assert actions.gone({"rank": 2, "prob": 0.2}, {"rank": 40, "prob": 0.01})
+
+
+def test_check_labels_lose_template_markers():
+    assert actions._clean("<|im_start|>Roses are → x") == "Roses are → x"
+    # A saved label cut to its last characters can start inside a marker.
+    cut = "…rt|>assistant\n<think>\n\n</think>\n\nThe capital of Australia is →  Canberra"
+    assert actions._clean(cut) == "The capital of Australia is → Canberra"
+    assert actions._clean("One, two, → three") == "One, two, → three"
 
 
 def test_verdicts():
