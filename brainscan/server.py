@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
-from .recorder import actions, catalog, workbench
+from .recorder import actions, catalog, monitors, workbench
 from .recorder.model import Subject, display_name
 from .recorder.session import Cancelled, GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
@@ -625,6 +625,58 @@ async def delete_check(cid: str):
         return workbench.remove_check(recorder(), cid)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/brainscan/monitors")
+async def get_monitors():
+    return recorder().monitors.list()
+
+
+@app.post("/brainscan/monitors")
+async def post_monitor(request: Request):
+    """Watch a direction: {direction, threshold, sign (above|below|either), min_tokens, phase
+    (gen|all), label}. Runs recorded from now on raise a "monitor" event when the rule is met."""
+    body = await request.json()
+    rec = recorder()
+    try:
+        return rec.monitors.add(body, set(rec.directions.dirs)).describe()
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.patch("/brainscan/monitors/{mid}")
+async def patch_monitor(mid: str, request: Request):
+    body = await request.json()
+    try:
+        return recorder().monitors.update(mid, body).describe()
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.delete("/brainscan/monitors/{mid}")
+async def delete_monitor(mid: str):
+    try:
+        return recorder().monitors.remove(mid)
+    except KeyError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+
+@app.get("/brainscan/runs/{run_id}/flags")
+async def run_flags(run_id: str):
+    """Every monitor's flags on a recorded run, with the same rule on the random control."""
+    rec = recorder()
+    run = rec.get_run(run_id)
+    if run is None:
+        raise HTTPException(404, f"no run {run_id}")
+    return await asyncio.to_thread(monitors.scan_run, rec.monitors, run.tape, rec.directions.describe())
+
+
+@app.get("/brainscan/flags")
+async def flags_across_runs(limit: int = 20):
+    """Flag counts per enabled monitor on the most recent runs."""
+    return await asyncio.to_thread(monitors.scan_runs, recorder(), limit)
 
 
 @app.post("/brainscan/checks/run")

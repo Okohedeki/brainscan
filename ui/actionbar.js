@@ -12,10 +12,11 @@
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const TAB = { scanner: "Watch", weights: "Trace", workbench: "Tune" };
-const TONE = { Test: "ex", Steer: "ex", Change: "ch", Verify: "vf", Ship: "vf" };
+const TONE = { Test: "ex", Steer: "ex", Change: "ch", Verify: "vf", Ship: "vf", Monitor: "vf" };
 const SAVED = "brainscan-action";
 
-const BARS = new Map();   // tab -> { groups, context, actions, state, el, sig, note }
+const BARS = new Map();   // tab -> { groups, context, actions, states, el, sig, note }
+const PENDING = new Map(); // tab -> tools other modules added before the screen defined its bar
 let view = null;          // the screen on show
 // What the edit panels report from any screen: the edit stack and the behavior checks (ui/edits.js).
 const SHARED = { applied: 0, edits: 0, checks: 0, checked: false };
@@ -35,9 +36,11 @@ const runOn = (tab, run) => { if (tab !== view) { show(tab); setTimeout(run, 120
 export function st(key) {
   if (key in SHARED) return SHARED[key];
   for (const bar of BARS.values()) {
-    let s = null;
-    try { s = bar.state?.(); } catch { /* not ready */ }
-    if (s && key in s) return s[key];
+    for (const state of bar.states) {
+      let s = null;
+      try { s = state(); } catch { /* not ready */ }
+      if (s && key in s) return s[key];
+    }
   }
   return undefined;
 }
@@ -46,7 +49,9 @@ export function st(key) {
  *          actions: [{ id, group, label, hint, need, run, choices }] }
  *  `choices` (optional) returns [{ label, run }]: the tool opens a menu of them. */
 export function defineBar(tab, spec) {
-  const bar = { ...spec, el: document.querySelector(`[data-bar="${tab}"]`), sig: "", note: null };
+  const bar = { ...spec, states: spec.state ? [spec.state] : [], el: document.querySelector(`[data-bar="${tab}"]`), sig: "", note: null };
+  for (const extra of PENDING.get(tab) || []) merge(bar, extra);
+  PENDING.delete(tab);
   BARS.set(tab, bar);
   if (bar.el) {
     bar.el.addEventListener("click", (ev) => onBarClick(tab, ev));
@@ -56,6 +61,21 @@ export function defineBar(tab, spec) {
     }).observe(bar.el);
   }
   refreshBar(tab);
+}
+
+/** Another module's tools on a screen's bar (spec: { groups, before, state, actions }, `before`
+ * naming the group they go in front of), as if the screen had defined them. */
+export function extendBar(tab, spec) {
+  const bar = BARS.get(tab);
+  if (!bar) { PENDING.set(tab, [...(PENDING.get(tab) || []), spec]); return; }
+  merge(bar, spec);
+  refreshBar(tab);
+}
+function merge(bar, spec) {
+  const at = spec.before ? bar.groups.indexOf(spec.before) : -1;
+  bar.groups = at < 0 ? [...bar.groups, ...spec.groups] : [...bar.groups.slice(0, at), ...spec.groups, ...bar.groups.slice(at)];
+  bar.actions = [...bar.actions, ...spec.actions];
+  if (spec.state) bar.states.push(spec.state);
 }
 
 /** Re-render a screen's bar if what it shows changed (cheap to call often). The bar on show is

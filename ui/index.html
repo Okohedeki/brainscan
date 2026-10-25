@@ -123,6 +123,40 @@
           <ul id="dir-list" class="dir-list"></ul>
         </section>
       </div>
+
+      <section class="panel monitors" aria-labelledby="h-monitors">
+        <div class="panel-head">
+          <h2 id="h-monitors">Monitors</h2>
+          <button type="button" class="link" id="mon-scan">Scan recent runs</button>
+        </div>
+        <p class="hint">Flag a run when a probe fires: a direction's z-score past a threshold for some tokens in a row.
+          Runs are checked as they are recorded, and older runs on a scan. The random direction on the same rule shows
+          how often noise alone would fire it.</p>
+        <form id="mon-form" class="mon-form">
+          <label>Direction<select id="mon-dir"></select></label>
+          <label>When z is
+            <select id="mon-sign">
+              <option value="above">above +</option>
+              <option value="below">below −</option>
+              <option value="either">beyond ±</option>
+            </select>
+          </label>
+          <label>Threshold<input id="mon-z" type="number" min="0.1" max="20" step="0.1" value="2"></label>
+          <label>Tokens in a row<input id="mon-n" type="number" min="1" max="512" step="1" value="3"></label>
+          <label>On
+            <select id="mon-phase">
+              <option value="gen">the model's own tokens</option>
+              <option value="all">every new token</option>
+            </select>
+          </label>
+          <button type="submit" class="primary">Add monitor</button>
+        </form>
+        <div class="wb-msg" id="mon-msg" role="status"></div>
+        <ul id="mon-list" class="iv-list"></ul>
+        <h3 id="h-flags">Flags in this run</h3>
+        <div id="mon-run"></div>
+        <div id="mon-across"></div>
+      </section>
     </div>
   </main>
 
@@ -429,6 +463,7 @@
   <script type="module" src="/ui/actionbar.js"></script>
   <script type="module" src="/ui/actions.js"></script>
   <script type="module" src="/ui/app.js"></script>
+  <script type="module" src="/ui/monitors.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
   <script type="module" src="/ui/weights.js"></script>
   <script type="module" src="/ui/verbs.js"></script>

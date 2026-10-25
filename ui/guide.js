@@ -26,6 +26,7 @@ const STEPS = [
       { name: "Connect an agent", what: "Point any OpenAI-compatible harness at the endpoint below. Each request becomes a recorded run.", endpoint: true },
       { name: "Transcript and timeline", what: "Messages, tool calls and results lined up with a per-token timeline: events, logit lens by layer, surprisal, projections onto directions.", act: go("scanner") },
       { name: "Token inspector", what: "Click any token to see what the model predicted there, layer by layer.", act: go("scanner", scrollTo("#h-inspector")) },
+      { name: "Monitors", what: "A rule on a direction: its z-score past a threshold for some tokens in a row. Runs are checked as they are recorded (a ⚑ on the timeline, in the bar and in the run list) and older runs on a scan. Each run's flags show beside how often the random direction trips the same rule.", act: go("scanner", scrollTo("#h-monitors")) },
       { name: "Steering", what: "Add, ablate or clamp a direction at a layer while the model generates. Requests made with steering on are marked.", act: go("scanner", scrollTo("#h-steer")) },
     ],
   },

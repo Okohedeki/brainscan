@@ -76,6 +76,7 @@ function eventLook(e) {
     case "think_end": return { label: "◆ end of thinking", tone: "ink2", glyph: "◆" };
     case "cutoff": return { label: d.while_reasoning ? "▲ cut off while thinking" : "▲ cut off", tone: "serious", glyph: "▲", line: true, status: "serious" };
     case "cancelled": return { label: d.in_prompt ? "■ stopped while reading" : d.while_reasoning ? "■ stopped while thinking" : "■ stopped", tone: "serious", glyph: "■", line: true, status: "serious" };
+    case "monitor": return { label: `⚑ ${d.name}`, tone: "serious", glyph: "⚑", line: true, status: "serious" };
     case "verdict": return d.success ? { label: "✓ PASS", tone: "good", glyph: "✓", line: true, status: "good" }
       : { label: "✕ FAIL", tone: "critical", glyph: "✕", line: true, status: "critical" };
     default: return null;
@@ -631,7 +632,8 @@ function runLabel(m) {
   const when = new Date((m.created || 0) * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
   const out = m.outcome ? (m.outcome.success ? " ✓" : " ✕") : "";
   const iv = (m.interventions || []).length ? " ▲steered" : "";
-  return `${m.label || m.id} · ${when} · ${m.tokens || 0} tok${out}${iv}`;
+  const fl = m.flags ? ` ⚑${m.flags}` : "";  // flags monitors raised while it was recorded
+  return `${m.label || m.id} · ${when} · ${m.tokens || 0} tok${out}${iv}${fl}`;
 }
 function renderRunSelect() {
   const sel = $("#run-select");
@@ -683,6 +685,8 @@ function setGenerating(g) {
 }
 
 function handle(msg) {
+  // A monitor fired, in any run (ui/monitors.js shows it).
+  if (msg.k === "ev" && msg.ev?.type === "monitor") document.dispatchEvent(new CustomEvent("brainscan:flag", { detail: { run: msg.run, ev: msg.ev } }));
   if (msg.k === "req") setGenerating({ run: msg.run, req: msg.req });
   else if (msg.k === "done") { setGenerating(null); document.dispatchEvent(new CustomEvent("brainscan:done", { detail: msg })); }
   if (S.loadingRun && msg.run === S.loadingRun && ["toks", "ev", "msg", "done"].includes(msg.k)) {
@@ -846,6 +850,7 @@ function setupBar() {
 
 async function boot() {
   setupTheme(); readColors(); setupScopeInput(); setupSteering(); setupBar();
+  document.addEventListener("brainscan:select", (ev) => { if (S.runId && ev.detail?.t != null) selectToken(ev.detail.t, true); });  // a flag picked
   $("#run-select").onchange = (ev) => openRun(ev.target.value);
   // A message sent from a composer: open its run in every view as soon as it appears (ui/chat.js).
   document.addEventListener("brainscan:expect-run", (ev) => {

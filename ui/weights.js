@@ -1488,7 +1488,7 @@ function eventTone(e) {
     case "error": return C.critical;
     case "test_result": return (d.failed || 0) + (d.errors || 0) ? C.critical : C.good;
     case "verdict": return d.success ? C.good : C.critical;
-    case "cutoff": case "cancelled": case "file_edit": return C.serious;
+    case "cutoff": case "cancelled": case "file_edit": case "monitor": return C.serious;
     case "think_end": case "final_answer": return C.ink2;
     default: return null;
   }

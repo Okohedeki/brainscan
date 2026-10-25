@@ -106,6 +106,24 @@ defineVerbs([
     ],
   },
   {
+    id: "monitor", group: "Analyze", label: "Monitor",
+    lead: "Flag an agent run when a probe fires: a direction's z-score past a threshold for some tokens in a row, with the random direction's count on the same rule beside it.",
+    steps: [
+      findDirection("The state to watch for, as a direction: two sets of examples, one per line, or one already in the bank. Save it."),
+      { id: "rule", label: "Rule", view: "scanner", focus: "#h-monitors", done: () => st("monitors") > 0,
+        what: "Pick the direction, a threshold and how many tokens in a row, then Add monitor. Every run recorded from now on is checked as it goes.",
+        tools: ["scanner:monitor"] },
+      record("Run the agent or ask the model. A flag shows on the timeline (⚑), in this bar and in the run list the moment the rule is met."),
+      { id: "review", label: "Review", view: "scanner", focus: "#h-flags",
+        what: "Each flag: where it began, its peak, and how often the random direction trips the same rule on this run. Jump to a flag, then trace its peak token to see what drove it.",
+        tools: ["scanner:flags", "scanner:nextflag", "scanner:trace", "scanner:scanruns"] },
+      { id: "explain", label: "Explain", view: "weights", done: () => !!st("word"),
+        what: () => (st("word") ? `Tracing “${st("word")}”: where its logit came from, layer by layer, and the units behind it. If a few units carry it, test removing them (Ablate).`
+          : "Trace a flagged token (Trace → on a flag, or click a word in the conversation): where its logit came from and the units behind it."),
+        tools: ["weights:why", "weights:follow", "weights:paths"] },
+    ],
+  },
+  {
     id: "compare", group: "Analyze", label: "Compare",
     lead: "What the weight edits did: the chat asked again on both weights, your own prompts with drift on neutral text, the circuit behind a word before and after.",
     steps: [
@@ -138,7 +156,6 @@ defineVerbs([
 ], [
   { label: "Cap", what: "Keep a direction within the range it has on ordinary text, so a persona can't drift." },
   { label: "Rewrite a fact", what: "Change an answer instead of removing it: one rank-one edit at one MLP layer." },
-  { label: "Monitor", what: "Flag an agent run when a probe fires: eval awareness, sycophancy, a loop." },
   { label: "Inject and ask", what: "Plant a concept in the residual stream and ask whether the model notices it." },
   { label: "Faithfulness", what: "Did the answer use a hint the reasoning never mentions?" },
   { label: "Audit", what: "Search, blind, for an objective a model was trained to pursue." },

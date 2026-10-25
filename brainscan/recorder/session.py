@@ -36,6 +36,7 @@ from .directions import DirectionBank
 from .edits import EditStack
 from .events import message_events
 from .graphs import DecodeGraphs
+from .monitors import MonitorBank
 from .tracing import Tracer
 
 
@@ -108,6 +109,7 @@ class RunState:
     last_prompt: list[int] = field(default_factory=list)
     last_msg_count: int = 0
     pos2tape: dict[int, int] = field(default_factory=dict)
+    monitor_state: dict = field(default_factory=dict)  # each monitor's live check along this run
 
 
 LENS_FLOOR = -6.0  # log10 p below this shows as 0 in the scanner
@@ -164,6 +166,7 @@ class Recorder:
         self.tap = LayerTap(subject)
         self.directions = DirectionBank(store.root / "directions", subject, self.tap)
         self.edits = EditStack(subject)
+        self.monitors = MonitorBank(store.root / "monitors" / f"{subject.slug}.json")
         use_graphs = settings.graph_decode and DecodeGraphs.available(subject)
         self.graphs = DecodeGraphs(subject, self.tap) if use_graphs else None
         # Anatomy is an optional feature; a failure to build it must not take the recorder down.
@@ -412,7 +415,16 @@ class Recorder:
                 r["lens_top"] = [int(x) for x in pred["lens_top"][k]]
         run.tape.append(r)
         run.pos2tape[int(pos)] = r["t"]
+        for m, flag in self.monitors.feed(run.monitor_state, r):
+            self._flag(run, m, flag)
         return r
+
+    def _flag(self, run: RunState, m, flag: dict) -> None:
+        """A monitor's rule was met at this token (recorder/monitors.py): an event on the run, live."""
+        run.meta["flags"] = run.meta.get("flags", 0) + 1
+        self._event(run, flag["raised_t"], "monitor", {
+            "monitor": m.id, "name": m.label or m.direction, "direction": m.direction, "rule": m.rule(),
+            "z": round(flag["raised_z"], 3), "start": flag["start"]})
 
     def _prefill_records(self, run, req, rendered, cs, chunk, resid, logits, pending, record_from,
                          new_from) -> list[dict]:

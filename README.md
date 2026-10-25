@@ -14,6 +14,7 @@ The UI is organized around **actions**: what you can do to the model. Pick one i
 | **Scale** | Dampen or boost chosen heads and neuron clusters | Record (Watch) › Locate › Test › Apply › Measure (Trace) › Export (Tune) |
 | **Steer** | Push a direction into the model while it writes; the weights don't change | Direction (Tune) › Steer › Run › Compare (Watch) |
 | **Probe** | Read a state on every token, beside a random direction as the control | Direction (Tune) › Record › Read (Watch) |
+| **Monitor** | Flag an agent run when a probe fires | Direction (Tune) › Rule › Record › Review (Watch) › Explain (Trace) |
 | **Compare** | What the weight edits did, outside and inside | Change › Re-run › Prompts (Tune) › Inside (Trace) |
 | **Check** | Behavior tests for every change, original → now | Save (Trace) › Run (Tune) |
 
@@ -22,7 +23,7 @@ action's steps (done ones ticked), what to do in this step, the tools it needs, 
 Tools that need something first stay greyed and say what ("a test on this word to keep: knock
 out or scale units first"). **Explore** is no action: each screen's bar lists all its tools.
 **Do… (⌘K or Ctrl+K)** searches every action and tool and runs it, switching screens if needed.
-Planned actions (Cap, Rewrite a fact, Monitor, Inject and ask, Faithfulness, Audit) are listed
+Planned actions (Cap, Rewrite a fact, Inject and ask, Faithfulness, Audit) are listed
 under **More**. The screens:
 
 1. **Watch**: the run live: transcript, a per-token timeline (logit lens, surprisal,
@@ -84,6 +85,30 @@ experience.
 - **Reasoning models** (Qwen3.5): thinking tokens are recorded as their own role and shown as
   collapsible thinking in the transcript; `--thinking on|off` on the harness, or
   `chat_template_kwargs` per request.
+
+## Monitor: flag a run when a probe fires
+
+A monitor is a rule on one direction of the bank: its z-score past a threshold (above, below or
+beyond ±) for some tokens in a row, on the model's own tokens or on every new token
+(`brainscan/recorder/monitors.py`). Add one in Watch's **Monitors** panel or with
+`POST /brainscan/monitors` (`{direction, threshold, sign, min_tokens, phase}`).
+
+- **Live.** Every enabled monitor is checked as each token is recorded. When the rule is met the
+  recorder adds a `monitor` event at that token, so it shows on the timeline (⚑), in the bar and on
+  the live feed a harness can watch, and the run is marked ⚑ in the run list.
+- **On a recorded run.** `GET /brainscan/runs/{run}/flags` applies the same rules to the stored
+  tape: each flag's start, end, the token where the rule was met, its peak and its words. Runs
+  recorded before a monitor existed are checked the same way, if the direction existed when they
+  were recorded. Live flags and the scan agree token for token (`tests/test_monitors.py`).
+- **Against noise.** Each run's flags come with the same rule applied to the bank's random-control
+  direction on the same tokens, and the share of tokens past the threshold for both. When the random
+  direction trips the rule as often, the panel says to read the flags as noise.
+- **Across runs.** *Scan recent runs* (`GET /brainscan/flags`) counts each monitor's flags, and the
+  random direction's, on the 20 most recent runs.
+
+The z-scores are relative to each direction's own example texts, so a threshold is a distance from
+those examples, not a calibrated probability. A flag points at tokens worth reading and tracing; it
+doesn't say what the model represents there.
 
 ## Forget a fact: a guided knockout made permanent
 
@@ -424,12 +449,12 @@ brainscan/recorder/   model loading, hooks, chat rendering, events, storage, ses
                       weight edits (edits.py), workbench checks (workbench.py), models on disk (catalog.py), the weight
                       graph's units, activity probe and edges (anatomy.py), and token tracing:
                       attribution, neurons and attention at a token (tracing.py), and actions:
-                      forget a fact (actions.py)
+                      forget a fact (actions.py), and monitors that flag runs (monitors.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
 ui/                   the actions and their steps (verbs.js), the bars and Do… (actionbar.js), the
-                      forget flow (actions.js), Watch
+                      forget flow (actions.js), monitors (monitors.js), Watch
                       (app.js, models.js, chat.js), Trace
                       (graph.js, weights.js, paths.js), Tune (workbench.js), the edit stack and
                       checks (edits.js) and the guide (guide.js): plain HTML, CSS and canvas
