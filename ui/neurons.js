@@ -20,7 +20,8 @@ async function api(path, opts) {
 }
 const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body ?? {}) });
 
-const N = { name: null, dose: 1, card: null, loading: null, history: [], set: [], sweep: null, busy: false, steering: [] };
+const N = { name: null, dose: 1, card: null, loading: null, history: [], set: [], sweep: null, busy: false, steering: [],
+  index: null, results: null, searching: null, timer: 0 };
 const SET_KEY = "brainscan-neuron-set";
 
 function message(text, tone = "") {
@@ -88,15 +89,73 @@ function render() {
       ${[sl.plus, sl.minus].map((s) => `<div class="nv-steer"><b>dose ${sign(s.dose, 2)}</b><span class="muted small">KL ${n2(s.kl, 3)}</span></div>
         <div class="nv-row"><span class="nv-lbl">more</span>${chips(s.up, "up")}</div>
         <div class="nv-row"><span class="nv-lbl">less</span>${chips(s.down, "down")}</div>`).join("")}</section>
-    <section class="nv-sec"><h4>Where it fires <span class="dim">on the calibration texts: mean ${n2(a.mean)}, max ${n2(a.max)}, ${a.positions} tokens</span></h4>
-      <ul class="nv-ctx">${a.contexts.map((x) => `<li><span class="v">${n2(x.act)}</span><span class="t">…${esc(x.before)}<mark>${esc(x.token)}</mark>${esc(x.after)}</span></li>`).join("")}</ul>
-      <p class="hint">A small, fixed set of texts: a starting point, not a search. Where a neuron fires across much more text is the neuron index, next.</p></section>
+    ${c.corpus ? `<section class="nv-sec"><h4>Where it fires <span class="dim">its top activations in the neuron index (${c.corpus.tokens.toLocaleString()} tokens): mean ${n2(c.corpus.mean)}, spread ${n2(c.corpus.std)}</span></h4>
+      <ul class="nv-ctx">${c.corpus.contexts.map(ctxRow).join("")}</ul></section>` : ""}
+    <section class="nv-sec"><h4>${c.corpus ? "On the calibration texts" : "Where it fires"} <span class="dim">mean ${n2(a.mean)}, max ${n2(a.max)}, ${a.positions} tokens</span></h4>
+      <ul class="nv-ctx">${a.contexts.map(ctxRow).join("")}</ul>
+      ${c.corpus ? "" : `<p class="hint">A small, fixed set of texts. Build the neuron index (Find neurons, above) for its top activations across a corpus.</p>`}</section>
     <section class="nv-sec two"><div><h4>Feeds <span class="dim">later neurons it moves when steered (z)</span></h4>
         <div class="nv-sub">toward</div><div class="nv-links">${links(fd.toward, "z", (z) => sign(z, 1))}</div>
         <div class="nv-sub">away</div><div class="nv-links">${links(fd.away, "z", (z) => sign(z, 1))}</div></div>
       <div><h4>Fed by <span class="dim">earlier neurons driving it where it fires</span></h4>
         <div class="nv-sub">drive it up</div><div class="nv-links">${links(fb.drives_up, "c", (v) => sign(v, 3))}</div>
         <div class="nv-sub">drive it down</div><div class="nv-links">${links(fb.drives_down, "c", (v) => sign(v, 3))}</div></div></section>`;
+}
+
+const ctxRow = (x) => `<li><span class="v">${n2(x.act)}</span><span class="t">…${esc(x.before)}<mark>${esc(x.token)}</mark>${esc(x.after)}</span></li>`;
+const snip = (c) => (c ? `<span class="t">…${esc(c.before.slice(-60))}<mark>${esc(c.token)}</mark>${esc(c.after)}</span>` : "");
+
+// ---------------------------------------------------------------- the index and search
+async function loadIndex() {
+  try { N.index = await api("/brainscan/neurons/index"); } catch { N.index = null; }
+  renderIndex();
+  if (N.index?.status === "building") { clearTimeout(N.timer); N.timer = setTimeout(loadIndex, 1500); }
+}
+
+function renderIndex() {
+  const el = $("#nv-index");
+  if (!el) return;
+  refreshBar("neurons");
+  const x = N.index;
+  if (!x) { el.textContent = ""; return; }
+  const m = x.meta;
+  const built = m ? `Index: ${m.tokens.toLocaleString()} tokens from ${m.sources.join(", ")}; built ${new Date(m.built * 1000).toLocaleString([], { month: "short", day: "numeric", hour: "2-digit", minute: "2-digit" })} in ${m.seconds}s.` : "";
+  el.innerHTML = x.status === "building" ? `Building the neuron index: ${esc(x.step || "")} ${Math.round((x.progress || 0) * 100)}%. The model is busy until it's done.`
+    : x.status === "error" ? `<span class="warn-text">The index build failed: ${esc(x.error)}</span> ${esc(built)}`
+    : m ? `${esc(built)} <button type="button" class="link" data-build>Rebuild</button>`
+    : `No neuron index for this model yet. <button type="button" class="link" data-build>Build it</button>: one read of the corpus (the starter texts, your recorded runs, or BRAINSCAN_CORPUS) keeps every neuron's top contexts and lens.`;
+}
+
+async function buildIndex() {
+  try { N.index = await post("/brainscan/neurons/index", {}); } catch (err) { message(err.message, "error"); }
+  loadIndex();
+}
+
+async function search(q) {
+  q = String(q || "").trim();
+  if (q.length < 2) { message("Search for at least two characters.", "error"); return; }
+  N.searching = q; N.results = null; renderResults();
+  try { N.results = await api(`/brainscan/neurons/search?q=${encodeURIComponent(q)}&limit=12`); message(""); }
+  catch (err) { message(err.message, "error"); }
+  N.searching = null; renderResults();
+}
+
+function renderResults() {
+  const box = $("#nv-results");
+  if (!box) return;
+  refreshBar("neurons");
+  if (N.searching) { box.innerHTML = `<p class="muted small">Searching for “${esc(N.searching)}”: reading it where it occurs…</p>`; return; }
+  const r = N.results;
+  if (!r) { box.innerHTML = ""; return; }
+  const col = (title, sub, rows, fmt) => `<div class="nv-col"><h4>${title} <span class="dim">${sub}</span></h4>
+    <ul>${rows.map(fmt).join("") || `<li class="muted small">none</li>`}</ul></div>`;
+  const link = (x, extra) => `<button type="button" class="nv-link" data-open-neuron="${x.neuron}">${x.neuron} <span>${extra}</span></button>`;
+  box.innerHTML = `<p class="small">“${esc(r.query)}” ${r.in_corpus ? `occurs ${r.matches} time${r.matches === 1 ? "" : "s"} in the index's ${r.tokens.toLocaleString()} tokens` : "isn't in the corpus: neurons that fire on it are read on the query itself"}.</p>
+    <div class="nv-cols">
+      ${col("Fire on it", "z, where it occurs", r.fires_on, (x) => `<li>${link(x, `z ${n2(x.z, 1)}`)}</li>`)}
+      ${col("Push it", "a logit-lens top token", r.pushes, (x) => `<li>${link(x, `#${x.rank + 1}`)}<span class="nv-toks">${x.tokens.map((t) => esc(vis(t))).join(" ")}</span></li>`)}
+      ${col("Have it in their top contexts", "hits", r.contexts, (x) => `<li>${link(x, `${x.hits}× · ${n2(x.act)}`)}${snip(x.context)}</li>`)}
+    </div>`;
 }
 
 // ---------------------------------------------------------------- steer and verify
@@ -179,6 +238,10 @@ function setupBar() {
       + (N.set.length ? ` · steer set: ${N.set.length}` : "") + (N.steering.length ? ` · <b>steering the chat</b>` : ""),
     state: () => ({ neuron: N.card?.neuron || null, steer_set: N.set.length, neuron_steering: N.steering.length }),
     actions: [
+      { id: "search", group: "Find", label: "Search", hint: "Find neurons by text: ones that fire on it, push it, or have it in their top contexts",
+        need: () => (N.index?.meta ? null : "the neuron index: build it first"), run: () => { scroll("#h-nsearch"); $("#nv-s").focus(); } },
+      { id: "build", group: "Find", label: () => (N.index?.meta ? "Rebuild index" : "Build index"), hint: "Read the corpus once and keep every neuron's top contexts and lens",
+        need: () => (N.index?.status === "building" ? "the build running now to finish" : null), run: buildIndex },
       { id: "go", group: "Find", label: "Go to neuron", hint: "Open a neuron by name, like L14 N8949", run: () => { $("#nv-q").focus(); $("#nv-q").select(); } },
       { id: "back", group: "Find", label: "Back", hint: "The neuron opened before this one",
         need: () => (N.history.length ? null : "a neuron opened before this one"), run: () => open(N.history.pop(), { push: false }) },
@@ -205,6 +268,8 @@ function boot() {
     open(q);
   });
   $("#nv-dose").addEventListener("change", () => { if (N.name) open(N.name, { push: false }); });
+  $("#nv-sform").addEventListener("submit", (ev) => { ev.preventDefault(); search($("#nv-s").value); });
+  $("#nv-index").addEventListener("click", (ev) => { if (ev.target.closest("[data-build]")) buildIndex(); });
   $("#nv-run").addEventListener("click", runSweep);
   $("#nv-set").addEventListener("change", (ev) => {
     const li = ev.target.closest("li[data-i]");
@@ -229,9 +294,10 @@ function boot() {
     if ($("#view-neurons").hidden) document.dispatchEvent(new CustomEvent("brainscan:show", { detail: "neurons" }));
     open(ev.detail);
   });
-  document.addEventListener("brainscan:view", (ev) => { if (ev.detail === "neurons") refreshSteering(); });
-  document.addEventListener("brainscan:model", () => { N.card = null; N.history = []; N.sweep = null; render(); renderSweep(); });
+  document.addEventListener("brainscan:view", (ev) => { if (ev.detail === "neurons") { refreshSteering(); loadIndex(); } });
+  document.addEventListener("brainscan:model", () => { N.card = null; N.history = []; N.sweep = null; N.results = null; render(); renderSweep(); renderResults(); loadIndex(); });
   render();
   refreshSteering();
+  loadIndex();
 }
 boot();

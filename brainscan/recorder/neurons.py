@@ -253,6 +253,8 @@ class Neurons:
             out["feeds"] = self._feeds(cal, layer, moved)
             out["fed_by"] = self._fed_by(cal, mlp, layer, n)
         out["activity"] = self._activity(cal, layer, n)
+        index = getattr(self.rec, "neuron_index", None)
+        out["corpus"] = index.contexts(layer, n) if index is not None else None  # its top activations in the index
         return out
 
     def _unit_of(self, layer: int, n: int) -> dict | None:

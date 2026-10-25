@@ -417,6 +417,17 @@
 
   <main class="neurons" id="view-neurons" hidden>
     <div class="act-bar" data-bar="neurons" aria-label="Actions in Neurons"></div>
+    <section class="panel nv-search" aria-labelledby="h-nsearch">
+      <div class="panel-head">
+        <h2 id="h-nsearch">Find neurons</h2>
+        <form id="nv-sform" class="nv-go">
+          <input id="nv-s" type="search" placeholder="conspiracy, Canberra, sorry, def…" spellcheck="false" autocomplete="off" aria-label="Search neurons by text">
+          <button type="submit">Search</button>
+        </form>
+      </div>
+      <p class="muted small" id="nv-index"></p>
+      <div id="nv-results" class="nv-results"></div>
+    </section>
     <section class="panel nv-card" aria-labelledby="h-neuron">
       <div class="panel-head">
         <h2 id="h-neuron">Neuron</h2>

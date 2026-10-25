@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
-from .recorder import actions, catalog, monitors, neurons, workbench
+from .recorder import actions, catalog, monitors, neuron_index, neurons, workbench
 from .recorder.model import Subject, display_name
 from .recorder.session import Cancelled, GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
@@ -648,6 +648,32 @@ def _neuron_call(fn, *args):
 async def neurons_summary():
     """Layer widths, the median residual norms the dose recipe uses, and the neurons being steered."""
     return recorder().neurons.summary()
+
+
+@app.get("/brainscan/neurons/index")
+async def neuron_index_status():
+    """Whether this model has a neuron index, and how it was built (or how far a build has got)."""
+    return recorder().neuron_index.status()
+
+
+@app.post("/brainscan/neurons/index")
+async def neuron_index_build(request: Request):
+    """Build the neuron index over the corpus (recorder/neuron_index.py): {max_tokens}. Runs in the
+    background and holds the model while it reads; poll GET /brainscan/neurons/index."""
+    body = await request.json()
+    rec = recorder()
+    try:
+        max_tokens = int(body.get("max_tokens", neuron_index.DEFAULT_TOKENS))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "max_tokens must be a number") from None
+    return _neuron_call(rec.neuron_index.build_async, max_tokens)
+
+
+@app.get("/brainscan/neurons/search")
+async def neuron_search(q: str = "", limit: int = 20):
+    """Neurons for a text query: fire on it, push it, or have it in their top contexts."""
+    rec = recorder()
+    return await asyncio.to_thread(_neuron_call, rec.neuron_index.search, q, max(1, min(limit, 100)))
 
 
 @app.get("/brainscan/neurons/{name}")

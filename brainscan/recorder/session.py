@@ -37,6 +37,7 @@ from .edits import EditStack
 from .events import message_events
 from .graphs import DecodeGraphs
 from .monitors import MonitorBank
+from .neuron_index import NeuronIndex
 from .neurons import Neurons, label, parse
 from .tracing import Tracer
 
@@ -180,6 +181,7 @@ class Recorder:
                       "the Weights tab will be unavailable", flush=True)
         self.tracer = Tracer(self) if self.anatomy is not None else None  # needs the unit map
         self.neurons = Neurons(self)
+        self.neuron_index = NeuronIndex(self)  # loads this model's index if one was built
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}

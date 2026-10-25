@@ -97,8 +97,8 @@ neutral texts Compare uses for drift), on the weights as they are:
   final norm and the unembedding.
 - **Steer lens:** what steering it at +dose and −dose does to the model's predictions: the change in
   next-token log-probs averaged over every position, with the mean KL from the unsteered model.
-- **Where it fires:** its activation on those texts and the contexts where it fires most. This is a
-  small fixed set, not yet a search over a corpus.
+- **Where it fires:** its top activations in the neuron index (below), and its activation on the
+  calibration texts.
 - **Feeds:** the later neurons whose mean activation moves most when it is steered, measured, in
   units of each one's spread.
 - **Fed by:** the earlier neurons whose direct writes drive it where it fires most: each one's
@@ -119,7 +119,33 @@ On Qwen2.5-1.5B, L20 N100's lenses push "claim" (声明, claims). A sweep of "Te
 gives the normal answer at × 0 and × 0.5, breaks down at × 1, and repeats "Claim" at × 2. The
 neuron it feeds most, L21 N1490, is a claim neuron too.
 
+**The neuron index** (`brainscan/recorder/neuron_index.py`) finds neurons by text. One read of a
+corpus, on the original weights, keeps for every neuron:
+- its 16 highest activations with their positions;
+- its mean and spread;
+- its logit lens.
+
+It is cached per model under `<data>/neuron_index/<model>/`. The corpus is `BRAINSCAN_CORPUS` (a
+`.txt`, `.md` or `.jsonl` file or folder; jsonl rows carry `"text"`) when it is set. Otherwise it
+is a bundled starter corpus (`starter_corpus.py`: about 70 short texts across topics and registers),
+every recorded run's messages (deduplicated) and the calibration texts.
+
+Search takes a query and returns three lists:
+- neurons that **fire on it** where it occurs in the corpus, or on the query itself, in units of
+  each one's spread;
+- neurons that **push it** (a logit-lens top token contains it);
+- neurons that **have it in their top contexts**.
+
+Then the method is: read a candidate's card, filter by what it pushes, and steer to verify. On
+Qwen2.5-1.5B with the default corpus (32,260 tokens, built in 12 s), "conspiracy" finds L10 N3859
+under "push it". Its steer lens raises "conject, assumption, hypotheses" instead, and a sweep turns
+answers into "assuming assuming…". It is an assumption neuron, which the weights-only lens alone
+would have hidden. A larger corpus gives far better top contexts: point `BRAINSCAN_CORPUS` at one.
+
 API:
+- `GET /brainscan/neurons/index` returns the index's status; `POST /brainscan/neurons/index`
+  (`{max_tokens}`) builds it in the background.
+- `GET /brainscan/neurons/search?q=` searches it.
 - `GET /brainscan/neurons/{L N}?dose=` returns the card.
 - `POST /brainscan/neurons/sweep` takes `{prompt, steers: [{neuron, dose}], factors, max_tokens}`.
 - `POST /brainscan/neurons/steer` takes `{neuron, dose, phase}`.
@@ -444,6 +470,7 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 | `BRAINSCAN_ANATOMY` | `1` | Record per-token unit activity for the Trace tab; `0` turns it off |
 | `BRAINSCAN_ANATOMY_CLUSTERS` | `64` | MLP neuron clusters per layer in the Trace tab |
 | `BRAINSCAN_GRAPH_DECODE` | `1` | Replay decode steps from CUDA graphs (same outputs, about 3x faster); `0` decodes eagerly |
+| `BRAINSCAN_CORPUS` | none | Text for the neuron index: a `.txt`, `.md` or `.jsonl` file, or a folder of them. Unset: the bundled starter corpus, recorded runs' messages and the calibration texts |
 | `BRAINSCAN_GPU_FRACTION` | `0` (no cap) | The share of GPU memory the recorder may hold, e.g. `0.25` to leave three quarters to other apps. Going over raises an out-of-memory error instead of spilling into system RAM. `/brainscan/status` reports the process's own use (`gpu.process`, `gpu.process_peak`) |
 
 ## Known limits
@@ -495,7 +522,8 @@ brainscan/recorder/   model loading, hooks, chat rendering, events, storage, ses
                       graph's units, activity probe and edges (anatomy.py), and token tracing:
                       attribution, neurons and attention at a token (tracing.py), and actions:
                       forget a fact (actions.py), monitors that flag runs (monitors.py), and
-                      single neurons: cards and the dose recipe (neurons.py)
+                      single neurons: cards and the dose recipe (neurons.py), the neuron index
+                      and search (neuron_index.py, starter_corpus.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
