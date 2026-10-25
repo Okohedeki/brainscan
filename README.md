@@ -162,6 +162,26 @@ With the FineWeb sample the 1.5B's index covers 423,496 tokens and builds in 39 
 from no occurrences to 42. Its top contexts go from none to real ones, like "Mexican President
 Enrique Pena Nieto" (L24 N4291). "Paris" occurs 8 times, and L4 N3300 fires on it at z 102.
 
+**Knobs** (`brainscan/recorder/knobs.py`) keep a recipe once it is found. A knob is a named set of
+neurons with doses, like `L14 N8949 +1, L13 N7956 -1`, saved per model under
+`<data>/knobs/<model>.json`. Save the steer set as a knob in Neurons, then use it in three ways:
+- **Steer.** Steer it with a factor on every request from now: one write per neuron at its dose ×
+  the factor, as a single neuron is steered. Steering a knob again replaces its writes instead of
+  stacking them.
+- **Ablate.** Ablating it adds a weight edit that zeroes its neurons' output weights (a `units` edit,
+  as Ablate's Apply makes). It is added, not applied: apply, measure and export it like any edit.
+- **Monitor.** Watching it adds one monitor rule per neuron on its activation, z-scored per token.
+  The mean and spread come from the neuron index, or from the calibration texts when there is no
+  index.
+
+The neuron watch costs nothing while no neuron monitor is on. It works inside decode CUDA graphs.
+The z-scores are stored as each token's `nz`, apart from the directions' `proj`.
+
+On Qwen2.5-1.5B, a knob of the two claim neurons (L20 N100 and L21 N1490) at +1 each swamps the
+model: answers become one repeated character. With it watched at z ≥ 2, a reply about filing an
+insurance claim flags L20 N100 at z 2.65, on " insurance", the token just before the model says
+"claim".
+
 API:
 - `GET /brainscan/neurons/index` returns the index's status; `POST /brainscan/neurons/index`
   (`{max_tokens}`) builds it in the background.
@@ -170,10 +190,17 @@ API:
 - `POST /brainscan/neurons/sweep` takes `{prompt, steers: [{neuron, dose}], factors, max_tokens}`.
 - `POST /brainscan/neurons/steer` takes `{neuron, dose, phase}`.
 - `GET /brainscan/neurons` returns layer widths, the median norms and what's steering.
+- `GET /brainscan/knobs` lists the knobs, each with the interventions steering it now.
+  `POST /brainscan/knobs` takes `{name, description, neurons: [{neuron, dose}]}` or `{name, text}`
+  and replaces any knob of that name. `DELETE /brainscan/knobs/{name}` is refused while it steers.
+- `POST /brainscan/knobs/{name}/steer` takes `{factor, phase}`; `DELETE` on the same path stops it.
+- `POST /brainscan/knobs/{name}/ablate` takes `{factor, note}` and returns the unapplied edit.
+- `POST /brainscan/knobs/{name}/monitor` takes `{threshold, sign, min_tokens, phase}`.
+- `POST /brainscan/knobs/{name}/sweep` takes `{prompt, factors, max_tokens}`.
 
 ## Monitor: flag a run when a probe fires
 
-A monitor is a rule on one direction of the bank: its z-score past a threshold (above, below or
+A monitor is a rule on one direction of the bank, or on one neuron (see Knobs above): its z-score past a threshold (above, below or
 beyond ±) for some tokens in a row, on the model's own tokens or on every new token
 (`brainscan/recorder/monitors.py`). Add one in Watch's **Monitors** panel or with
 `POST /brainscan/monitors` (`{direction, threshold, sign, min_tokens, phase}`).
@@ -185,8 +212,8 @@ beyond ±) for some tokens in a row, on the model's own tokens or on every new t
   tape: each flag's start, end, the token where the rule was met, its peak and its words. Runs
   recorded before a monitor existed are checked the same way, if the direction existed when they
   were recorded. Live flags and the scan agree token for token (`tests/test_monitors.py`).
-- **Against noise.** Each run's flags come with the same rule applied to the bank's random-control
-  direction on the same tokens, and the share of tokens past the threshold for both. When the random
+- **Against noise.** Each run's direction flags come with the same rule applied to the bank's
+  random-control direction on the same tokens (a neuron rule has no such control), and the share of tokens past the threshold for both. When the random
   direction trips the rule as often, the panel says to read the flags as noise.
 - **Across runs.** *Scan recent runs* (`GET /brainscan/flags`) counts each monitor's flags, and the
   random direction's, on the 20 most recent runs.
@@ -543,7 +570,7 @@ brainscan/recorder/   model loading, hooks, chat rendering, events, storage, ses
                       attribution, neurons and attention at a token (tracing.py), and actions:
                       forget a fact (actions.py), monitors that flag runs (monitors.py), and
                       single neurons: cards and the dose recipe (neurons.py), the neuron index
-                      and search (neuron_index.py, starter_corpus.py)
+                      and search (neuron_index.py, starter_corpus.py), knobs (knobs.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report

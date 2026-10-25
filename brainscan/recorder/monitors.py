@@ -1,19 +1,23 @@
 """Monitors: flag a run when a probe fires.
 
 A monitor watches one direction of the bank (a probe: every recorded token's residual is projected
-onto it and z-scored, see directions.py) and fires when that z-score stays past a threshold for some
-tokens in a row. Each firing is a flag: the token where the rule was met, where the streak began and
-ended, and its peak. Flags come out the same two ways, because both apply one rule to the same
-recorded numbers:
+onto it and z-scored, see directions.py) or one neuron (its activation, z-scored against a frozen mean
+and spread, see neurons.py NeuronWatch), and fires when that z-score stays past a threshold for some
+tokens in a row. A neuron is named like "L14 N8949" where a direction would be; its z-scores sit on the
+token record under "nz", a direction's under "proj". Each firing is a flag: the token where the rule
+was met, where the streak began and ended, and its peak. Flags come out the same two ways, because
+both apply one rule to the same recorded numbers:
 
   live  as each token is recorded; the recorder adds a "monitor" event at the token where the rule
         is met, so the UI and a harness watching the live feed see it while the run goes on
   scan  over a recorded run's tape, which is how runs recorded before a monitor existed are checked
 
-Every scan also applies the rule to the bank's random-control direction on the same tokens. A rule
-the random direction trips about as often as the probe is reading noise, not the probe. The z-scores
-are relative to each direction's own example texts, so a threshold of 2 means "two spreads past the
-examples' mean", not a calibrated probability, and a flag is a pointer to tokens worth reading.
+Every scan also applies a direction's rule to the bank's random-control direction on the same tokens.
+A rule the random direction trips about as often as the probe is reading noise, not the probe. (A
+neuron's rule has no such control.) The z-scores are relative to each direction's own example texts
+(a neuron's, to its activations on the index or calibration texts), so a threshold of 2 means "two
+spreads past the examples' mean", not a calibrated probability, and a flag is a pointer to tokens
+worth reading.
 """
 
 from __future__ import annotations
@@ -24,9 +28,11 @@ import uuid
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
+from .neurons import is_label, label, parse
+
 SIGNS = ("above", "below", "either")
 PHASES = {"gen": ("gen",), "all": ("gen", "prefill")}  # re-read context ("replay") is never counted
-MAX_MONITORS = 32
+MAX_MONITORS = 128  # a knob of 64 neurons is 64 rules
 
 
 @dataclass
@@ -53,6 +59,10 @@ class Monitor:
             raise ValueError("min_tokens must be between 1 and 512")
         return self
 
+    @property
+    def neuron(self) -> bool:
+        return is_label(self.direction)
+
     def eligible(self, rec: dict) -> bool:
         return rec.get("ph") in PHASES[self.phase]
 
@@ -70,7 +80,13 @@ class Monitor:
         return f"{self.direction} {cmp} for {n} token{'' if n == 1 else 's'} in a row, on {where}"
 
     def describe(self) -> dict:
-        return asdict(self) | {"rule": self.rule(), "name": self.label or self.direction}
+        return asdict(self) | {"rule": self.rule(), "name": self.label or self.direction,
+                               "kind": "neuron" if self.neuron else "direction"}
+
+
+def z_of(monitor: Monitor, rec: dict, key: str):
+    """The z-score a token record holds for `key`: the monitor's own neuron is in "nz", any direction in "proj"."""
+    return (rec.get("nz" if monitor.neuron and key == monitor.direction else "proj") or {}).get(key)
 
 
 class Streak:
@@ -81,7 +97,7 @@ class Streak:
 
     def feed(self, rec: dict) -> tuple[dict | None, dict | None]:
         """(the flag raised at this token, the flag this token ended), either or both None."""
-        z = (rec.get("proj") or {}).get(self.key) if self.m.eligible(rec) else None
+        z = z_of(self.m, rec, self.key) if self.m.eligible(rec) else None
         if self.m.passes(z):
             c = self.cur
             if c is None:
@@ -125,7 +141,7 @@ def scan(monitor: Monitor, tape: list[dict], key: str | None = None) -> list[dic
 
 def _past(monitor: Monitor, tape: list[dict], key: str) -> tuple[int, float | None]:
     """How many eligible tokens carry this direction, and the share of them past the threshold."""
-    zs = [(r.get("proj") or {}).get(key) for r in tape if r is not None and monitor.eligible(r)]
+    zs = [z_of(monitor, r, key) for r in tape if r is not None and monitor.eligible(r)]
     zs = [z for z in zs if z is not None]
     return len(zs), (round(sum(monitor.passes(z) for z in zs) / len(zs), 4) if zs else None)
 
@@ -147,7 +163,7 @@ def scan_run(bank: MonitorBank, tape: list[dict], directions: list[dict]) -> lis
         for f in flags:  # the words of the streak, for reading the flag at a glance
             f["text"] = "".join(by_t[t].get("text", "") for t in range(f["start"], f["end"] + 1) if t in by_t)[:120]
         row = {"monitor": m.describe(), "tokens": eligible, "recorded": recorded, "past": past, "flags": flags}
-        if control and control != m.direction:
+        if control and control != m.direction and not m.neuron:  # the random direction is no baseline for a neuron
             c_recorded, c_past = _past(m, tape, control)
             row["control"] = {"direction": control, "recorded": c_recorded, "past": c_past,
                               "flags": len(scan(m, tape, control)) if c_recorded else 0}
@@ -168,7 +184,7 @@ def scan_runs(recorder, limit: int = 20) -> dict:
         counts, controls = {}, {}
         for m in monitors:
             counts[m.id] = len(scan(m, run.tape))
-            if control and control != m.direction:
+            if control and control != m.direction and not m.neuron:
                 controls[m.id] = len(scan(m, run.tape, control))
         runs.append({"run": run.id, "label": meta.get("label"), "created": meta.get("created"),
                      "tokens": meta.get("tokens", 0), "flags": counts, "control": controls,
@@ -182,6 +198,7 @@ class MonitorBank:
     def __init__(self, path: Path):
         self.path = path
         self.items: list[Monitor] = []
+        self.on_change = None  # called after a monitor is added, changed or removed (the recorder's neuron watch)
         try:
             raw = json.loads(path.read_text()) if path.exists() else []
             self.items = [Monitor(**d).check() for d in raw]
@@ -204,10 +221,46 @@ class MonitorBank:
             raise KeyError(f"no monitor {mid}")
         return m
 
-    def add(self, body: dict, directions: set[str]) -> Monitor:
+    def _changed(self) -> None:
+        if self.on_change is not None:
+            self.on_change()
+
+    @staticmethod
+    def _neuron(text: str, check) -> str:
+        """A neuron named like L14 N8949 as label() writes it, if the model has it (`check(layer, n)`)."""
+        try:
+            layer, n = parse(text)
+        except ValueError:
+            raise ValueError(f"unknown direction {text!r}: save it to the direction bank first "
+                             "(or name a neuron like L14 N8949)") from None
+        if check is not None:
+            try:
+                check(layer, n)
+            except KeyError as exc:
+                raise ValueError(str(exc).strip("'\"")) from exc
+        return label(layer, n)
+
+    def add(self, body: dict, directions: set[str], check_neuron=None) -> Monitor:
+        """A new monitor, or the one with the same rule. The direction is one of `directions`, or a neuron
+        that `check_neuron(layer, n)` accepts (it raises KeyError for one the model doesn't have)."""
+        return self.add_many([body], directions, check_neuron)[0]
+
+    def add_many(self, bodies: list[dict], directions: set[str], check_neuron=None) -> list[Monitor]:
+        """Several monitors, all or none (a knob's neurons are one rule each)."""
+        before, out = list(self.items), []
+        try:
+            out = [self._add(body, directions, check_neuron) for body in bodies]
+        except Exception:
+            self.items = before
+            raise
+        self._save()
+        self._changed()
+        return out
+
+    def _add(self, body: dict, directions: set[str], check_neuron) -> Monitor:
         direction = str(body.get("direction") or "")
         if direction not in directions:
-            raise ValueError(f"unknown direction {direction!r}: save it to the direction bank first")
+            direction = self._neuron(direction, check_neuron)
         if len(self.items) >= MAX_MONITORS:
             raise ValueError(f"at most {MAX_MONITORS} monitors")
         keys = ("threshold", "sign", "min_tokens", "phase", "label", "enabled")
@@ -217,7 +270,6 @@ class MonitorBank:
         if same is not None:  # the same rule twice is one monitor
             return same
         self.items.append(m)
-        self._save()
         return m
 
     def update(self, mid: str, body: dict) -> Monitor:
@@ -233,12 +285,14 @@ class MonitorBank:
                 setattr(m, k, v)
             raise
         self._save()
+        self._changed()
         return m
 
     def remove(self, mid: str) -> list[dict]:
         self.get(mid)
         self.items = [m for m in self.items if m.id != mid]
         self._save()
+        self._changed()
         return self.list()
 
     def feed(self, state: dict, rec: dict) -> list[tuple[Monitor, dict]]:

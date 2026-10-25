@@ -48,7 +48,7 @@ defineVerbs([
       { id: "locate", label: "Locate", view: "weights", done: () => !!word(),
         what: () => (word() ? `Tracing ${quote(word())}: the graph colors every unit by what it did to it. Select units to remove (shift-drag), or test the top 5.`
           : "Click the word you want gone in the conversation. The graph then colors every unit by what it did to it."),
-        tools: ["weights:why", "weights:runner", "weights:paths", "weights:jump"], also: ["weights:forget"] },
+        tools: ["weights:why", "weights:runner", "weights:paths", "weights:jump"], also: ["weights:forget", "neurons:knob-ablate"] },
       { id: "test", label: "Test", view: "weights", done: () => !!st("tested"),
         what: "Knock the units out and read the word again: its probability before → after, and what the model says instead. Nothing changes in the weights yet.",
         tools: ["weights:ko5", "weights:kosel", "weights:kopaths"] },
@@ -85,8 +85,8 @@ defineVerbs([
     steps: [
       findDirection("Give two sets of examples, one per line, that differ only in the trait. Brainscan finds the direction between them at every layer; save the best layer to the direction bank."),
       { id: "steer", label: "Steer", view: "scanner", focus: "#h-steer", done: () => st("steering") > 0,
-        what: "Pick the direction, a layer and a strength under Steering, then Add. Start small: 0.05 of the residual's size. Or steer single neurons in the Neurons view.",
-        tools: ["scanner:steer", "scanner:unsteer"], also: ["neurons:go"] },
+        what: "Pick the direction, a layer and a strength under Steering, then Add. Start small: 0.05 of the residual's size. Or steer a saved knob (a named set of neurons), or single neurons, in the Neurons view.",
+        tools: ["scanner:steer", "scanner:unsteer"], also: ["neurons:knob", "neurons:go"] },
       { id: "run", label: "Run", view: "scanner", done: () => !!st("steered"),
         what: "Ask the model. Requests made with steering on are marked ▲steered in the run list.",
         tools: ["scanner:ask", "scanner:new"] },
@@ -112,8 +112,8 @@ defineVerbs([
     steps: [
       findDirection("The state to watch for, as a direction: two sets of examples, one per line, or one already in the bank. Save it."),
       { id: "rule", label: "Rule", view: "scanner", focus: "#h-monitors", done: () => st("monitors") > 0,
-        what: "Pick the direction, a threshold and how many tokens in a row, then Add monitor. Every run recorded from now on is checked as it goes.",
-        tools: ["scanner:monitor"] },
+        what: "Pick the direction (or a neuron of a saved knob), a threshold and how many tokens in a row, then Add monitor. Or watch a whole knob. Every run recorded from now on is checked as it goes.",
+        tools: ["scanner:monitor"], also: ["neurons:knob-monitor"] },
       record("Run the agent or ask the model. A flag shows on the timeline (⚑), in this bar and in the run list the moment the rule is met."),
       { id: "review", label: "Review", view: "scanner", focus: "#h-flags",
         what: "Each flag: where it began, its peak, and how often the random direction trips the same rule on this run. Jump to a flag, then trace its peak token to see what drove it.",

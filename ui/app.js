@@ -593,7 +593,7 @@ function renderSteering() {
   banner.textContent = on.length ? `Steering is on (${on.length}). New requests are recorded with these edits and marked as intervened.` : "";
   $("#iv-list").innerHTML = ivs.map((iv) => {
     const what = iv.mode === "add" ? `add ${iv.strength >= 0 ? "+" : ""}${iv.strength}×|h|` : iv.mode === "clamp" ? `clamp to ${iv.value}`
-      : iv.mode === "write" ? `neuron, dose ${iv.strength >= 0 ? "+" : ""}${iv.strength}` : "ablate";
+      : iv.mode === "write" ? `${iv.knob ? `knob ${iv.knob}` : "neuron"}, dose ${iv.strength >= 0 ? "+" : ""}${iv.strength}` : "ablate";
     return `<li class="${iv.enabled ? "" : "off"}" data-id="${iv.id}"><input type="checkbox" ${iv.enabled ? "checked" : ""} aria-label="Enable">
       <span class="desc">${esc(what)} · ${esc(iv.direction)} @ L${iv.layer} · ${esc(iv.phase)}</span><button aria-label="Remove">✕</button></li>`;
   }).join("") || `<li class="muted" style="border:none;background:none;padding:0">No interventions. Readouts are passive.</li>`;
@@ -777,6 +777,7 @@ async function pollStatus() {
   if (dirsChanged) renderLegend();
   renderSteering();
   refreshBar("scanner");
+  document.dispatchEvent(new CustomEvent("brainscan:status", { detail: st }));  // the Neurons view reads the model's name and its knobs
   schedule();
 }
 
@@ -852,6 +853,7 @@ function setupBar() {
 async function boot() {
   setupTheme(); readColors(); setupScopeInput(); setupSteering(); setupBar();
   document.addEventListener("brainscan:select", (ev) => { if (S.runId && ev.detail?.t != null) selectToken(ev.detail.t, true); });  // a flag picked
+  document.addEventListener("brainscan:steering", pollStatus);  // steering changed elsewhere (a knob in Neurons)
   $("#run-select").onchange = (ev) => openRun(ev.target.value);
   // A message sent from a composer: open its run in every view as soon as it appears (ui/chat.js).
   document.addEventListener("brainscan:expect-run", (ev) => {

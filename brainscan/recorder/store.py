@@ -54,7 +54,14 @@ class RunStore:
     def write_tokens(self, run_id: str, req: int, records: list[dict]) -> None:
         if not records:
             return
-        rows = [{**r, "proj": json.dumps(r["proj"])} for r in records]
+        watched = any(r.get("nz") for r in records)  # neuron monitors' z-scores: a column only if this request had a watch
+        rows = []
+        for r in records:
+            row = {**r, "proj": json.dumps(r["proj"])}
+            row.pop("nz", None)
+            if watched:
+                row["nz"] = json.dumps(r.get("nz") or {})
+            rows.append(row)
         path = self.run_dir(run_id) / "tokens" / f"req{req:04d}.parquet"
         path.parent.mkdir(exist_ok=True)
         pq.write_table(pa.Table.from_pylist(rows), path, compression="zstd")
@@ -95,5 +102,9 @@ class RunStore:
             rows += pq.read_table(path).to_pylist()
         for r in rows:
             r["proj"] = json.loads(r["proj"]) if r.get("proj") else {}
+            if r.get("nz"):  # a request recorded without a watch has no such column, or an empty one
+                r["nz"] = json.loads(r["nz"])
+            else:
+                r.pop("nz", None)
         rows.sort(key=lambda r: r["t"])
         return rows

@@ -3,6 +3,9 @@
 // a steer set doses one or more neurons with the recipe and answers a prompt at several dose levels
 // to verify, or steers the chat itself (brainscan/recorder/neurons.py). Any neuron named in the app
 // opens here: a [data-open-neuron] link anywhere, or the brainscan:neuron event.
+// A steer set can be saved as a knob (brainscan/recorder/knobs.py): a named set of neurons with doses,
+// per model, that Steer, Ablate and Monitor use without finding the neurons again. The Knobs panel
+// lists them; the tools that take a knob (choices) are on this screen's bar and in those actions.
 import { defineBar, noteBar, refreshBar } from "/ui/actionbar.js";
 
 const $ = (sel) => document.querySelector(sel);
@@ -21,8 +24,9 @@ async function api(path, opts) {
 const post = (path, body) => api(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body ?? {}) });
 
 const N = { name: null, dose: 1, card: null, loading: null, history: [], set: [], sweep: null, busy: false, steering: [],
-  index: null, results: null, searching: null, timer: 0 };
-const SET_KEY = "brainscan-neuron-set";
+  index: null, results: null, searching: null, timer: 0,
+  model: null, knobs: [], knobSeq: 0, factors: {}, confirm: null, kbusy: null, from: null };
+const SET_KEY = "brainscan-neuron-set";  // + ":<model name>": a steer set belongs to one model
 
 function message(text, tone = "") {
   const el = $("#nv-msg");
@@ -159,7 +163,28 @@ function renderResults() {
 }
 
 // ---------------------------------------------------------------- steer and verify
-function saveSet() { try { localStorage.setItem(SET_KEY, JSON.stringify(N.set)); } catch { /* storage unavailable */ } }
+const setKey = () => (N.model ? `${SET_KEY}:${N.model}` : null);
+function saveSet() {
+  const key = setKey();
+  if (key) { try { localStorage.setItem(key, JSON.stringify(N.set)); } catch { /* storage unavailable */ } }
+}
+
+/** This model's steer set. The key used to be one for every model: the first model loaded takes that set. */
+function loadSet() {
+  N.set = [];
+  const key = setKey();
+  if (!key) return;
+  try {
+    let raw = localStorage.getItem(key);
+    const old = localStorage.getItem(SET_KEY);
+    if (old != null) {
+      if (raw == null) { raw = old; localStorage.setItem(key, old); }
+      localStorage.removeItem(SET_KEY);
+    }
+    const set = JSON.parse(raw || "[]");
+    N.set = Array.isArray(set) ? set.filter((s) => /^L\d+ N\d+$/.test(s?.neuron) && Number.isFinite(Number(s.dose))).map((s) => ({ neuron: s.neuron, dose: Number(s.dose) })) : [];
+  } catch { N.set = []; }
+}
 
 function renderSet() {
   const ul = $("#nv-set");
@@ -167,9 +192,9 @@ function renderSet() {
   ul.innerHTML = N.set.map((s, i) => `<li data-i="${i}"><button type="button" class="link mono" data-open-neuron="${s.neuron}">${s.neuron}</button>
       <label>dose <input type="number" step="0.25" min="-16" max="16" value="${s.dose}" data-dose></label>
       <button type="button" data-remove aria-label="Remove ${s.neuron} from the steer set">✕</button></li>`).join("")
-    || `<li class="muted" style="border:none;background:none;padding:0">No neurons yet. Open one and press Add to steer set, or type several, like L14 N8949 +1 and L13 N7956 −1.</li>`;
+    || `<li class="muted" style="border:none;background:none;padding:0">No neurons yet. Open one and press Add to steer set, or type several, like L14 N8949 +1 and L13 N7956 −1${N.knobs.length ? ". Or Load a saved knob below" : ""}.</li>`;
   const live = N.steering.length;
-  $("#nv-live").textContent = live ? `Steering the chat with ${live} neuron${live === 1 ? "" : "s"}: ${N.steering.map((iv) => `${iv.direction} ${sign(iv.strength, 2)}`).join(", ")}` : "";
+  $("#nv-live").textContent = live ? `Steering the chat with ${live} neuron${live === 1 ? "" : "s"}: ${N.steering.map((iv) => `${iv.knob ? `${iv.knob} · ` : ""}${iv.direction} ${sign(iv.strength, 2)}`).join(", ")}` : "";
 }
 
 function addToSet(neuron = N.name, dose = N.dose) {
@@ -214,29 +239,215 @@ async function refreshSteering() {
   renderSet(); refreshBar("neurons");
 }
 
+/** Steering changed here: the knob rows, this bar and Watch's steering panel (ui/app.js) catch up. */
+async function steeringChanged() {
+  await Promise.all([refreshSteering(), loadKnobs()]);
+  document.dispatchEvent(new CustomEvent("brainscan:steering"));
+}
+
 async function steerChat() {
   if (!N.set.length) return;
   try {
-    for (const s of N.set) await post("/brainscan/neurons/steer", { neuron: s.neuron, dose: s.dose, phase: "all" });
+    // Pressing it again replaces the set's steers rather than stacking them; a knob's steers stay.
     await refreshSteering();
+    for (const iv of N.steering.filter((x) => !x.knob)) await api(`/brainscan/interventions/${iv.id}`, { method: "DELETE" }).catch(() => {});
+    for (const s of N.set) await post("/brainscan/neurons/steer", { neuron: s.neuron, dose: s.dose, phase: "all" });
+    await steeringChanged();
     noteBar("neurons", "Every new request is steered with the set, prompt and reply alike, and marked ▲steered");
   } catch (err) { message(err.message, "error"); }
 }
 
 async function unsteer() {
   for (const iv of N.steering) await api(`/brainscan/interventions/${iv.id}`, { method: "DELETE" }).catch(() => {});
-  await refreshSteering();
+  await steeringChanged();
   noteBar("neurons", "Neuron steering removed");
+}
+
+// ---------------------------------------------------------------- knobs
+// A knob is the steer set with a name (brainscan/recorder/knobs.py). Steering one writes its neurons
+// at their doses × a multiple, tagged with the knob, so steering it again replaces it.
+const kurl = (name, tail = "") => `/brainscan/knobs/${encodeURIComponent(name)}${tail}`;
+const knobOf = (name) => N.knobs.find((k) => k.name === name);
+const dose = (x) => `${x >= 0 ? "+" : "−"}${+Math.abs(x).toFixed(2)}`;
+const count = (n, word) => `${n} ${word}${n === 1 ? "" : "s"}`;
+
+async function loadKnobs() {
+  const seq = ++N.knobSeq;
+  let r = null;
+  try { r = await api("/brainscan/knobs"); } catch { /* an older recorder, or still loading: keep what is shown */ }
+  if (seq !== N.knobSeq) return;
+  if (r) { N.knobs = r.knobs || []; N.knobError = r.error || null; }
+  renderKnobs(); renderSet(); refreshBar("neurons");
+}
+
+/** The Knobs panel's message line; `html` (already escaped) follows the text. */
+function knobMsg(text, tone = "", html = "") {
+  const el = $("#nk-msg");
+  if (el) { el.className = `wb-msg ${tone}`; el.innerHTML = `${esc(text)}${html ? ` ${html}` : ""}`; }
+}
+function saveMsg(text, tone = "") {
+  const el = $("#nv-ksave-msg");
+  if (el) { el.className = `wb-msg ${tone}`; el.textContent = text || ""; }
+}
+
+function knobRow(k) {
+  const live = (k.active || []).length, ask = N.confirm === k.name, busy = !!N.kbusy;
+  const act = (id, label, title, off = false) => `<button type="button" class="btn sm" data-act="${id}" title="${esc(title)}"${busy || off ? " disabled" : ""}>${label}</button>`;
+  return `<li class="nk-row${live ? " on" : ""}" data-name="${esc(k.name)}">
+    <div class="nk-head"><b class="mono">${esc(k.name)}</b>${live ? `<span class="pill ok">steering now</span>` : ""}
+      ${k.description ? `<span class="muted small">${esc(k.description)}</span>` : ""}</div>
+    <div class="nv-links">${k.neurons.map((n) => `<button type="button" class="nv-link" data-open-neuron="${esc(n.neuron)}" title="Open ${esc(n.neuron)}">${esc(n.neuron)} <span>${dose(n.dose)}</span></button>`).join("")}</div>
+    <div class="nk-acts">
+      ${act("load", "Load", "Replace the steer set with this knob's neurons")}
+      <span class="nk-steer"><label>× <input type="number" step="0.25" min="-16" max="16" value="${esc(N.factors[k.name] ?? 1)}" data-factor aria-label="Multiple of ${esc(k.name)}'s doses to steer with"></label>
+        ${act("steer", "Steer chat", "Steer every new request with this knob, at this multiple of its doses")}
+        ${act("stop", "Stop", "Stop steering the chat with this knob", !live)}</span>
+      ${act("sweep", "Sweep", "Load it into the steer set and answer the prompt at each dose level")}
+      ${act("monitor", "Monitor", "Watch each of its neurons as the model writes, and flag a run where one stays unusually active")}
+      ${act("ablate", "Ablate", "Add a weight edit that zeroes these neurons' output weights. It isn't applied until you apply it")}
+      ${ask ? `<span class="nk-ask">Delete? <button type="button" class="link danger" data-act="delete-yes">Yes</button> <button type="button" class="link" data-act="delete-no">No</button></span>`
+        : `<button type="button" class="link danger" data-act="delete" ${live ? 'disabled title="Stop steering with it first"' : `title="Delete this knob"${busy ? " disabled" : ""}`}>Delete</button>`}
+    </div></li>`;
+}
+
+function renderKnobs() {
+  const ul = $("#nk-list");
+  if (!ul) return;
+  ul.innerHTML = (N.knobError ? `<li class="warn-text">${esc(N.knobError)}</li>` : "")
+    + (N.knobs.map(knobRow).join("") || `<li class="muted nk-empty">Save the steer set as a knob to reuse it from Steer, Ablate and Monitor.</li>`);
+}
+
+function loadKnob(name) {
+  const k = knobOf(name);
+  if (!k) return;
+  N.set = k.neurons.map((n) => ({ neuron: n.neuron, dose: n.dose }));
+  N.from = name;
+  saveSet(); render();
+  knobMsg(`Loaded ${name} into the steer set.`, "ok");
+}
+
+async function steerKnob(name, factor = 1) {
+  if (!Number.isFinite(factor)) throw new Error("Give the multiple as a number.");
+  const ivs = await post(kurl(name, "/steer"), { factor });
+  await steeringChanged();
+  knobMsg(`Steering the chat with ${name}${factor === 1 ? "" : ` × ${factor}`}: ${count(Array.isArray(ivs) ? ivs.length : knobOf(name)?.neurons.length ?? 0, "neuron")}. Every new request is steered, prompt and reply alike, and marked ▲steered.`, "ok");
+  noteBar("neurons", `Steering the chat with knob ${name}`);
+}
+
+async function stopKnob(name) {
+  await api(kurl(name, "/steer"), { method: "DELETE" });
+  await steeringChanged();
+  knobMsg(`Stopped steering with ${name}.`, "ok");
+  noteBar("neurons", `Stopped steering with knob ${name}`);
+}
+
+async function monitorKnob(name) {
+  const rules = await post(kurl(name, "/monitor"), {});
+  const n = Array.isArray(rules) ? rules.length : 0, first = rules?.[0];
+  const rest = first?.rule ? String(first.rule).replace(first.direction || "", "").trim() : "";  // "z ≥ 4 for 2 tokens in a row, on …"
+  document.dispatchEvent(new CustomEvent("brainscan:monitors"));
+  knobMsg(`Watching ${count(n, "neuron")} of ${name}${rest ? `: a flag when ${rest}` : ""}.`, "ok", `<button type="button" class="link" data-pick="monitor">Open the Monitor action</button>`);
+  noteBar("neurons", `Watching ${count(n, "neuron")} of knob ${name}`);
+}
+
+async function ablateKnob(name) {
+  await post(kurl(name, "/ablate"), { factor: 0 });
+  document.dispatchEvent(new CustomEvent("brainscan:workbench"));  // the edit stack (ui/edits.js) and Tune refresh
+  knobMsg("Edit added (not applied): apply it in Ablate › Apply.", "ok",
+    `<button type="button" class="link" data-pick="ablate">Open Ablate</button> <button type="button" class="link" data-show="workbench">Edit stack in Tune</button>`);
+  noteBar("neurons", `Edit for knob ${name} added, not applied`);
+}
+
+async function deleteKnob(name) {
+  await api(kurl(name), { method: "DELETE" });
+  delete N.factors[name];
+  if (N.from === name) N.from = null;
+  await loadKnobs();
+  knobMsg(`Deleted ${name}.`, "ok");
+}
+
+/** Run one knob action with the rows locked, and its result or error in the Knobs panel. */
+async function knobAct(name, fn) {
+  if (N.kbusy) return;
+  N.kbusy = name; N.confirm = null; renderKnobs();
+  try { await fn(); } catch (err) { knobMsg(err.message, "error"); }
+  N.kbusy = null; renderKnobs();
+}
+
+function onKnobClick(ev) {
+  const b = ev.target.closest("[data-act]"), li = ev.target.closest("li[data-name]");
+  if (!b || !li || N.kbusy) return;
+  const name = li.dataset.name, act = b.dataset.act;
+  if (act === "load") loadKnob(name);
+  else if (act === "sweep") { loadKnob(name); $("#h-nsteer")?.scrollIntoView({ behavior: "smooth", block: "start" }); runSweep(); }
+  else if (act === "delete" || act === "delete-no") { N.confirm = act === "delete" ? name : null; renderKnobs(); }
+  else if (act === "steer") {
+    const raw = li.querySelector("[data-factor]").value.trim();
+    knobAct(name, () => steerKnob(name, raw === "" ? NaN : Number(raw)));
+  }
+  else if (act === "stop") knobAct(name, () => stopKnob(name));
+  else if (act === "monitor") knobAct(name, () => monitorKnob(name));
+  else if (act === "ablate") knobAct(name, () => ablateKnob(name));
+  else if (act === "delete-yes") knobAct(name, () => deleteKnob(name));
+}
+
+/** Save as knob: the form under the steer set. */
+function openSave() {
+  const k = knobOf(N.from);
+  if (k && !$("#nv-kname").value) { $("#nv-kname").value = k.name; $("#nv-kdesc").value = k.description || ""; }
+  $("#nv-save").hidden = false;
+  saveMsg(""); saveNote();
+  $("#nv-kname").focus(); $("#nv-kname").select();
+  $("#nv-save").scrollIntoView({ behavior: "smooth", block: "center" });
+}
+function saveNote() {
+  const old = knobOf($("#nv-kname").value.trim());
+  $("#nv-ksave-note").textContent = old ? `${old.name} is already saved: saving replaces its neurons and doses.`
+    : "Letters, digits, _ . - only. A name that's already saved is replaced.";
+}
+async function saveKnob(ev) {
+  ev.preventDefault();
+  if (!N.set.length) { saveMsg("Add a neuron to the steer set first.", "error"); return; }
+  try {
+    const k = await post("/brainscan/knobs", { name: $("#nv-kname").value.trim(), description: $("#nv-kdesc").value.trim(), neurons: N.set });
+    N.from = k?.name || $("#nv-kname").value.trim();
+    $("#nv-save").hidden = true; $("#nv-kname").value = ""; $("#nv-kdesc").value = "";
+    saveMsg("");
+    await loadKnobs();
+    knobMsg(`Saved ${N.from}: ${count(N.set.length, "neuron")}.`, "ok");
+    noteBar("neurons", `Saved knob ${N.from}`);
+  } catch (err) { saveMsg(err.message, "error"); }
+}
+
+/** The tools that take a knob (a menu of the saved ones), here and in the Steer, Ablate and Monitor actions. */
+const needKnob = () => (N.knobs.length ? null : "a saved knob");
+const knobChoices = (fn) => () => N.knobs.map((k) => ({ label: `${k.name} · ${count(k.neurons.length, "neuron")}`,
+  run: () => { $("#h-nknobs")?.scrollIntoView({ behavior: "smooth", block: "start" }); knobAct(k.name, () => fn(k.name)); } }));
+
+/** The recorder switched models: a steer set and the knobs belong to one model. */
+function adoptModel(name) {
+  const first = !N.model;
+  if (name) N.model = name;
+  loadSet();
+  N.from = null; N.confirm = null; N.factors = {};
+  if (!first) { N.knobs = []; N.knobError = null; }
+}
+function onStatus(st) {
+  const name = st?.model?.name;
+  if (name && name !== N.model) { adoptModel(name); render(); renderKnobs(); loadKnobs(); return; }
+  // Knobs saved or deleted elsewhere (the API, an agent): status lists their names.
+  const names = (st?.knobs || []).slice().sort().join("\n");
+  if (st?.knobs && names !== N.knobs.map((k) => k.name).sort().join("\n")) loadKnobs();
 }
 
 // ---------------------------------------------------------------- the bar
 function setupBar() {
   const scroll = (sel) => $(sel)?.scrollIntoView({ behavior: "smooth", block: "start" });
   defineBar("neurons", {
-    groups: ["Find", "Steer", "Verify"],
+    groups: ["Find", "Steer", "Verify", "Change", "Monitor"],
     context: () => (N.card ? `<b>${esc(N.card.neuron)}</b> · dose ${N.card.dose}` : N.loading ? `Reading <b>${esc(N.loading)}</b>…` : "No neuron open")
-      + (N.set.length ? ` · steer set: ${N.set.length}` : "") + (N.steering.length ? ` · <b>steering the chat</b>` : ""),
-    state: () => ({ neuron: N.card?.neuron || null, steer_set: N.set.length, neuron_steering: N.steering.length }),
+      + (N.set.length ? ` · steer set: ${N.set.length}` : "") + (N.knobs.length ? ` · knobs: ${N.knobs.length}` : "") + (N.steering.length ? ` · <b>steering the chat</b>` : ""),
+    state: () => ({ neuron: N.card?.neuron || null, steer_set: N.set.length, neuron_steering: N.steering.length, knobs: N.knobs.length }),
     actions: [
       { id: "search", group: "Find", label: "Search", hint: "Find neurons by text: ones that fire on it, push it, or have it in their top contexts",
         need: () => (N.index?.meta ? null : "the neuron index: build it first"), run: () => { scroll("#h-nsearch"); $("#nv-s").focus(); } },
@@ -249,18 +460,25 @@ function setupBar() {
         need: () => (N.card ? null : "a neuron open"), run: () => addToSet() },
       { id: "chat", group: "Steer", label: "Steer the chat", hint: "Steer every new request with the set, prompt and reply alike",
         need: () => (N.set.length ? null : "a neuron in the steer set"), run: steerChat },
-      { id: "unsteer", group: "Steer", label: "Remove neuron steering", hint: "Stop steering the chat with neurons",
+      { id: "unsteer", group: "Steer", label: "Remove neuron steering", hint: "Stop steering the chat with neurons, knobs included",
         need: () => (N.steering.length ? null : "neurons steering the chat"), run: unsteer },
+      { id: "saveknob", group: "Steer", label: "Save as knob", hint: "Name the steer set and keep it for this model, to steer, ablate or watch again",
+        need: () => (N.set.length ? null : "a neuron in the steer set"), run: openSave },
+      { id: "knob", group: "Steer", label: "Steer a knob", hint: "Steer the chat with a saved knob, at its own doses",
+        need: needKnob, choices: knobChoices((name) => steerKnob(name, 1)) },
       { id: "sweep", group: "Verify", label: "Run sweep", hint: "Answer the prompt at each dose level, side by side",
         need: () => (N.busy ? "the sweep running now to finish" : N.set.length ? null : "a neuron in the steer set"), run: () => { scroll("#h-nsteer"); runSweep(); } },
+      { id: "knob-ablate", group: "Change", label: "Ablate a knob", hint: "Add a weight edit that zeroes a knob's neurons. It isn't applied until you apply it",
+        need: needKnob, choices: knobChoices(ablateKnob) },
+      { id: "knob-monitor", group: "Monitor", label: "Watch a knob", hint: "Flag a run where any of a knob's neurons stays unusually active",
+        need: needKnob, choices: knobChoices(monitorKnob) },
     ],
   });
 }
 
 function boot() {
   if (!$("#view-neurons")) return;
-  try { N.set = JSON.parse(localStorage.getItem(SET_KEY) || "[]"); } catch { N.set = []; }
-  setupBar();
+  setupBar();  // the steer set loads once the model's name is known (onStatus)
   $("#nv-go").addEventListener("submit", (ev) => {
     ev.preventDefault();
     const q = $("#nv-q").value;
@@ -294,10 +512,30 @@ function boot() {
     if ($("#view-neurons").hidden) document.dispatchEvent(new CustomEvent("brainscan:show", { detail: "neurons" }));
     open(ev.detail);
   });
-  document.addEventListener("brainscan:view", (ev) => { if (ev.detail === "neurons") { refreshSteering(); loadIndex(); } });
-  document.addEventListener("brainscan:model", () => { N.card = null; N.history = []; N.sweep = null; N.results = null; render(); renderSweep(); renderResults(); loadIndex(); });
+  $("#nv-save").addEventListener("submit", saveKnob);
+  $("#nv-ksave-cancel").addEventListener("click", () => { $("#nv-save").hidden = true; saveMsg(""); });
+  $("#nv-kname").addEventListener("input", saveNote);
+  $("#nk-list").addEventListener("click", onKnobClick);
+  $("#nk-list").addEventListener("input", (ev) => {
+    const li = ev.target.closest("li[data-name]");
+    if (li && ev.target.matches("[data-factor]")) N.factors[li.dataset.name] = ev.target.value;
+  });
+  $("#nk-msg").addEventListener("click", (ev) => {  // a link in a knob message: an action to pick, or a screen
+    const b = ev.target.closest("[data-pick], [data-show]");
+    if (b) document.dispatchEvent(new CustomEvent(b.dataset.pick ? "brainscan:pick" : "brainscan:show", { detail: b.dataset.pick || b.dataset.show }));
+  });
+  document.addEventListener("brainscan:status", (ev) => onStatus(ev.detail));  // every poll (ui/app.js)
+  document.addEventListener("brainscan:view", (ev) => { if (ev.detail === "neurons") { refreshSteering(); loadIndex(); loadKnobs(); } });
+  document.addEventListener("brainscan:model", (ev) => {
+    N.card = null; N.history = []; N.sweep = null; N.results = null; N.steering = [];
+    adoptModel(ev.detail?.name);
+    render(); renderSweep(); renderResults(); renderKnobs(); loadIndex(); refreshSteering(); loadKnobs();
+  });
   render();
+  renderKnobs();
   refreshSteering();
   loadIndex();
+  loadKnobs();
+  api("/brainscan/status").then(onStatus).catch(() => { /* the recorder is loading: the next poll tells */ });
 }
 boot();

@@ -10,7 +10,11 @@ writes act × W_down[:, n] into the residual stream. Neurons are named "L14 N894
              weights, first token skipped (it carries the attention sink). During a chat or an
              agent run it is a "write" intervention on layer L's output, which adds the same vector.
 
-  card       what the neuron does, read on the calibration texts:
+  watch      a monitor on one neuron (monitors.py): its activation z-scored per token against a mean
+             and spread frozen when the watch is built (the neuron index's when it exists, else the
+             calibration texts'). NeuronWatch below reads it live, only while such a monitor is on.
+
+  card      what the neuron does, read on the calibration texts:
                logit lens   tokens its write pushes up and down, read straight through the final
                             norm and the unembedding (weights only, nothing run)
                steer lens   what steering it does to the model's predictions: the change in
@@ -30,6 +34,7 @@ Everything runs with runtime steering paused, on the weights as they are (edits 
 from __future__ import annotations
 
 import contextlib
+import itertools
 import math
 import re
 
@@ -43,9 +48,12 @@ from .tracing import Busy
 from .workbench import REFERENCE_TEXTS, _generate, _reference_ids
 
 NAME = re.compile(r"^\s*L(\d+)[\s/:._-]*N(\d+)\s*$", re.IGNORECASE)
+LABEL = re.compile(r"^L\d+ N\d+$")  # a neuron as label() writes it; a direction's name can't have the space
+SET = re.compile(r"L([0-9]+)\s*N([0-9]+)\s*([+−-]?\s*[0-9]*\.?[0-9]+)?", re.IGNORECASE)  # ui/neurons.js addTyped
 TOP = 12            # tokens and neurons listed per side
 FIRE = 6            # positions where a neuron fires most, for its contexts and its inputs
 MAX_DOSE = 16.0
+MIN_STD = 1e-4      # a watched neuron's spread is never taken as smaller than this
 
 
 def parse(name: str) -> tuple[int, int]:
@@ -57,6 +65,19 @@ def parse(name: str) -> tuple[int, int]:
 
 def label(layer: int, n: int) -> str:
     return f"L{layer} N{n}"
+
+
+def is_label(text) -> bool:
+    return isinstance(text, str) and LABEL.match(text) is not None
+
+
+def parse_set(text: str) -> list[tuple[int, int, float]]:
+    """"L14 N8949 +1, L13 N7956 -1" -> [(14, 8949, 1.0), (13, 7956, -1.0)]. A neuron with no number
+    gets dose 1; the minus sign may be the unicode one."""
+    found = list(SET.finditer(str(text or "")))
+    if not found:
+        raise ValueError("name neurons with a dose like L14 N8949 +1, L13 N7956 -1")
+    return [(int(m[1]), int(m[2]), float(re.sub(r"\s", "", m[3].replace("−", "-"))) if m[3] else 1.0) for m in found]
 
 
 class MLP:
@@ -177,6 +198,24 @@ class Neurons:
             return True
         except ValueError:
             return False
+
+    def stats_source(self, items: list[tuple[int, int]]) -> str:
+        """Where the mean and spread a watch z-scores against come from: the neuron index when it is
+        built (the original weights, over its corpus), else the calibration texts on the current weights."""
+        index = getattr(self.rec, "neuron_index", None)
+        if index is not None and index.ready() and all(f"mean.{i}" in index.data for i, _ in items):
+            return "index"
+        return "calibration"
+
+    def stats(self, items: list[tuple[int, int]], source: str) -> dict[tuple[int, int], tuple[float, float]]:
+        """(mean, std) of each neuron's activation, read once from `source` (stats_source)."""
+        if source == "index":
+            data = self.rec.neuron_index.data
+            raw = {(i, n): (float(data[f"mean.{i}"][n]), float(data[f"std.{i}"][n])) for i, n in items}
+        else:
+            cal = self.calibration()
+            raw = {(i, n): (float(cal["mean"][i][n]), float(cal["std"][i][n])) for i, n in items}
+        return {k: (mean, max(std, MIN_STD)) for k, (mean, std) in raw.items()}
 
     # ---- steering ------------------------------------------------------------------------
 
@@ -386,3 +425,88 @@ class Neurons:
                 "median_norms": [round(x, 3) for x in cal["median"]] if cal else None,
                 "calibration": "workbench.REFERENCE_TEXTS, first token skipped",
                 "steering": [iv.describe() for iv in self.rec.interventions.values() if iv.mode == "write"]}
+
+
+class NeuronWatch:
+    """The live signal of neuron monitors: each watched neuron's activation, z-scored per token.
+
+    A forward pre-hook on `mlp.down` of every layer with a watched neuron reads the activation (the
+    input to down_proj at the neuron's index) and z-scores it against a mean and spread frozen when
+    the watch is built. The hooks follow the cluster probe in anatomy.py, so they work in prefill
+    chunks and inside decode CUDA graphs: a single-token forward writes into the static buffer `step`
+    (a captured graph refreshes it on every replay), a longer forward keeps its rows in `parts`, and
+    the recorder copies them out after each forward (read_step, read_chunk). They do nothing outside
+    `recording()`. A watch exists only while an enabled neuron monitor does (Recorder.sync_watch).
+
+    `key` names this watch. Decode graphs bake the hooks and their buffers in, so graphs captured
+    under another watch are stale: the recorder puts `key` in the graph key.
+    """
+
+    _serial = itertools.count(1)
+
+    def __init__(self, nm: Neurons, items, stats: dict, source: str):
+        self.items = tuple(sorted(set(items)))
+        self.labels = [label(i, n) for i, n in self.items]
+        self.stats, self.source = {k: stats[k] for k in self.items}, source  # (mean, std), frozen
+        self.key = ("watch", next(self._serial), self.items)
+        dev = nm.s.device
+        self.step = torch.zeros(len(self.items), device=dev)  # z of the latest single-token forward
+        self.parts: dict[int, torch.Tensor] = {}              # layer -> (tokens, its neurons), longer forwards
+        self.slices: dict[int, tuple[int, int]] = {}          # layer -> its columns of step
+        self.enabled = False
+        self.handles = []
+        for layer in sorted({i for i, _ in self.items}):
+            rows = [j for j, (i, _) in enumerate(self.items) if i == layer]  # items are sorted: contiguous
+            a, b = rows[0], rows[-1] + 1
+            idx = torch.tensor([self.items[j][1] for j in rows], device=dev)
+            mean = torch.tensor([self.stats[self.items[j]][0] for j in rows], device=dev)
+            std = torch.tensor([self.stats[self.items[j]][1] for j in rows], device=dev)
+            self.slices[layer] = (a, b)
+            self.handles.append(nm.mlp(layer).down.register_forward_pre_hook(self._hook(layer, a, b, idx, mean, std)))
+
+    def _hook(self, layer: int, a: int, b: int, idx: torch.Tensor, mean: torch.Tensor, std: torch.Tensor):
+        def fn(module, args):
+            x = args[0]
+            if not self.enabled or x.dim() != 3 or x.shape[0] != 1:
+                return None
+            z = (x[0].index_select(-1, idx).float() - mean) / std
+            if z.shape[0] == 1:
+                self.step[a:b].copy_(z[0])
+            else:
+                self.parts[layer] = z
+            return None
+        return fn
+
+    @contextlib.contextmanager
+    def recording(self):
+        self.enabled = True
+        try:
+            yield
+        finally:
+            self.enabled = False
+            self.parts.clear()
+
+    def read_step(self) -> torch.Tensor:
+        """z (neurons,) for the latest single-token forward, as a copy on the device."""
+        return self.step.clone()
+
+    def read_chunk(self, n: int) -> torch.Tensor:
+        """z (n, neurons) for the latest n-token forward, on the device."""
+        if n == 1:
+            return self.step[None].clone()
+        out = torch.zeros(n, len(self.items), device=self.step.device)
+        for layer, z in self.parts.items():
+            if z.shape[0] == n:
+                a, b = self.slices[layer]
+                out[:, a:b] = z
+        self.parts.clear()
+        return out
+
+    def remove(self) -> None:
+        for h in self.handles:
+            h.remove()
+        self.handles, self.enabled = [], False
+        self.parts.clear()
+
+    def describe(self) -> dict:
+        return {"neurons": self.labels, "source": self.source}

@@ -555,6 +555,31 @@ button.model-badge:hover, button.model-badge[aria-expanded="true"] { border-colo
 .nv-col .t, .nv-toks { font: 11.5px var(--mono); color: var(--ink-2); white-space: pre-wrap; overflow-wrap: anywhere; }
 .nv-col mark { background: color-mix(in srgb, var(--accent) 30%, transparent); color: var(--ink); border-radius: 3px; padding: 0 1px; }
 
+/* knobs: saved sets of neurons with doses (ui/neurons.js) */
+.nv-knobs { grid-column: 1 / -1; }
+.nv-save { display: flex; flex-wrap: wrap; align-items: end; gap: 8px 10px; margin: 8px 0 4px; padding: 10px; border: 1px dashed var(--border-strong); border-radius: 10px; }
+.nv-save[hidden] { display: none; }
+.nv-save label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+.nv-save label.grow { flex: 1; min-width: 140px; }
+.nv-save-btns { display: flex; gap: 8px; }
+.nv-save input[type=text] { width: 100%; box-sizing: border-box; }
+.nv-save #nv-kname { width: 180px; font-family: var(--mono); }
+.nv-save .nv-save-note { flex-basis: 100%; margin: 0; }
+.nk-list { list-style: none; margin: 8px 0 0; padding: 0; display: flex; flex-direction: column; gap: 8px; font-size: 12px; }
+.nk-row { display: flex; flex-direction: column; gap: 8px; padding: 10px 12px; border: 1px solid var(--border); border-radius: 10px; background: var(--raised); }
+.nk-row.on { border-color: color-mix(in srgb, var(--good) 45%, transparent); }
+.nk-empty { padding: 10px 12px; border: 1px dashed var(--border); border-radius: 10px; }
+.nk-head { display: flex; flex-wrap: wrap; align-items: baseline; gap: 4px 10px; }
+.nk-head b { font-size: 13px; }
+.nk-head .pill { margin-top: 0; }
+.nk-acts { display: flex; flex-wrap: wrap; align-items: center; gap: 6px 8px; }
+.nk-steer { display: inline-flex; align-items: center; gap: 6px; }
+.nk-steer label { display: flex; align-items: center; gap: 4px; color: var(--ink-2); }
+.nk-steer input { width: 64px; min-height: 28px; }
+.nk-ask { display: inline-flex; align-items: baseline; gap: 8px; color: var(--ink-2); }
+.nk-acts > .link.danger, .nk-acts > .nk-ask { margin-left: auto; }
+#nk-msg .link { margin-left: 6px; }
+
 /* monitors (ui/monitors.js) */
 .mon-form { display: grid; grid-template-columns: 1.6fr 1fr 0.8fr 0.9fr 1.4fr auto; gap: 8px; align-items: end; margin-top: 10px; }
 .mon-form label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }

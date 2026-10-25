@@ -16,8 +16,10 @@ request's cache.
 
 The layer hooks (capture.LayerTap) run while the graphs are captured, so the residuals they keep
 are graph outputs that every replay refreshes, and the interventions that applied at capture time
-are part of the graphs: a change in which interventions apply recaptures. Weight edits change
-parameters in place, which the graphs read directly.
+are part of the graphs: a change in which interventions apply recaptures. So is the neuron watch
+(neurons.py NeuronWatch): its hooks write into buffers of their own, which the graphs refresh, and the
+recorder puts the watch's key in the capture key. Weight edits change parameters in place, which the
+graphs read directly.
 """
 
 from __future__ import annotations
@@ -67,6 +69,7 @@ class DecodeGraphs:
         self.rejected: set = set()   # capture keys whose graphs did not match the eager step
         self.captures = 0
         self.capture_s: float | None = None
+        self.extras = None  # () -> tensors hooks refresh on every step (the neuron watch's), verified like the residuals
 
     @staticmethod
     def available(subject) -> bool:
@@ -81,8 +84,8 @@ class DecodeGraphs:
     @torch.no_grad()
     def step(self, token: int, cache, key) -> torch.Tensor | None:
         """Logits (1, 1, vocab) for `token` fed after the tokens in `cache`, which is advanced by one
-        position. `key` names everything Python decides at capture time (which interventions apply).
-        Returns None when the caller should run this step eagerly instead."""
+        position. `key` names everything Python decides at capture time (which interventions apply,
+        which neurons are watched). Returns None when the caller should run this step eagerly instead."""
         if self.off is not None or key in self.rejected:
             return None
         try:
@@ -262,11 +265,14 @@ class DecodeGraphs:
         try:
             out = self.s.model(input_ids=torch.tensor([[token]], device=self.s.device), past_key_values=cache,
                                use_cache=True)
-            ref = (out.logits.clone(), self.tap.stack())
+            ref = (out.logits.clone(), self.tap.stack(), *self._watched())
             self._restore(cache, snapshot)
-            got = (self._replay(token, cache).clone(), self.tap.stack())
+            got = (self._replay(token, cache).clone(), self.tap.stack(), *self._watched())
         finally:
             self._restore(cache, snapshot)
         bad = [f"{name} max |diff| {(a.float() - b.float()).abs().max().item():.3g}"
-               for name, a, b in zip(("logits", "residuals"), ref, got) if not torch.equal(a, b)]
+               for name, a, b in zip(("logits", "residuals", "watched neurons"), ref, got) if not torch.equal(a, b)]
         return "; ".join(bad) or None
+
+    def _watched(self) -> list[torch.Tensor]:
+        return [t.clone() for t in self.extras()] if self.extras is not None else []

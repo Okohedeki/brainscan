@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
-from .recorder import actions, catalog, monitors, neuron_index, neurons, workbench
+from .recorder import actions, catalog, knobs, monitors, neuron_index, neurons, workbench
 from .recorder.model import Subject, display_name
 from .recorder.session import Cancelled, GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
@@ -636,7 +636,7 @@ def _neuron_call(fn, *args):
     """A neuron read off the event loop, its failures mapped to HTTP codes."""
     try:
         return fn(*args)
-    except Busy as exc:
+    except (Busy, knobs.Clash) as exc:
         raise HTTPException(409, str(exc)) from exc
     except KeyError as exc:
         raise HTTPException(404, str(exc).strip("'\"")) from exc
@@ -713,6 +713,115 @@ async def neuron_sweep(request: Request):
                                    factors, max_tokens)
 
 
+def _knob_view(rec: Recorder, knob: dict) -> dict:
+    return knob | {"active": [iv.id for iv in rec.interventions.values() if iv.knob == knob["name"]]}
+
+
+async def _body(request: Request) -> dict:
+    try:
+        body = await request.json() if await request.body() else {}
+    except ValueError:
+        body = None
+    if not isinstance(body, dict):
+        raise HTTPException(400, "send a JSON object")
+    return body
+
+
+@app.get("/brainscan/knobs")
+async def get_knobs():
+    """The saved knobs (recorder/knobs.py): named sets of neurons with doses. "active" lists the
+    interventions steering each one now. "error" says why saving is refused, if it is."""
+    rec = recorder()
+    return {"knobs": [_knob_view(rec, k) for k in rec.knobs.list()], "error": rec.knobs.error}
+
+
+@app.post("/brainscan/knobs")
+async def post_knob(request: Request):
+    """Save a knob, replacing the one of that name: {name, description, neurons: [{neuron, dose}]} or
+    {name, description, text: "L14 N8949 +1, L13 N7956 -1"}."""
+    body = await _body(request)
+    rec = recorder()
+
+    def save():
+        steers = body["neurons"] if body.get("neurons") is not None else neurons.parse_set(body.get("text"))
+        return rec.knobs.save(str(body.get("name") or ""), steers, body.get("description") or "")
+    return _knob_view(rec, await asyncio.to_thread(_neuron_call, save))
+
+
+@app.delete("/brainscan/knobs/{name}")
+async def delete_knob(name: str):
+    rec = recorder()
+    if any(iv.knob == name for iv in rec.interventions.values()):
+        raise HTTPException(409, f"{name} is steering now; stop it first")
+    _neuron_call(rec.knobs.delete, name)
+    return {"deleted": name}
+
+
+@app.post("/brainscan/knobs/{name}/steer")
+async def knob_steer(name: str, request: Request):
+    """Steer a knob on every request from now: {factor, phase}. Each neuron at its dose × factor;
+    steering a knob again replaces its steers. Stop it with DELETE on this path."""
+    body = await _body(request)
+    return await asyncio.to_thread(_neuron_call, recorder().steer_knob, name, body.get("factor", 1.0),
+                                   str(body.get("phase") or "all"))
+
+
+@app.delete("/brainscan/knobs/{name}/steer")
+async def knob_unsteer(name: str):
+    rec = recorder()
+    _neuron_call(rec.knobs.get, name)
+    return {"knob": name, "removed": await asyncio.to_thread(rec.unsteer_knob, name)}
+
+
+@app.post("/brainscan/knobs/{name}/ablate")
+async def knob_ablate(name: str, request: Request):
+    """Add a weight edit that scales a knob's neurons' output weights by `factor` (default 0, which
+    zeroes them): {factor, note}. It is added, not applied: apply it with POST /brainscan/workbench/apply."""
+    body = await _body(request)
+    rec = recorder()
+
+    def add():
+        knob = rec.knobs.get(name)
+        factor = float(body.get("factor", 0.0))
+        if not 0 <= factor <= 1:
+            raise ValueError("factor must be between 0 and 1")
+        names = [e["neuron"] for e in knob["neurons"]]
+        listed = ", ".join(names[:4]) + (f" +{len(names) - 4} more" if len(names) > 4 else "")
+        return rec.add_weight_edit(kind="units", units=rec.knobs.units(name), factor=factor,
+                                   note=str(body.get("note") or "")[:200] or listed).describe()
+    return await asyncio.to_thread(_neuron_call, add)
+
+
+@app.post("/brainscan/knobs/{name}/monitor")
+async def knob_monitor(name: str, request: Request):
+    """Watch each of a knob's neurons: {threshold, sign, min_tokens, phase}. One rule per neuron, labelled
+    "knob · neuron", on its activation z-scored per token. All are added or none."""
+    body = await _body(request)
+    rec = recorder()
+
+    def add():
+        knob = rec.knobs.get(name)
+        rule = {"threshold": 4.0, "sign": "above", "min_tokens": 2, "phase": "gen"}
+        rule |= {k: body[k] for k in ("threshold", "sign", "min_tokens", "phase") if k in body}
+        rules = [rule | {"direction": e["neuron"], "label": f"{name[:40]} · {e['neuron']}"} for e in knob["neurons"]]
+        return [m.describe() for m in rec.monitors.add_many(rules, set(rec.directions.dirs), rec.neurons.check)]
+    return await asyncio.to_thread(_neuron_call, add)
+
+
+@app.post("/brainscan/knobs/{name}/sweep")
+async def knob_sweep(name: str, request: Request):
+    """A prompt answered with a knob's doses scaled by each factor: {prompt, factors, max_tokens}."""
+    body = await _body(request)
+    rec = recorder()
+
+    def sweep():
+        steers = rec.knobs.steers(name)
+        factors = [float(f) for f in body.get("factors") or [0, 0.5, 1, 2]][:8]
+        max_tokens = max(1, min(int(body.get("max_tokens", 60)), 256))
+        return rec.neurons.sweep(str(body.get("prompt") or ""), steers, factors, max_tokens)
+    return await asyncio.to_thread(_neuron_call, sweep)
+
+
 @app.get("/brainscan/monitors")
 async def get_monitors():
     return recorder().monitors.list()
@@ -720,21 +829,23 @@ async def get_monitors():
 
 @app.post("/brainscan/monitors")
 async def post_monitor(request: Request):
-    """Watch a direction: {direction, threshold, sign (above|below|either), min_tokens, phase
-    (gen|all), label}. Runs recorded from now on raise a "monitor" event when the rule is met."""
+    """Watch a direction, or a neuron named like "L14 N8949": {direction, threshold, sign
+    (above|below|either), min_tokens, phase (gen|all), label}. Runs recorded from now on raise a
+    "monitor" event when the rule is met."""
     body = await request.json()
     rec = recorder()
     try:
-        return rec.monitors.add(body, set(rec.directions.dirs)).describe()
+        monitor = await asyncio.to_thread(rec.monitors.add, body, set(rec.directions.dirs), rec.neurons.check)
     except (TypeError, ValueError) as exc:
         raise HTTPException(400, str(exc)) from exc
+    return monitor.describe()
 
 
 @app.patch("/brainscan/monitors/{mid}")
 async def patch_monitor(mid: str, request: Request):
     body = await request.json()
     try:
-        return recorder().monitors.update(mid, body).describe()
+        return (await asyncio.to_thread(recorder().monitors.update, mid, body)).describe()
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
     except (TypeError, ValueError) as exc:
@@ -744,7 +855,7 @@ async def patch_monitor(mid: str, request: Request):
 @app.delete("/brainscan/monitors/{mid}")
 async def delete_monitor(mid: str):
     try:
-        return recorder().monitors.remove(mid)
+        return await asyncio.to_thread(recorder().monitors.remove, mid)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
 

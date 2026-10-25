@@ -27,6 +27,8 @@ class Intervention:
     ablate: h -= (h . v) v
     clamp:  h += (value - h . v) v
     write:  h += value * v            (a fixed write: a steered neuron, see recorder/neurons.py)
+
+    `knob` names the saved knob (recorder/knobs.py) a steered neuron belongs to, if it was steered with one.
     """
     layer: int
     mode: str
@@ -38,6 +40,7 @@ class Intervention:
     run: str | None = None
     enabled: bool = True
     id: str = field(default_factory=lambda: uuid.uuid4().hex[:8])
+    knob: str | None = None
 
     def applies(self, phase: str, run_id: str | None) -> bool:
         return (self.enabled and (self.phase == "all" or self.phase == phase)
@@ -57,7 +60,7 @@ class Intervention:
     def describe(self) -> dict:
         return {"id": self.id, "layer": self.layer, "mode": self.mode, "direction": self.direction,
                 "strength": self.strength, "value": self.value, "phase": self.phase,
-                "run": self.run, "enabled": self.enabled}
+                "run": self.run, "enabled": self.enabled, "knob": self.knob}
 
 
 class LayerTap:

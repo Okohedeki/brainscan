@@ -131,7 +131,8 @@
         </div>
         <p class="hint">Flag a run when a probe fires: a direction's z-score past a threshold for some tokens in a row.
           Runs are checked as they are recorded, and older runs on a scan. The random direction on the same rule shows
-          how often noise alone would fire it.</p>
+          how often noise alone would fire it. A neuron of a saved knob can be watched too: its activation, scored per
+          token against its usual range. Watch a whole knob from Neurons.</p>
         <form id="mon-form" class="mon-form">
           <label>Direction<select id="mon-dir"></select></label>
           <label>When z is
@@ -448,6 +449,14 @@
       <h3>Steer set</h3>
       <ul id="nv-set" class="iv-list"></ul>
       <p class="muted small" id="nv-live"></p>
+      <form id="nv-save" class="nv-save" hidden>
+        <label>Knob name <input id="nv-kname" type="text" maxlength="64" placeholder="evil" spellcheck="false" autocomplete="off" autocapitalize="off"></label>
+        <label class="grow">What it does <input id="nv-kdesc" type="text" maxlength="300" placeholder="optional" autocomplete="off"></label>
+        <span class="nv-save-btns"><button type="submit" class="primary">Save knob</button>
+          <button type="button" class="btn" id="nv-ksave-cancel">Cancel</button></span>
+        <p class="muted small nv-save-note" id="nv-ksave-note">Letters, digits, _ . - only. A name that's already saved is replaced.</p>
+      </form>
+      <div class="wb-msg" id="nv-ksave-msg" role="status"></div>
       <h3>Try it</h3>
       <textarea id="nv-prompt" rows="3" spellcheck="false">Tell me about yourself in two sentences.</textarea>
       <div class="row nv-run-row">
@@ -456,6 +465,13 @@
         <button type="button" class="primary" id="nv-run">Run sweep</button>
       </div>
       <div id="nv-sweep" class="nv-sweep"></div>
+    </section>
+    <section class="panel nv-knobs" aria-labelledby="h-nknobs">
+      <div class="panel-head"><h2 id="h-nknobs">Knobs</h2></div>
+      <p class="hint">A knob is a named set of neurons with doses, saved for this model. Steer it, ablate it or watch it
+        from Steer, Ablate and Monitor without finding the neurons again.</p>
+      <div class="wb-msg" id="nk-msg" role="status"></div>
+      <ul id="nk-list" class="nk-list"></ul>
     </section>
   </main>
 

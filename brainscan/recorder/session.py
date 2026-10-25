@@ -36,9 +36,10 @@ from .directions import DirectionBank
 from .edits import EditStack
 from .events import message_events
 from .graphs import DecodeGraphs
+from .knobs import KnobBank
 from .monitors import MonitorBank
 from .neuron_index import NeuronIndex
-from .neurons import Neurons, label, parse
+from .neurons import MAX_DOSE, Neurons, NeuronWatch, label, parse
 from .tracing import Tracer
 
 
@@ -182,6 +183,9 @@ class Recorder:
         self.tracer = Tracer(self) if self.anatomy is not None else None  # needs the unit map
         self.neurons = Neurons(self)
         self.neuron_index = NeuronIndex(self)  # loads this model's index if one was built
+        self.knobs = KnobBank(store.root / "knobs" / f"{subject.slug}.json", self.neurons)
+        self.watch: NeuronWatch | None = None  # hooks for neuron monitors; there only while one is enabled
+        self.monitors.on_change = self._watch_changed
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}
@@ -210,6 +214,10 @@ class Recorder:
                 self.graphs = None
             if self.tracer is not None:
                 self.tracer._cache.clear()
+            self.monitors.on_change = None
+            if self.watch is not None:
+                self.watch.remove()
+                self.watch = None
             self._kv, self._kv_ids = None, []
             self.interventions.clear()
             self.tap.interventions = []
@@ -238,19 +246,54 @@ class Recorder:
             self._sync_interventions()
         return iv
 
+    def _neuron_write(self, layer: int, n: int, dose: float, phase: str, run: str | None = None,
+                      knob: str | None = None) -> Intervention:
+        """A neuron steered with the dose recipe (recorder/neurons.py): a "write" of dose × the layer's
+        median residual norm along its output weights."""
+        unit, length = self.neurons.write_vector(layer, n, float(dose))
+        return Intervention(layer, "write", label(layer, n), unit.to(self.s.device, torch.float32),
+                            strength=float(dose), value=length, phase=phase, run=run, knob=knob)
+
     def steer_neuron(self, neuron: str, dose: float, phase: str = "all", run: str | None = None) -> Intervention:
-        """Steer one MLP neuron with the dose recipe (recorder/neurons.py) on every request from now:
-        a "write" of dose × the layer's median residual norm along its output weights."""
+        """Steer one MLP neuron on every request from now."""
         if phase not in PHASES:
             raise ValueError(f"phase must be one of {PHASES}")
         layer, n = parse(neuron)
-        unit, length = self.neurons.write_vector(layer, n, float(dose))
-        iv = Intervention(layer, "write", label(layer, n), unit.to(self.s.device, torch.float32),
-                          strength=float(dose), value=length, phase=phase, run=run)
+        iv = self._neuron_write(layer, n, dose, phase, run)
         with self.lock:
             self.interventions[iv.id] = iv
             self._sync_interventions()
         return iv
+
+    def steer_knob(self, name: str, factor: float = 1.0, phase: str = "all") -> list[dict]:
+        """Steer a saved knob (recorder/knobs.py) on every request from now: one write per neuron at its
+        dose × factor, each built as steer_neuron builds it. Steering a knob again replaces its writes."""
+        if phase not in PHASES:
+            raise ValueError(f"phase must be one of {PHASES}")
+        factor = float(factor)
+        if not math.isfinite(factor):
+            raise ValueError("factor must be a number")
+        steers = self.knobs.steers(name)
+        for layer, n, dose in steers:
+            if abs(dose * factor) > MAX_DOSE:
+                raise ValueError(f"{label(layer, n)}: dose {dose:g} × factor {factor:g} is past ±{MAX_DOSE:g}")
+        ivs = [self._neuron_write(layer, n, dose * factor, phase, knob=name) for layer, n, dose in steers]
+        with self.lock:
+            for iid in [i for i, iv in self.interventions.items() if iv.knob == name]:
+                del self.interventions[iid]
+            self.interventions.update({iv.id: iv for iv in ivs})
+            self._sync_interventions()
+        return [iv.describe() for iv in ivs]
+
+    def unsteer_knob(self, name: str) -> int:
+        """Stop steering a knob; how many of its writes were removed."""
+        with self.lock:
+            ids = [i for i, iv in self.interventions.items() if iv.knob == name]
+            for iid in ids:
+                del self.interventions[iid]
+            if ids:
+                self._sync_interventions()
+        return len(ids)
 
     def set_intervention(self, iid: str, enabled: bool) -> Intervention:
         with self.lock:
@@ -266,6 +309,54 @@ class Recorder:
     def _sync_interventions(self) -> None:
         self.tap.interventions = [iv for iv in self.interventions.values() if iv.enabled]
         self._iv_epoch += 1  # cached keys/values were computed under different edits
+
+    # ---- neuron monitors -----------------------------------------------------------
+
+    def sync_watch(self) -> bool:
+        """Make the neuron watch match the enabled neuron monitors: none while there are none (no hooks,
+        no cost), else hooks on the layers they name, with each neuron's mean and spread frozen here. It
+        doesn't wait for a request in flight: every request starts by calling this, so the change takes
+        effect at the next one. True when the watch is in step."""
+        if not self.lock.acquire(blocking=False):
+            return False
+        try:
+            if self.closed:
+                return False
+            items = []
+            for m in self.monitors.monitors():
+                if m.enabled and m.neuron:
+                    try:
+                        layer, n = parse(m.direction)
+                        self.neurons.check(layer, n)
+                    except (KeyError, ValueError):  # saved for a model that had it; it never flags here
+                        continue
+                    items.append((layer, n))
+            items = sorted(set(items))
+            watch = self.watch
+            if not items:
+                if watch is not None:
+                    watch.remove()
+                    self.watch = None
+                return True
+            source = self.neurons.stats_source(items)
+            if watch is not None and watch.items == tuple(items) and watch.source == source:
+                return True
+            new = NeuronWatch(self.neurons, items, self.neurons.stats(items, source), source)
+            if watch is not None:
+                watch.remove()
+            self.watch = new
+            return True
+        finally:
+            self.lock.release()
+
+    def _watch_changed(self) -> None:
+        try:
+            self.sync_watch()
+        except Exception as exc:  # the monitor is saved either way; the next request tries again
+            print(f"[brainscan] neuron watch not updated ({type(exc).__name__}: {exc})", flush=True)
+
+    def _watch_recording(self):
+        return self.watch.recording() if self.watch is not None else contextlib.nullcontext()
 
     def release_memory(self, below_gb: float | None = None) -> None:
         """Hand cached GPU blocks back to the driver. On Windows/WSL an over-full GPU doesn't raise
@@ -390,7 +481,8 @@ class Recorder:
             self.active = {"named": queued[0], "run": None, "req": None, "cancel": cancel}
             try:
                 self.release_memory(below_gb=2.0)
-                with torch.no_grad(), self._anatomy_recording():
+                self._watch_changed()
+                with torch.no_grad(), self._anatomy_recording(), self._watch_recording():
                     return self._generate(p, on_text, on_reasoning, cancel)
             finally:
                 self.perf["busy"] = False
@@ -417,12 +509,14 @@ class Recorder:
     def _anatomy_recording(self):
         return self.anatomy.recording() if self.anatomy is not None else contextlib.nullcontext()
 
-    def _record(self, run, req, pos, tok, role, msg, phase, pred, k, norm, proj) -> dict:
+    def _record(self, run, req, pos, tok, role, msg, phase, pred, k, norm, proj, nz=None) -> dict:
         r = {"t": len(run.tape), "req": req, "pos": int(pos), "tok": int(tok), "text": self.s.token_str(int(tok)),
              "role": role, "msg": int(msg), "ph": phase, "p": None, "ent": None, "top_ids": None, "top_p": None,
              "lens_p": None, "lens_top": None,
              "norm": None if norm is None else [round(float(x), 2) for x in norm],
              "proj": {n: round(float(v), 3) for n, v in proj.items()}}
+        if nz:  # watched neurons' z-scores, kept apart from "proj": the scanner's z-lanes scale to that
+            r["nz"] = {n: round(float(v), 3) for n, v in nz.items()}
         if pred is not None and k is not None:
             r["p"] = round(float(pred["p"][k]), 5)
             r["ent"] = round(float(pred["ent"][k]), 4)
@@ -445,9 +539,10 @@ class Recorder:
             "z": round(flag["raised_z"], 3), "start": flag["start"]})
 
     def _prefill_records(self, run, req, rendered, cs, chunk, resid, logits, pending, record_from,
-                         new_from) -> list[dict]:
+                         new_from, nz=None) -> list[dict]:
         """Records for this chunk's positions at or after `record_from`. Earlier positions were
-        recorded on a previous request of this run and are only re-read for context."""
+        recorded on a previous request of this run and are only re-read for context. `nz` is the
+        neuron watch's (chunk, neurons) read of the chunk, if there is a watch."""
         first = max(cs, record_from)
         if first >= cs + len(chunk):
             return []
@@ -472,11 +567,13 @@ class Recorder:
         own = resid[:, first - cs:, :]
         norms = own.float().norm(dim=-1).cpu().numpy()
         proj = self.directions.project(own)
+        zs = nz[first - cs:].cpu().numpy() if nz is not None else None
         recs = []
         for k, pos in enumerate(range(first, cs + len(chunk))):
             phase = "replay" if rendered.offsets[pos][0] < new_from else "prefill"
             recs.append(self._record(run, req, pos, chunk[pos - cs], rendered.roles[pos], rendered.msg_index[pos],
-                                     phase, pred, row_of.get(pos), norms[:, k], {n: v[k] for n, v in proj.items()}))
+                                     phase, pred, row_of.get(pos), norms[:, k], {n: v[k] for n, v in proj.items()},
+                                     None if zs is None else dict(zip(self.watch.labels, zs[k]))))
         return recs
 
     def _generate(self, p: GenParams, on_text, on_reasoning, cancel: threading.Event) -> GenResult:
@@ -496,6 +593,7 @@ class Recorder:
         new_from = max((e for st, e in rendered.spans[:seen] if st >= 0), default=0)
         active = [iv.describe() for iv in self.tap.interventions if iv.run in (None, run.id)]
         weight_edits = self.edits.active()
+        watch = self.watch  # neuron monitors' hooks, fixed for this request (sync_watch runs between requests)
 
         # Tokens shared with this run's previous request were already recorded. Never share
         # across runs: each run's tape must hold its own full prompt. Attention-only models
@@ -545,8 +643,9 @@ class Recorder:
             self._kv = out.past_key_values
             resid = self.tap.stack()
             logits = out.logits[0]
+            nz = watch.read_chunk(len(chunk)) if watch is not None else None
             recs = self._prefill_records(run, req, rendered, cs, chunk, resid, logits, pending,
-                                         record_from, new_from)
+                                         record_from, new_from, nz=nz)
             new_records += recs
             if self.anatomy is not None:
                 codes = self.anatomy.read_chunk(len(chunk))
@@ -593,8 +692,12 @@ class Recorder:
         else:
             generator.seed()
         msg_idx = len(p.messages)
-        # Interventions are baked into the decode graphs, so the set that applies keys them.
-        graph_key = tuple(iv.id for iv in self.tap.interventions if iv.applies("gen", run.id))
+        # Interventions and the neuron watch's hooks are baked into the decode graphs, so the set that
+        # applies and the watch (its key changes whenever the watched set does) key them.
+        graph_key = (tuple(iv.id for iv in self.tap.interventions if iv.applies("gen", run.id)),
+                     watch.key if watch is not None else None)
+        if self.graphs is not None:
+            self.graphs.extras = (lambda: (watch.step,)) if watch is not None else None
         cuda = s.device.type == "cuda"
         marks = (torch.cuda.Event(enable_timing=True), torch.cuda.Event(enable_timing=True)) if cuda else None
 
@@ -606,7 +709,8 @@ class Recorder:
             pred = {k: v.numpy() for k, v in host["pred"].items()}
             norm = host["norm"].numpy() if "norm" in host else None
             proj = {k: v.numpy()[0] for k, v in host["proj"].items()} if "proj" in host else {}
-            rec = self._record(run, req, st["pos"], st["tok"], st["role"], msg_idx, "gen", pred, 0, norm, proj)
+            nz = dict(zip(watch.labels, host["nz"].numpy())) if "nz" in host else None
+            rec = self._record(run, req, st["pos"], st["tok"], st["role"], msg_idx, "gen", pred, 0, norm, proj, nz)
             new_records.append(rec)
             self.publish({"k": "toks", "run": run.id, "items": [compact(rec)]})
             if "anat" in host:
@@ -660,6 +764,8 @@ class Recorder:
                         "proj": self.directions.project(own[:, None, :], host=False)}
                 if self.anatomy is not None:
                     dev["anat"] = self.anatomy.read_step()
+                if watch is not None:
+                    dev["nz"] = watch.read_step()
                 if p.temperature <= 0:  # the next greedy pick comes back with this step's copies
                     dev["next"] = pending[1].argmax()
             host = to_host(dev)
@@ -784,7 +890,8 @@ class Recorder:
                 "generating": generating, "queued": len(self._queued),
                 "disk": {"used": self.store.used_bytes(), "budget": self.store.budget},
                 "interventions": [iv.describe() for iv in self.interventions.values()],
-                "directions": self.directions.describe(), "workbench": self.edits.summary()}
+                "directions": self.directions.describe(), "workbench": self.edits.summary(),
+                "knobs": self.knobs.names()}
 
     # ---- workbench -----------------------------------------------------------------
 
