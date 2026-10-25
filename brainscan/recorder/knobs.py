@@ -1,7 +1,7 @@
 """Knobs: named, saved sets of neurons with doses, per model.
 
-A knob is a recipe found once and reused: "evil" = L14 N8949 +1, L13 N7956 -1. Each entry is a neuron
-(neurons.py) and the dose it is steered at (the dose recipe there). One knob serves four actions:
+A knob is a set of neurons found once and reused, e.g. "tone" = L5 N120 +1, L9 N64 -0.5. Each entry is a
+neuron (neurons.py) and the dose it is steered at (dose scaling, there). One knob serves four actions:
 
   steer    Recorder.steer_knob: one runtime "write" per neuron, every request from now, at dose × factor
   ablate   a "units" weight edit that zeroes the knob's neurons' write columns (added, not applied)
@@ -120,7 +120,7 @@ class KnobBank:
             elif isinstance(s, (list, tuple)) and len(s) == 3:
                 layer, n, dose = s
             else:
-                raise ValueError("each neuron is {neuron: \"L14 N8949\", dose: 1}")
+                raise ValueError("each neuron is {neuron: \"L5 N120\", dose: 1}")
             try:
                 self.nm.check(int(layer), int(n))
             except KeyError as exc:

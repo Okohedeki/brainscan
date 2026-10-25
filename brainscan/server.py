@@ -646,7 +646,7 @@ def _neuron_call(fn, *args):
 
 @app.get("/brainscan/neurons")
 async def neurons_summary():
-    """Layer widths, the median residual norms the dose recipe uses, and the neurons being steered."""
+    """Layer widths, the median residual norms dose scaling uses, and the neurons being steered."""
     return recorder().neurons.summary()
 
 
@@ -678,7 +678,7 @@ async def neuron_search(q: str = "", limit: int = 20):
 
 @app.get("/brainscan/neurons/{name}")
 async def neuron_card(name: str, dose: float = 1.0):
-    """One neuron's card (recorder/neurons.py): logit lens, steer lens at ±dose, activity, wiring."""
+    """One neuron's card (recorder/neurons.py): logit lens, steering effect at ±dose, activity, wiring."""
     rec = recorder()
     try:
         layer, n = neurons.parse(name)
@@ -689,7 +689,7 @@ async def neuron_card(name: str, dose: float = 1.0):
 
 @app.post("/brainscan/neurons/steer")
 async def neuron_steer(request: Request):
-    """Steer a neuron on every request from now: {neuron: "L14 N8949", dose, phase}. Remove it like any
+    """Steer a neuron on every request from now: {neuron: "L5 N120", dose, phase}. Remove it like any
     intervention (DELETE /brainscan/interventions/{id})."""
     body = await request.json()
     rec = recorder()
@@ -738,7 +738,7 @@ async def get_knobs():
 @app.post("/brainscan/knobs")
 async def post_knob(request: Request):
     """Save a knob, replacing the one of that name: {name, description, neurons: [{neuron, dose}]} or
-    {name, description, text: "L14 N8949 +1, L13 N7956 -1"}."""
+    {name, description, text: "L5 N120 +1, L9 N64 -0.5"}."""
     body = await _body(request)
     rec = recorder()
 
@@ -829,7 +829,7 @@ async def get_monitors():
 
 @app.post("/brainscan/monitors")
 async def post_monitor(request: Request):
-    """Watch a direction, or a neuron named like "L14 N8949": {direction, threshold, sign
+    """Watch a direction, or a neuron named like "L5 N120": {direction, threshold, sign
     (above|below|either), min_tokens, phase (gen|all), label}. Runs recorded from now on raise a
     "monitor" event when the rule is met."""
     body = await request.json()

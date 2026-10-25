@@ -297,7 +297,7 @@ export const SCENES = [
       const d = window.demo, q = d.q;
       await d.title("Adjust open-weights models, and see what changed", "Brainscan runs the model on your GPU and records what happens inside it", 3400);
       await d.say("Brainscan runs an open-weights model on your machine and records its internals, token by token.",
-        `Here: ${q("#model-badge").innerText.split(" · ")[0]}, using a quarter of one RTX 4090.`);
+        `Here: ${q("#model-badge").innerText.split(" · ")[0]}, within a GPU memory cap.`);
       await d.move(q("#verbs"));
       await d.say("Start with what you want to do to the model.",
         "Adjust it: ablate, scale or steer. Analyze it: probe, monitor, compare or check.", "top");

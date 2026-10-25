@@ -1,6 +1,6 @@
-// The Neurons view: a secondary screen for single MLP neurons ("L14 N8949"). A card says what a
-// neuron does (logit lens, steer lens at ±dose, where it fires, what feeds it and what it feeds);
-// a steer set doses one or more neurons with the recipe and answers a prompt at several dose levels
+// The Neurons view: a secondary screen for single MLP neurons ("L5 N120"). A card says what a
+// neuron does (logit lens, steering effect at ±dose, where it fires, what feeds it and what it feeds);
+// a steer set doses one or more neurons with dose scaling and answers a prompt at several dose levels
 // to verify, or steers the chat itself (brainscan/recorder/neurons.py). Any neuron named in the app
 // opens here: a [data-open-neuron] link anywhere, or the brainscan:neuron event.
 // A steer set can be saved as a knob (brainscan/recorder/knobs.py): a named set of neurons with doses,
@@ -36,7 +36,7 @@ function message(text, tone = "") {
 // ---------------------------------------------------------------- the card
 async function open(name, { push = true } = {}) {
   name = String(name || "").trim();
-  if (!/^L\d+\s*N\d+$/i.test(name)) { message("Name a neuron like L14 N8949.", "error"); return; }
+  if (!/^L\d+\s*N\d+$/i.test(name)) { message("Name a neuron like L5 N120.", "error"); return; }
   name = name.toUpperCase().replace(/\s*N/, " N");
   if (push && N.name && N.name !== name) N.history.push(N.name);
   N.name = name;
@@ -79,7 +79,7 @@ function render() {
     body.innerHTML = `<p class="muted">Open a neuron by name, or from a cluster's neurons in Trace. A neuron is one channel of a layer's MLP output: it writes its activation × its output weights into the residual stream.</p>`;
     return;
   }
-  const sl = c.steer_lens, a = c.activity, fb = c.fed_by, fd = c.feeds;
+  const sl = c.steer_effect, a = c.activity, fb = c.fed_by, fd = c.feeds;
   body.innerHTML = `
     <div class="nv-head">
       <h3>${esc(c.neuron)}</h3>
@@ -89,7 +89,7 @@ function render() {
     <section class="nv-sec"><h4>Logit lens <span class="dim">what its write pushes, read straight out (weights only)</span></h4>
       <div class="nv-row"><span class="nv-lbl">up</span>${chips(c.logit_lens.up, "up")}</div>
       <div class="nv-row"><span class="nv-lbl">down</span>${chips(c.logit_lens.down, "down")}</div></section>
-    <section class="nv-sec"><h4>Steer lens <span class="dim">what steering it does to the predictions, averaged over the calibration texts</span></h4>
+    <section class="nv-sec"><h4>Steering effect <span class="dim">what steering it does to the predictions, averaged over the calibration texts</span></h4>
       ${[sl.plus, sl.minus].map((s) => `<div class="nv-steer"><b>dose ${sign(s.dose, 2)}</b><span class="muted small">KL ${n2(s.kl, 3)}</span></div>
         <div class="nv-row"><span class="nv-lbl">more</span>${chips(s.up, "up")}</div>
         <div class="nv-row"><span class="nv-lbl">less</span>${chips(s.down, "down")}</div>`).join("")}</section>
@@ -192,7 +192,7 @@ function renderSet() {
   ul.innerHTML = N.set.map((s, i) => `<li data-i="${i}"><button type="button" class="link mono" data-open-neuron="${s.neuron}">${s.neuron}</button>
       <label>dose <input type="number" step="0.25" min="-16" max="16" value="${s.dose}" data-dose></label>
       <button type="button" data-remove aria-label="Remove ${s.neuron} from the steer set">✕</button></li>`).join("")
-    || `<li class="muted" style="border:none;background:none;padding:0">No neurons yet. Open one and press Add to steer set, or type several, like L14 N8949 +1 and L13 N7956 −1${N.knobs.length ? ". Or Load a saved knob below" : ""}.</li>`;
+    || `<li class="muted" style="border:none;background:none;padding:0">No neurons yet. Open one and press Add to steer set, or type several, like L5 N120 +1 and L9 N64 −1${N.knobs.length ? ". Or Load a saved knob below" : ""}.</li>`;
   const live = N.steering.length;
   $("#nv-live").textContent = live ? `Steering the chat with ${live} neuron${live === 1 ? "" : "s"}: ${N.steering.map((iv) => `${iv.knob ? `${iv.knob} · ` : ""}${iv.direction} ${sign(iv.strength, 2)}`).join(", ")}` : "";
 }
@@ -204,7 +204,7 @@ function addToSet(neuron = N.name, dose = N.dose) {
   saveSet(); render();
 }
 
-/** "L14 N8949 +1, L13 N7956 -1" → the steer set. */
+/** "L5 N120 +1, L9 N64 -0.5" → the steer set. */
 function addTyped(text) {
   const found = [...String(text).matchAll(/L(\d+)\s*N(\d+)\s*([+−-]?\s*\d*\.?\d+)?/gi)];
   for (const m of found) addToSet(`L${m[1]} N${m[2]}`, m[3] ? Number(m[3].replace("−", "-").replace(/\s/g, "")) : 1);
@@ -453,7 +453,7 @@ function setupBar() {
         need: () => (N.index?.meta ? null : "the neuron index: build it first"), run: () => { scroll("#h-nsearch"); $("#nv-s").focus(); } },
       { id: "build", group: "Find", label: () => (N.index?.meta ? "Rebuild index" : "Build index"), hint: "Read the corpus once and keep every neuron's top contexts and lens",
         need: () => (N.index?.status === "building" ? "the build running now to finish" : null), run: buildIndex },
-      { id: "go", group: "Find", label: "Go to neuron", hint: "Open a neuron by name, like L14 N8949", run: () => { $("#nv-q").focus(); $("#nv-q").select(); } },
+      { id: "go", group: "Find", label: "Go to neuron", hint: "Open a neuron by name, like L5 N120", run: () => { $("#nv-q").focus(); $("#nv-q").select(); } },
       { id: "back", group: "Find", label: "Back", hint: "The neuron opened before this one",
         need: () => (N.history.length ? null : "a neuron opened before this one"), run: () => open(N.history.pop(), { push: false }) },
       { id: "add", group: "Steer", label: "Add to steer set", hint: "Steer this neuron, at the dose above, with the others in the set",

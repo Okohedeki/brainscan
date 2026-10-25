@@ -1,14 +1,14 @@
 """Neurons: single MLP neurons as units you can read and steer.
 
 A neuron is one input channel of a layer's MLP output projection (down_proj): at every position it
-writes act × W_down[:, n] into the residual stream. Neurons are named "L14 N8949" (layer, index).
+writes act × W_down[:, n] into the residual stream. Neurons are named like "L5 N120" (layer, index).
 
-  steer      the dose recipe: dose × median(‖resid‖ leaving layer L, tokens 1:) / ‖W_down[:, n]‖ is
-             added to the neuron's activation at every position, so its write grows by dose ×
-             that median norm along W_down[:, n]: dose 1 writes one typical residual's worth. The
-             median is read on the calibration texts (workbench.REFERENCE_TEXTS) on the current
-             weights, first token skipped (it carries the attention sink). During a chat or an
-             agent run it is a "write" intervention on layer L's output, which adds the same vector.
+  steer      dose scaling: a dose is expressed in units of the layer's typical residual size, so
+             one dose adds that much along the neuron's output direction at every position. The
+             typical size is the median residual norm at the layer's output on the calibration
+             texts (workbench.REFERENCE_TEXTS), current weights, without the first token (the
+             attention sink). The activation gets dose × that median / ‖W_down[:, n]‖. During a
+             chat or an agent run it is a "write" intervention on the layer's output: the same vector.
 
   watch      a monitor on one neuron (monitors.py): its activation z-scored per token against a mean
              and spread frozen when the watch is built (the neuron index's when it exists, else the
@@ -17,7 +17,7 @@ writes act × W_down[:, n] into the residual stream. Neurons are named "L14 N894
   card      what the neuron does, read on the calibration texts:
                logit lens   tokens its write pushes up and down, read straight through the final
                             norm and the unembedding (weights only, nothing run)
-               steer lens   what steering it does to the model's predictions: the change in
+               steering effect   what steering it does to the model's predictions: the change in
                             next-token log-probs averaged over every position, at +dose and −dose,
                             with the mean KL from the unsteered predictions
                activity     its activation over the texts, and the contexts where it fires most
@@ -59,7 +59,7 @@ MIN_STD = 1e-4      # a watched neuron's spread is never taken as smaller than t
 def parse(name: str) -> tuple[int, int]:
     m = NAME.match(str(name))
     if not m:
-        raise ValueError(f"name a neuron like L14 N8949, not {name!r}")
+        raise ValueError(f"name a neuron like L5 N120, not {name!r}")
     return int(m[1]), int(m[2])
 
 
@@ -72,11 +72,11 @@ def is_label(text) -> bool:
 
 
 def parse_set(text: str) -> list[tuple[int, int, float]]:
-    """"L14 N8949 +1, L13 N7956 -1" -> [(14, 8949, 1.0), (13, 7956, -1.0)]. A neuron with no number
+    """"L5 N120 +1, L9 N64 -0.5" -> [(5, 120, 1.0), (9, 64, -0.5)]. A neuron with no number
     gets dose 1; the minus sign may be the unicode one."""
     found = list(SET.finditer(str(text or "")))
     if not found:
-        raise ValueError("name neurons with a dose like L14 N8949 +1, L13 N7956 -1")
+        raise ValueError("name neurons with a dose like L5 N120 +1, L9 N64 -0.5")
     return [(int(m[1]), int(m[2]), float(re.sub(r"\s", "", m[3].replace("−", "-"))) if m[3] else 1.0) for m in found]
 
 
@@ -220,7 +220,7 @@ class Neurons:
     # ---- steering ------------------------------------------------------------------------
 
     def boost(self, layer: int, n: int, dose: float) -> float:
-        """The dose recipe: what is added to the neuron's activation."""
+        """Dose scaling: what is added to the neuron's activation."""
         if not math.isfinite(dose) or abs(dose) > MAX_DOSE:
             raise ValueError(f"dose must be a number between -{MAX_DOSE:g} and {MAX_DOSE:g}")
         w = self.write(layer, n)
@@ -286,9 +286,9 @@ class Neurons:
         with self._model():
             logits = s.lm_head(s.norm(w.to(s.lm_head.weight.dtype)[None, None]))[0, 0].float()
             out["logit_lens"] = {"up": self._tokens(logits, True), "down": self._tokens(logits, False)}
-            plus, moved = self._steer_lens(cal, layer, n, dose, measure_downstream=True)
-            minus, _ = self._steer_lens(cal, layer, n, -dose)
-            out["steer_lens"] = {"plus": plus, "minus": minus}
+            plus, moved = self._steer_effect(cal, layer, n, dose, measure_downstream=True)
+            minus, _ = self._steer_effect(cal, layer, n, -dose)
+            out["steer_effect"] = {"plus": plus, "minus": minus}
             out["feeds"] = self._feeds(cal, layer, moved)
             out["fed_by"] = self._fed_by(cal, mlp, layer, n)
         out["activity"] = self._activity(cal, layer, n)
@@ -308,7 +308,7 @@ class Neurons:
         vals, ids = scores.topk(k, largest=up)
         return [{"id": int(i), "text": self.s.token_str(int(i)), "v": round(float(v), 4)} for v, i in zip(vals, ids)]
 
-    def _steer_lens(self, cal: dict, layer: int, n: int, dose: float, measure_downstream: bool = False):
+    def _steer_effect(self, cal: dict, layer: int, n: int, dose: float, measure_downstream: bool = False):
         s = self.s
         delta = torch.zeros(s.vocab_size, device=s.device)
         kl_sum, count = 0.0, 0

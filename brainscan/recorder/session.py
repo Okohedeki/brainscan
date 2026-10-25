@@ -248,7 +248,7 @@ class Recorder:
 
     def _neuron_write(self, layer: int, n: int, dose: float, phase: str, run: str | None = None,
                       knob: str | None = None) -> Intervention:
-        """A neuron steered with the dose recipe (recorder/neurons.py): a "write" of dose × the layer's
+        """A neuron steered with dose scaling (recorder/neurons.py): a "write" of dose × the layer's
         median residual norm along its output weights."""
         unit, length = self.neurons.write_vector(layer, n, float(dose))
         return Intervention(layer, "write", label(layer, n), unit.to(self.s.device, torch.float32),

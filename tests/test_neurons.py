@@ -1,4 +1,4 @@
-"""Neurons: the dose recipe, steering by a "write" on the layer output (the same as boosting the
+"""Neurons: dose scaling, steering by a "write" on the layer output (the same as boosting the
 neuron's activation), and the card's readings, checked on the tiny saved Llama in fp32."""
 
 from pathlib import Path
@@ -39,15 +39,16 @@ def logits_of(rec, text):
 
 
 def test_names():
-    assert nmod.parse("L14 N8949") == (14, 8949) == nmod.parse("l14n8949") == nmod.parse("L14/N8949")
+    assert nmod.parse("L5 N120") == (5, 120) == nmod.parse("l5n120") == nmod.parse("L5/N120")
     assert nmod.label(3, 7) == "L3 N7"
-    for bad in ("14 8949", "L14", "N3", "L1 N"):
+    for bad in ("5 120", "L5", "N3", "L1 N"):
         with pytest.raises(ValueError):
             nmod.parse(bad)
 
 
-def test_the_dose_recipe(rec):
-    """boost = dose × median(‖residual leaving layer L‖ over tokens 1:) / ‖W_down[:, n]‖."""
+def test_dose_scaling(rec):
+    """A dose is in units of the layer's median output residual norm (first token skipped), divided
+    by the neuron's output-weight norm."""
     norms = [[] for _ in range(rec.s.n_layers)]
     with torch.no_grad(), rec.tap.paused():
         for text in REFERENCE_TEXTS:
@@ -95,13 +96,13 @@ def test_the_card(rec):
     card = rec.neurons.card(layer, n, 1.0)
     assert card["neuron"] == "L2 N5" and card["unit"]["name"].startswith("L2 c")
     assert len(card["logit_lens"]["up"]) == nmod.TOP and card["logit_lens"]["up"][0]["v"] >= card["logit_lens"]["down"][0]["v"]
-    plus, minus = card["steer_lens"]["plus"], card["steer_lens"]["minus"]
+    plus, minus = card["steer_effect"]["plus"], card["steer_effect"]["minus"]
     assert plus["kl"] > 0 and minus["kl"] > 0 and plus["dose"] == 1.0 and minus["dose"] == -1.0
     assert all(x["layer"] > layer for x in card["feeds"]["toward"] + card["feeds"]["away"])
     assert all(x["layer"] < layer for x in card["fed_by"]["drives_up"] + card["fed_by"]["drives_down"])
     act = card["activity"]
     assert len(act["contexts"]) == nmod.FIRE and act["contexts"][0]["act"] == pytest.approx(act["max"], abs=1e-3)
-    zero = rec.neurons.card(layer, n, 0.0)["steer_lens"]["plus"]
+    zero = rec.neurons.card(layer, n, 0.0)["steer_effect"]["plus"]
     assert zero["kl"] == pytest.approx(0.0, abs=1e-6)
 
 
@@ -144,7 +145,7 @@ def test_endpoints(rec):
         client = TestClient(server.app)
         assert client.get("/brainscan/neurons").json()["layers"] == rec.s.n_layers
         r = client.get("/brainscan/neurons/L2 N5", params={"dose": 0.5})
-        assert r.status_code == 200 and r.json()["steer_lens"]["plus"]["dose"] == 0.5
+        assert r.status_code == 200 and r.json()["steer_effect"]["plus"]["dose"] == 0.5
         assert client.get("/brainscan/neurons/bad").status_code == 400
         assert client.get("/brainscan/neurons/L99 N0").status_code == 404
         assert client.get("/brainscan/neurons/L2 N999999").status_code == 404

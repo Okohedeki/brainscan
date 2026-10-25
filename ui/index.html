@@ -422,7 +422,7 @@
       <div class="panel-head">
         <h2 id="h-nsearch">Find neurons</h2>
         <form id="nv-sform" class="nv-go">
-          <input id="nv-s" type="search" placeholder="conspiracy, Canberra, sorry, def…" spellcheck="false" autocomplete="off" aria-label="Search neurons by text">
+          <input id="nv-s" type="search" placeholder="a word or phrase: weather, sorry, def…" spellcheck="false" autocomplete="off" aria-label="Search neurons by text">
           <button type="submit">Search</button>
         </form>
       </div>
@@ -433,7 +433,7 @@
       <div class="panel-head">
         <h2 id="h-neuron">Neuron</h2>
         <form id="nv-go" class="nv-go">
-          <input id="nv-q" type="text" placeholder="L14 N8949" spellcheck="false" autocomplete="off" aria-label="Neuron to open, or several to add to the steer set">
+          <input id="nv-q" type="text" placeholder="L5 N120" spellcheck="false" autocomplete="off" aria-label="Neuron to open, or several to add to the steer set">
           <label>Dose <input id="nv-dose" type="number" step="0.25" min="-16" max="16" value="1"></label>
           <button type="submit">Open</button>
         </form>
@@ -443,14 +443,13 @@
     </section>
     <section class="panel nv-steer-panel" aria-labelledby="h-nsteer">
       <div class="panel-head"><h2 id="h-nsteer">Steer and verify</h2></div>
-      <p class="hint">The dose recipe: dose × the median residual norm leaving the neuron's layer (first token skipped)
-        ÷ ‖W_down[:, n]‖ is added to its activation at every position. Dose 1 writes one typical residual's worth
-        along its output weights.</p>
+      <p class="hint">Doses are in units of the layer's typical residual size: dose 1 adds one typical residual's
+        worth along the neuron's output weights, at every position.</p>
       <h3>Steer set</h3>
       <ul id="nv-set" class="iv-list"></ul>
       <p class="muted small" id="nv-live"></p>
       <form id="nv-save" class="nv-save" hidden>
-        <label>Knob name <input id="nv-kname" type="text" maxlength="64" placeholder="evil" spellcheck="false" autocomplete="off" autocapitalize="off"></label>
+        <label>Knob name <input id="nv-kname" type="text" maxlength="64" placeholder="my-knob" spellcheck="false" autocomplete="off" autocapitalize="off"></label>
         <label class="grow">What it does <input id="nv-kdesc" type="text" maxlength="300" placeholder="optional" autocomplete="off"></label>
         <span class="nv-save-btns"><button type="submit" class="primary">Save knob</button>
           <button type="button" class="btn" id="nv-ksave-cancel">Cancel</button></span>

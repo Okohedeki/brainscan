@@ -3,7 +3,7 @@
 A monitor watches one direction of the bank (a probe: every recorded token's residual is projected
 onto it and z-scored, see directions.py) or one neuron (its activation, z-scored against a frozen mean
 and spread, see neurons.py NeuronWatch), and fires when that z-score stays past a threshold for some
-tokens in a row. A neuron is named like "L14 N8949" where a direction would be; its z-scores sit on the
+tokens in a row. A neuron is named like "L5 N120" where a direction would be; its z-scores sit on the
 token record under "nz", a direction's under "proj". Each firing is a flag: the token where the rule
 was met, where the streak began and ended, and its peak. Flags come out the same two ways, because
 both apply one rule to the same recorded numbers:
@@ -227,12 +227,12 @@ class MonitorBank:
 
     @staticmethod
     def _neuron(text: str, check) -> str:
-        """A neuron named like L14 N8949 as label() writes it, if the model has it (`check(layer, n)`)."""
+        """A neuron named like L5 N120 as label() writes it, if the model has it (`check(layer, n)`)."""
         try:
             layer, n = parse(text)
         except ValueError:
             raise ValueError(f"unknown direction {text!r}: save it to the direction bank first "
-                             "(or name a neuron like L14 N8949)") from None
+                             "(or name a neuron like L5 N120)") from None
         if check is not None:
             try:
                 check(layer, n)

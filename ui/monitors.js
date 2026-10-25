@@ -3,7 +3,7 @@
 // enabled monitor as tokens are recorded and adds a "monitor" event where the rule is met
 // (brainscan/recorder/monitors.py). This panel in Watch adds and lists monitors, shows the open
 // run's flags beside how often the random direction trips the same rule, and scans recent runs.
-// Its tools join Watch's bar (extendBar). A rule may also watch one neuron ("L14 N8949", the
+// Its tools join Watch's bar (extendBar). A rule may also watch one neuron ("L5 N120", the
 // neurons of a saved knob: ui/neurons.js): its activation, z-scored per token against its usual range.
 import { extendBar, noteBar, refreshBar } from "/ui/actionbar.js";
 
@@ -28,7 +28,7 @@ const neuronLink = (n, cls = "nv-link") => `<button type="button" class="${cls}"
 /** A monitor's name in the lists: a direction as it is, a neuron as a link to its card (after its knob's name). */
 function whoHtml(m, cls) {
   if (!isNeuron(m.direction)) return `<b>${esc(m.name)}</b>`;
-  const knob = String(m.label || "").replace(m.direction, "").replace(/\s*·\s*$/, "").trim();  // "evil · L14 N8949" → "evil"
+  const knob = String(m.label || "").replace(m.direction, "").replace(/\s*·\s*$/, "").trim();  // "tone · L5 N120" → "tone"
   return `${knob ? `<b>${esc(knob)}</b> · ` : ""}${neuronLink(m.direction, cls)}`;
 }
 const enabled = () => M.list.filter((m) => m.enabled);
@@ -90,7 +90,7 @@ function renderForm() {
 function renderList() {
   const ul = $("#mon-list");
   if (!ul) return;
-  // A neuron rule reads "knob · L14 N8949 z ≥ 4 …", the neuron a link to its card.
+  // A neuron rule reads "knob · L5 N120 z ≥ 4 …", the neuron a link to its card.
   const ruleHtml = (m) => (isNeuron(m.direction) && String(m.rule).startsWith(m.direction)
     ? `${whoHtml(m, "link mono")} ${esc(String(m.rule).slice(m.direction.length).trim())}` : esc(m.rule));
   ul.innerHTML = M.list.map((m) => `<li data-id="${esc(m.id)}" class="${m.enabled ? "" : "off"}">

@@ -86,28 +86,28 @@ def watch_neuron(rec, label, **rule):
 
 def test_a_set_of_neurons_is_parsed_like_the_ui_does():
     assert nmod.parse_set("L1 N3 +1, L2 N5 −0.5, L0 N7") == [(1, 3, 1.0), (2, 5, -0.5), (0, 7, 1.0)]
-    assert nmod.parse_set("L14 N8949 +1, L13 N7956 -1") == [(14, 8949, 1.0), (13, 7956, -1.0)]
+    assert nmod.parse_set("L5 N120 +1, L9 N64 -0.5") == [(5, 120, 1.0), (9, 64, -0.5)]
     assert nmod.parse_set("l1n3 - 2.5") == [(1, 3, -2.5)]
     for bad in ("", "nothing here", "N3 L1"):
         with pytest.raises(ValueError):
             nmod.parse_set(bad)
-    assert nmod.is_label("L14 N8949") and not any(map(nmod.is_label, ("L14N8949", "l14 n8949", "tone", None)))
+    assert nmod.is_label("L5 N120") and not any(map(nmod.is_label, ("L5N120", "l5 n120", "tone", None)))
 
 
 def test_saving_and_loading(rec, tmp_path):
     path = tmp_path / "knobs" / "m.json"
     bank = KnobBank(path, rec.neurons)
     assert bank.list() == [] and bank.error is None
-    a = bank.save("evil", [{"neuron": "L2 N5", "dose": 1}, {"neuron": "l1/n3", "dose": -0.5}], "bad stuff")
+    a = bank.save("tone", [{"neuron": "L2 N5", "dose": 1}, {"neuron": "l1/n3", "dose": -0.5}], "a test knob")
     assert a["neurons"] == [{"neuron": "L2 N5", "dose": 1.0}, {"neuron": "L1 N3", "dose": -0.5}]  # canonical labels
     time.sleep(0.01)
-    b = bank.save("evil", [(2, 5, 2.0)], "again")  # the same name replaces it
-    assert b["created"] == a["created"] and b["updated"] > a["updated"] and bank.names() == ["evil"]
+    b = bank.save("tone", [(2, 5, 2.0)], "again")  # the same name replaces it
+    assert b["created"] == a["created"] and b["updated"] > a["updated"] and bank.names() == ["tone"]
     raw = json.loads(path.read_text())
     assert raw["version"] == 1 and raw["shape"] == [rec.s.n_layers, rec.neurons.mlp(0).width]
     assert not list(path.parent.glob("*.tmp"))  # written to a temp file, then moved into place
     assert KnobBank(path, rec.neurons).list() == bank.list()  # a new bank reads it back
-    assert bank.get("evil")["description"] == "again" and bank.steers("evil") == [(2, 5, 2.0)]
+    assert bank.get("tone")["description"] == "again" and bank.steers("tone") == [(2, 5, 2.0)]
     with pytest.raises(KeyError):
         bank.get("nope")
     bank.save("edge", [(2, 5, 16.0), (2, 6, -16.0)], "x" * 300)  # the limits themselves are fine
@@ -170,12 +170,12 @@ def test_a_shape_clash_loads_nothing_and_refuses_to_write(rec, tmp_path):
 
 
 def test_steering_a_knob(rec):
-    rec.knobs.save("evil", [{"neuron": "L2 N5", "dose": 1.0}, {"neuron": "L1 N3", "dose": -0.5}])
+    rec.knobs.save("tone", [{"neuron": "L2 N5", "dose": 1.0}, {"neuron": "L1 N3", "dose": -0.5}])
     single = rec.steer_neuron("L2 N5", 1.0)
     rec.remove_intervention(single.id)
 
-    ivs = rec.steer_knob("evil")
-    assert len(ivs) == 2 and {iv["knob"] for iv in ivs} == {"evil"} and {iv["mode"] for iv in ivs} == {"write"}
+    ivs = rec.steer_knob("tone")
+    assert len(ivs) == 2 and {iv["knob"] for iv in ivs} == {"tone"} and {iv["mode"] for iv in ivs} == {"write"}
     by = {iv["direction"]: iv for iv in ivs}
     assert by["L2 N5"]["value"] == pytest.approx(single.value, rel=1e-6)  # what steer_neuron gives
     assert by["L1 N3"]["value"] == pytest.approx(-0.5 * rec.neurons.calibration()["median"][1], rel=1e-5)
@@ -183,9 +183,9 @@ def test_steering_a_knob(rec):
     assert len(rec.interventions) == 2
 
     other = rec.steer_neuron("L3 N1", 1.0)
-    again = rec.steer_knob("evil")  # steering it twice replaces it
+    again = rec.steer_knob("tone")  # steering it twice replaces it
     assert len(rec.interventions) == 3 and {iv["id"] for iv in again}.isdisjoint(iv["id"] for iv in ivs)
-    double = rec.steer_knob("evil", factor=2.0)
+    double = rec.steer_knob("tone", factor=2.0)
     assert [iv["value"] for iv in double] == pytest.approx([2 * iv["value"] for iv in ivs])
     assert [iv["strength"] for iv in double] == [2.0, -1.0]
     assert len(rec.interventions) == 3 and other.id in rec.interventions
@@ -194,25 +194,25 @@ def test_steering_a_knob(rec):
     before = set(rec.interventions)
     for factor in (float("nan"), float("inf"), 17.0, -17.0):
         with pytest.raises(ValueError):
-            rec.steer_knob("evil", factor=factor)
+            rec.steer_knob("tone", factor=factor)
     with pytest.raises(ValueError):
-        rec.steer_knob("evil", phase="nope")
+        rec.steer_knob("tone", phase="nope")
     with pytest.raises(KeyError):
         rec.steer_knob("nope")
     assert set(rec.interventions) == before  # a refused steer changes nothing
-    rec.steer_knob("evil", factor=-16.0)
+    rec.steer_knob("tone", factor=-16.0)
 
-    assert rec.unsteer_knob("evil") == 2 and rec.unsteer_knob("evil") == 0
+    assert rec.unsteer_knob("tone") == 2 and rec.unsteer_knob("tone") == 0
     assert list(rec.interventions) == [other.id]
     assert [iv["knob"] for iv in rec.neurons.summary()["steering"]] == [None]
 
 
 def test_a_steered_knob_gives_the_logits_of_the_same_steers(rec):
-    rec.knobs.save("evil", [{"neuron": "L2 N5", "dose": 1.0}, {"neuron": "L1 N3", "dose": -0.5}])
+    rec.knobs.save("tone", [{"neuron": "L2 N5", "dose": 1.0}, {"neuron": "L1 N3", "dose": -0.5}])
     text = REFERENCE_TEXTS[1]
-    rec.steer_knob("evil")
+    rec.steer_knob("tone")
     knobbed = logits_of(rec, text)
-    rec.unsteer_knob("evil")
+    rec.unsteer_knob("tone")
     with rec.tap.paused(), rec.neurons.steered([(2, 5, 1.0), (1, 3, -0.5)]):
         hooked = logits_of(rec, text)
     with rec.tap.paused():
@@ -222,25 +222,25 @@ def test_a_steered_knob_gives_the_logits_of_the_same_steers(rec):
 
 
 def test_a_run_records_the_knob_it_was_steered_with(rec):
-    rec.knobs.save("evil", [{"neuron": "L2 N5", "dose": 1.0}, {"neuron": "L1 N3", "dose": -0.5}])
-    rec.steer_knob("evil")
+    rec.knobs.save("tone", [{"neuron": "L2 N5", "dose": 1.0}, {"neuron": "L1 N3", "dose": -0.5}])
+    rec.steer_knob("tone")
     rec.generate(GenParams(messages=ASK, max_tokens=3, temperature=0, run_hint="knob-steered"))
     snapshot = rec.get_run("knob-steered").meta["interventions"][0]["active"]
-    assert [iv["knob"] for iv in snapshot] == ["evil", "evil"]
+    assert [iv["knob"] for iv in snapshot] == ["tone", "tone"]
 
 
 # ---- ablating --------------------------------------------------------------------------------
 
 
 def test_ablating_a_knob_is_an_unapplied_edit_that_reverts_exactly(rec):
-    rec.knobs.save("evil", [(2, 5, 1.0), (2, 9, -1.0), (1, 3, 0.5)])
-    units = rec.knobs.units("evil")
-    assert units == [{"layer": 1, "target": "neuron", "index": [3], "name": "evil"},
-                     {"layer": 2, "target": "neuron", "index": [5, 9], "name": "evil"}]
+    rec.knobs.save("tone", [(2, 5, 1.0), (2, 9, -1.0), (1, 3, 0.5)])
+    units = rec.knobs.units("tone")
+    assert units == [{"layer": 1, "target": "neuron", "index": [3], "name": "tone"},
+                     {"layer": 2, "target": "neuron", "index": [5, 9], "name": "tone"}]
     edit = rec.add_weight_edit(kind="units", units=units, factor=0.0, note="L2 N5, L2 N9, L1 N3")
     assert edit.id not in rec.edits.applied
     d = edit.describe()  # units with no unit number (g) are fine
-    assert d["kind"] == "units" and [u["g"] for u in d["units"]] == [None, None] and [u["name"] for u in d["units"]] == ["evil"] * 2
+    assert d["kind"] == "units" and [u["g"] for u in d["units"]] == [None, None] and [u["name"] for u in d["units"]] == ["tone"] * 2
     assert "knock out 2 units" in d["summary"]
 
     down = {i: rec.neurons.mlp(i).down.weight for i in (1, 2)}
@@ -454,7 +454,7 @@ def test_the_decode_graph_key_follows_the_watch(rec):
             return None  # decode this step eagerly
 
     fake = Graphs()
-    rec.knobs.save("evil", [(2, 5, 1.0), (1, 3, -0.5)])
+    rec.knobs.save("tone", [(2, 5, 1.0), (1, 3, -0.5)])
 
     def request(run):
         fake.keys, fake.buffers = [], []
@@ -473,10 +473,10 @@ def test_the_decode_graph_key_follows_the_watch(rec):
         watch_neuron(rec, "L2 N7")
         b, buffers = request("key-b")
         assert b[1] != a[1] and b[1] == rec.watch.key and buffers[0] is rec.watch.step
-        rec.steer_knob("evil")
+        rec.steer_knob("tone")
         c, _ = request("key-c")
         assert c[0] == tuple(iv.id for iv in rec.tap.interventions) and len(c[0]) == 2 and c[1] == b[1]
-        rec.unsteer_knob("evil")
+        rec.unsteer_knob("tone")
         for m in rec.monitors.monitors():
             rec.monitors.remove(m.id)
         assert request("key-off") == (((), None), None)  # back to no watch: the plain key again
@@ -546,12 +546,12 @@ def test_the_watch_inside_decode_graphs_matches_eager_decoding():
 def test_endpoints(rec, client):
     assert client.get("/brainscan/knobs").json() == {"knobs": [], "error": None}
     one = [{"neuron": "L2 N5", "dose": 1}, {"neuron": "L1 N3", "dose": -0.5}]
-    r = client.post("/brainscan/knobs", json={"name": "evil", "description": "bad", "neurons": one})
-    assert r.status_code == 200 and r.json()["name"] == "evil" and r.json()["active"] == []
+    r = client.post("/brainscan/knobs", json={"name": "tone", "description": "test", "neurons": one})
+    assert r.status_code == 200 and r.json()["name"] == "tone" and r.json()["active"] == []
     t = client.post("/brainscan/knobs", json={"name": "texty", "text": "L1 N3 +1, L2 N5 −0.5, L0 N7"}).json()
     assert [(n["neuron"], n["dose"]) for n in t["neurons"]] == [("L1 N3", 1.0), ("L2 N5", -0.5), ("L0 N7", 1.0)]
-    assert [k["name"] for k in client.get("/brainscan/knobs").json()["knobs"]] == ["evil", "texty"]
-    assert client.get("/brainscan/status").json()["knobs"] == ["evil", "texty"]
+    assert [k["name"] for k in client.get("/brainscan/knobs").json()["knobs"]] == ["tone", "texty"]
+    assert client.get("/brainscan/status").json()["knobs"] == ["tone", "texty"]
     for body in ({"name": "bad name", "neurons": one}, {"name": "x"}, {"name": "x", "neurons": []},
                  {"name": "x", "neurons": [{"neuron": "L2 N5", "dose": 0}]}, {"name": "x", "neurons": [{"neuron": "L99 N0"}]},
                  {"name": "x", "text": "no neurons here"}, {"name": "x", "neurons": one, "description": "d" * 301}):
@@ -560,62 +560,62 @@ def test_endpoints(rec, client):
     assert client.post("/brainscan/knobs", content=b"{nope").status_code == 400
 
     # steer: replaces, never stacks; a knob that is steering can't be deleted
-    steers = client.post("/brainscan/knobs/evil/steer", json={}).json()
-    assert len(steers) == 2 and {s["knob"] for s in steers} == {"evil"}
-    knob = {k["name"]: k for k in client.get("/brainscan/knobs").json()["knobs"]}["evil"]
+    steers = client.post("/brainscan/knobs/tone/steer", json={}).json()
+    assert len(steers) == 2 and {s["knob"] for s in steers} == {"tone"}
+    knob = {k["name"]: k for k in client.get("/brainscan/knobs").json()["knobs"]}["tone"]
     assert sorted(knob["active"]) == sorted(s["id"] for s in steers)
-    twice = client.post("/brainscan/knobs/evil/steer", json={"factor": 2, "phase": "gen"}).json()
+    twice = client.post("/brainscan/knobs/tone/steer", json={"factor": 2, "phase": "gen"}).json()
     assert len(client.get("/brainscan/interventions").json()) == 2
     assert [t["value"] for t in twice] == pytest.approx([2 * s["value"] for s in steers]) and {t["phase"] for t in twice} == {"gen"}
-    assert client.get("/brainscan/neurons").json()["steering"][0]["knob"] == "evil"
-    assert client.delete("/brainscan/knobs/evil").status_code == 409
+    assert client.get("/brainscan/neurons").json()["steering"][0]["knob"] == "tone"
+    assert client.delete("/brainscan/knobs/tone").status_code == 409
     for body in ({"factor": 99}, {"factor": "x"}, {"factor": None}, {"phase": "nope"}):
-        assert client.post("/brainscan/knobs/evil/steer", json=body).status_code == 400, body
+        assert client.post("/brainscan/knobs/tone/steer", json=body).status_code == 400, body
     assert client.post("/brainscan/knobs/nope/steer", json={}).status_code == 404
     assert client.delete("/brainscan/knobs/nope/steer").status_code == 404
-    assert client.delete("/brainscan/knobs/evil/steer").json() == {"knob": "evil", "removed": 2}
-    assert client.delete("/brainscan/knobs/evil/steer").json()["removed"] == 0
+    assert client.delete("/brainscan/knobs/tone/steer").json() == {"knob": "tone", "removed": 2}
+    assert client.delete("/brainscan/knobs/tone/steer").json()["removed"] == 0
     assert client.get("/brainscan/interventions").json() == []
 
     # ablate: an edit that is added, not applied
-    e = client.post("/brainscan/knobs/evil/ablate", json={}).json()
+    e = client.post("/brainscan/knobs/tone/ablate", json={}).json()
     assert e["kind"] == "units" and e["factor"] == 0 and e["note"] == "L2 N5, L1 N3" and [u["g"] for u in e["units"]] == [None, None]
     edits = client.get("/brainscan/workbench").json()
     assert [x["id"] for x in edits["edits"]] == [e["id"]] and edits["edits"][0]["applied"] is False and edits["applied"] == []
-    half = client.post("/brainscan/knobs/evil/ablate", json={"factor": 0.5, "note": "half"}).json()
+    half = client.post("/brainscan/knobs/tone/ablate", json={"factor": 0.5, "note": "half"}).json()
     assert half["factor"] == 0.5 and half["note"] == "half"
     for body in ({"factor": 2}, {"factor": -0.1}, {"factor": "x"}, {"factor": "nan"}):
-        assert client.post("/brainscan/knobs/evil/ablate", json=body).status_code == 400, body
+        assert client.post("/brainscan/knobs/tone/ablate", json=body).status_code == 400, body
     assert client.post("/brainscan/knobs/nope/ablate", json={}).status_code == 404
 
     # monitor: one rule per neuron, no duplicates
-    ms = client.post("/brainscan/knobs/evil/monitor", json={}).json()
+    ms = client.post("/brainscan/knobs/tone/monitor", json={}).json()
     assert [m["direction"] for m in ms] == ["L2 N5", "L1 N3"] and {m["kind"] for m in ms} == {"neuron"}
-    assert [m["label"] for m in ms] == ["evil · L2 N5", "evil · L1 N3"]
+    assert [m["label"] for m in ms] == ["tone · L2 N5", "tone · L1 N3"]
     assert {(m["threshold"], m["sign"], m["min_tokens"], m["phase"]) for m in ms} == {(4.0, "above", 2, "gen")}
-    assert [m["id"] for m in client.post("/brainscan/knobs/evil/monitor", json={}).json()] == [m["id"] for m in ms]
+    assert [m["id"] for m in client.post("/brainscan/knobs/tone/monitor", json={}).json()] == [m["id"] for m in ms]
     assert len(client.get("/brainscan/monitors").json()) == 2
     assert rec.watch.labels == ["L1 N3", "L2 N5"]
-    loose = client.post("/brainscan/knobs/evil/monitor", json={"threshold": 3, "sign": "either", "min_tokens": 1}).json()
+    loose = client.post("/brainscan/knobs/tone/monitor", json={"threshold": 3, "sign": "either", "min_tokens": 1}).json()
     assert len(loose) == 2 and len(client.get("/brainscan/monitors").json()) == 4
-    assert client.post("/brainscan/knobs/evil/monitor", json={"sign": "up"}).status_code == 400
+    assert client.post("/brainscan/knobs/tone/monitor", json={"sign": "up"}).status_code == 400
     assert len(client.get("/brainscan/monitors").json()) == 4  # none added
     assert client.post("/brainscan/knobs/nope/monitor", json={}).status_code == 404
 
     # sweep
-    sw = client.post("/brainscan/knobs/evil/sweep", json={"prompt": "Hi", "factors": [0, 1], "max_tokens": 4})
+    sw = client.post("/brainscan/knobs/tone/sweep", json={"prompt": "Hi", "factors": [0, 1], "max_tokens": 4})
     assert sw.status_code == 200 and [o["factor"] for o in sw.json()] == [0, 1] and sw.json()[1]["doses"] == [1.0, -0.5]
     for body in ({"prompt": " "}, {"prompt": "Hi", "factors": ["x"]}, {"prompt": "Hi", "max_tokens": "x"}):
-        assert client.post("/brainscan/knobs/evil/sweep", json=body).status_code == 400, body
+        assert client.post("/brainscan/knobs/tone/sweep", json=body).status_code == 400, body
     assert client.post("/brainscan/knobs/nope/sweep", json={"prompt": "Hi"}).status_code == 404
 
-    assert client.delete("/brainscan/knobs/evil").json() == {"deleted": "evil"}
-    assert client.delete("/brainscan/knobs/evil").status_code == 404
+    assert client.delete("/brainscan/knobs/tone").json() == {"deleted": "tone"}
+    assert client.delete("/brainscan/knobs/tone").status_code == 404
     assert [k["name"] for k in client.get("/brainscan/knobs").json()["knobs"]] == ["texty"]
 
 
 def test_a_busy_model_is_a_409(rec, client):
-    rec.knobs.save("evil", [(2, 5, 1.0)])
+    rec.knobs.save("tone", [(2, 5, 1.0)])
     held, release = threading.Event(), threading.Event()
 
     def hold():
@@ -626,7 +626,7 @@ def test_a_busy_model_is_a_409(rec, client):
     thread.start()
     assert held.wait(5)
     try:
-        r = client.post("/brainscan/knobs/evil/sweep", json={"prompt": "Hi", "factors": [1], "max_tokens": 2})
+        r = client.post("/brainscan/knobs/tone/sweep", json={"prompt": "Hi", "factors": [1], "max_tokens": 2})
     finally:
         release.set()
         thread.join()
@@ -637,8 +637,8 @@ def test_a_shape_clash_is_a_409(rec, client, tmp_path, monkeypatch):
     path = tmp_path / "k.json"
     path.write_text(json.dumps({"version": 1, "shape": [1, 1], "knobs": []}))
     monkeypatch.setattr(rec, "knobs", KnobBank(path, rec.neurons))
-    r = client.post("/brainscan/knobs", json={"name": "evil", "neurons": [{"neuron": "L2 N5", "dose": 1}]})
+    r = client.post("/brainscan/knobs", json={"name": "tone", "neurons": [{"neuron": "L2 N5", "dose": 1}]})
     assert r.status_code == 409 and "Two models share the name" in r.json()["detail"]
     got = client.get("/brainscan/knobs").json()
     assert got["knobs"] == [] and "Two models share the name" in got["error"]
-    assert client.delete("/brainscan/knobs/evil").status_code == 409
+    assert client.delete("/brainscan/knobs/tone").status_code == 409
