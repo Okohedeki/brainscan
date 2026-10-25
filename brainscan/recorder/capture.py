@@ -15,7 +15,7 @@ from dataclasses import dataclass, field
 import torch
 
 LN2 = math.log(2)
-MODES = ("add", "ablate", "clamp")
+MODES = ("add", "ablate", "clamp", "write")
 PHASES = ("all", "prefill", "gen")
 
 
@@ -26,6 +26,7 @@ class Intervention:
     add:    h += strength * |h| * v   (strength is a fraction of the residual norm)
     ablate: h -= (h . v) v
     clamp:  h += (value - h . v) v
+    write:  h += value * v            (a fixed write: a steered neuron, see recorder/neurons.py)
     """
     layer: int
     mode: str
@@ -46,6 +47,8 @@ class Intervention:
         v = self.vector.to(h.dtype)
         if self.mode == "add":
             return h + self.strength * h.norm(dim=-1, keepdim=True) * v
+        if self.mode == "write":
+            return h + self.value * v
         proj = (h * v).sum(-1, keepdim=True)
         if self.mode == "ablate":
             return h - proj * v

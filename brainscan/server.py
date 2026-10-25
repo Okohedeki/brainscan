@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
-from .recorder import actions, catalog, monitors, workbench
+from .recorder import actions, catalog, monitors, neurons, workbench
 from .recorder.model import Subject, display_name
 from .recorder.session import Cancelled, GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
@@ -630,6 +630,61 @@ async def delete_check(cid: str):
         return workbench.remove_check(recorder(), cid)
     except KeyError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+def _neuron_call(fn, *args):
+    """A neuron read off the event loop, its failures mapped to HTTP codes."""
+    try:
+        return fn(*args)
+    except Busy as exc:
+        raise HTTPException(409, str(exc)) from exc
+    except KeyError as exc:
+        raise HTTPException(404, str(exc).strip("'\"")) from exc
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(400, str(exc)) from exc
+
+
+@app.get("/brainscan/neurons")
+async def neurons_summary():
+    """Layer widths, the median residual norms the dose recipe uses, and the neurons being steered."""
+    return recorder().neurons.summary()
+
+
+@app.get("/brainscan/neurons/{name}")
+async def neuron_card(name: str, dose: float = 1.0):
+    """One neuron's card (recorder/neurons.py): logit lens, steer lens at ±dose, activity, wiring."""
+    rec = recorder()
+    try:
+        layer, n = neurons.parse(name)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return await asyncio.to_thread(_neuron_call, rec.neurons.card, layer, n, dose)
+
+
+@app.post("/brainscan/neurons/steer")
+async def neuron_steer(request: Request):
+    """Steer a neuron on every request from now: {neuron: "L14 N8949", dose, phase}. Remove it like any
+    intervention (DELETE /brainscan/interventions/{id})."""
+    body = await request.json()
+    rec = recorder()
+    iv = await asyncio.to_thread(_neuron_call, rec.steer_neuron, str(body.get("neuron") or ""),
+                                 float(body.get("dose", 1.0)), str(body.get("phase") or "all"))
+    return iv.describe()
+
+
+@app.post("/brainscan/neurons/sweep")
+async def neuron_sweep(request: Request):
+    """A prompt answered at several dose levels: {prompt, steers: [{neuron, dose}], factors, max_tokens}."""
+    body = await request.json()
+    rec = recorder()
+    try:
+        steers = [(*neurons.parse(s["neuron"]), float(s.get("dose", 1.0))) for s in body.get("steers") or []]
+        factors = [float(f) for f in body.get("factors") or [0, 0.5, 1, 2]][:8]
+        max_tokens = max(1, min(int(body.get("max_tokens", 60)), 256))
+    except (KeyError, TypeError, ValueError) as exc:
+        raise HTTPException(400, f"steers are [{{neuron, dose}}] and factors are numbers ({exc})") from exc
+    return await asyncio.to_thread(_neuron_call, rec.neurons.sweep, str(body.get("prompt") or ""), steers,
+                                   factors, max_tokens)
 
 
 @app.get("/brainscan/monitors")

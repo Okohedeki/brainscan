@@ -37,6 +37,7 @@ defineVerbs([
       { id: "watch", label: "Watch", view: "scanner" },
       { id: "trace", label: "Trace", view: "weights" },
       { id: "tune", label: "Tune", view: "workbench" },
+      { id: "neurons", label: "Neurons", view: "neurons" },
     ],
   },
   {
@@ -84,8 +85,8 @@ defineVerbs([
     steps: [
       findDirection("Give two sets of examples, one per line, that differ only in the trait. Brainscan finds the direction between them at every layer; save the best layer to the direction bank."),
       { id: "steer", label: "Steer", view: "scanner", focus: "#h-steer", done: () => st("steering") > 0,
-        what: "Pick the direction, a layer and a strength under Steering, then Add. Start small: 0.05 of the residual's size.",
-        tools: ["scanner:steer", "scanner:unsteer"] },
+        what: "Pick the direction, a layer and a strength under Steering, then Add. Start small: 0.05 of the residual's size. Or steer single neurons in the Neurons view.",
+        tools: ["scanner:steer", "scanner:unsteer"], also: ["neurons:go"] },
       { id: "run", label: "Run", view: "scanner", done: () => !!st("steered"),
         what: "Ask the model. Requests made with steering on are marked ▲steered in the run list.",
         tools: ["scanner:ask", "scanner:new"] },

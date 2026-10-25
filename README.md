@@ -86,6 +86,45 @@ experience.
   collapsible thinking in the transcript; `--thinking on|off` on the harness, or
   `chat_template_kwargs` per request.
 
+## Neurons: read and steer single MLP neurons
+
+A secondary view (Explore's fourth screen, Neurons; also reached from a cluster's neuron list in
+Trace and from Steer). A neuron is one input channel of a layer's MLP output projection, named
+`L14 N8949` (`brainscan/recorder/neurons.py`). Its card reads it on the calibration texts (the
+neutral texts Compare uses for drift), on the weights as they are:
+
+- **Logit lens:** the tokens its write (W_down[:, n]) pushes up and down, read straight through the
+  final norm and the unembedding.
+- **Steer lens:** what steering it at +dose and −dose does to the model's predictions: the change in
+  next-token log-probs averaged over every position, with the mean KL from the unsteered model.
+- **Where it fires:** its activation on those texts and the contexts where it fires most. This is a
+  small fixed set, not yet a search over a corpus.
+- **Feeds:** the later neurons whose mean activation moves most when it is steered, measured, in
+  units of each one's spread.
+- **Fed by:** the earlier neurons whose direct writes drive it where it fires most: each one's
+  activation × its write read through this neuron's input (gate and up, linearized at that
+  position, through the norm in front of the MLP). Attention is left out.
+
+**Steering uses the dose recipe:** dose × median(‖residual leaving layer L‖, tokens 1:) /
+‖W_down[:, n]‖ is added to the neuron's activation at every position, so dose 1 writes one typical
+residual's worth along its output weights. The median is read on the calibration texts.
+- **Sweep.** The steer set (one or more neurons, each with a dose: `L14 N8949 +1, L13 N7956 -1`)
+  answers a prompt greedily at several dose levels side by side, to verify what a neuron does.
+- **Steer the chat.** This applies the set to every new request, prompt and reply alike, as
+  `write` interventions on the layer's output. That adds the same vector, so the logits match the
+  boosted activation exactly (`tests/test_neurons.py`). Runs are marked ▲steered, and Remove
+  steering clears them.
+
+On Qwen2.5-1.5B, L20 N100's lenses push "claim" (声明, claims). A sweep of "Tell me about yourself"
+gives the normal answer at × 0 and × 0.5, breaks down at × 1, and repeats "Claim" at × 2. The
+neuron it feeds most, L21 N1490, is a claim neuron too.
+
+API:
+- `GET /brainscan/neurons/{L N}?dose=` returns the card.
+- `POST /brainscan/neurons/sweep` takes `{prompt, steers: [{neuron, dose}], factors, max_tokens}`.
+- `POST /brainscan/neurons/steer` takes `{neuron, dose, phase}`.
+- `GET /brainscan/neurons` returns layer widths, the median norms and what's steering.
+
 ## Monitor: flag a run when a probe fires
 
 A monitor is a rule on one direction of the bank: its z-score past a threshold (above, below or
@@ -455,12 +494,14 @@ brainscan/recorder/   model loading, hooks, chat rendering, events, storage, ses
                       weight edits (edits.py), workbench checks (workbench.py), models on disk (catalog.py), the weight
                       graph's units, activity probe and edges (anatomy.py), and token tracing:
                       attribution, neurons and attention at a token (tracing.py), and actions:
-                      forget a fact (actions.py), and monitors that flag runs (monitors.py)
+                      forget a fact (actions.py), monitors that flag runs (monitors.py), and
+                      single neurons: cards and the dose recipe (neurons.py)
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
 ui/                   the actions and their steps (verbs.js), the bars and Do… (actionbar.js), the
-                      forget flow (actions.js), monitors (monitors.js), Watch
+                      forget flow (actions.js), monitors (monitors.js), the Neurons view
+                      (neurons.js), Watch
                       (app.js, models.js, chat.js), Trace
                       (graph.js, weights.js, paths.js), Tune (workbench.js), the edit stack and
                       checks (edits.js) and the guide (guide.js): plain HTML, CSS and canvas

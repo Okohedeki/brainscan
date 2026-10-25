@@ -850,7 +850,8 @@ async function renderTokenSection() {
 function neuronsHtml(g, nn) {
   let ma = 1e-9, mc = 1e-9;
   for (const n of nn.neurons) { ma = Math.max(ma, Math.abs(n.act)); mc = Math.max(mc, Math.abs(n.contrib)); }
-  const rows = nn.neurons.slice(0, 24).map((n) => `<li><span class="mono">${n.n}</span>${dbar(n.act / ma)}${dbar(n.contrib / mc)}
+  const layer = A.units[g].layer;
+  const rows = nn.neurons.slice(0, 24).map((n) => `<li><button type="button" class="link mono" data-open-neuron="L${layer} N${n.n}" title="Open L${layer} N${n.n} in the Neurons view">${n.n}</button>${dbar(n.act / ma)}${dbar(n.contrib / mc)}
       <span class="v ${n.contrib >= 0 ? "pos" : "neg"}">${n.contrib >= 0 ? "+" : ""}${n.contrib.toFixed(3)}</span></li>`).join("");
   return `<div class="facts"><span title="Fewest neurons that make up 90% of the cluster's write at this token"><b>${nn.active}</b> of ${nn.neurons.length} neurons carry 90% of its write</span>
       <span>cluster effect <b>${nn.contrib >= 0 ? "+" : ""}${nn.contrib.toFixed(3)}</b></span></div>
@@ -2216,6 +2217,7 @@ function boot() {
     if (d.mode) setMode(d.mode);
     if (d.paths) openPaths(d.paths === true ? undefined : d.paths);
     if (d.palette) openPalette();
+    if (d.unit != null && A.atlas) selectUnit(Number(d.unit));  // a unit named elsewhere (a neuron's cluster)
   });
   const recolor = () => { readColors(); renderLegend(); schedule(); resetThumbs(); if (H.tile && $("#an-heat")) { drawHeat(); renderHeatInfo(); } };
   $("#theme-toggle").addEventListener("click", recolor);

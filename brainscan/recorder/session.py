@@ -37,6 +37,7 @@ from .edits import EditStack
 from .events import message_events
 from .graphs import DecodeGraphs
 from .monitors import MonitorBank
+from .neurons import Neurons, label, parse
 from .tracing import Tracer
 
 
@@ -178,6 +179,7 @@ class Recorder:
                 print(f"[brainscan] weight anatomy disabled ({type(exc).__name__}: {exc}); "
                       "the Weights tab will be unavailable", flush=True)
         self.tracer = Tracer(self) if self.anatomy is not None else None  # needs the unit map
+        self.neurons = Neurons(self)
         self.lock = threading.RLock()        # one forward pass at a time
         self.log_lock = threading.Lock()     # events and transcript can arrive mid-generation
         self.runs: dict[str, RunState] = {}
@@ -229,6 +231,20 @@ class Recorder:
             raise ValueError(f"layer must be in 0..{self.s.n_layers - 1}")
         vector = (vector / vector.norm()).to(self.s.device, torch.float32)
         iv = Intervention(int(layer), mode, direction, vector, float(strength), float(value), phase, run)
+        with self.lock:
+            self.interventions[iv.id] = iv
+            self._sync_interventions()
+        return iv
+
+    def steer_neuron(self, neuron: str, dose: float, phase: str = "all", run: str | None = None) -> Intervention:
+        """Steer one MLP neuron with the dose recipe (recorder/neurons.py) on every request from now:
+        a "write" of dose × the layer's median residual norm along its output weights."""
+        if phase not in PHASES:
+            raise ValueError(f"phase must be one of {PHASES}")
+        layer, n = parse(neuron)
+        unit, length = self.neurons.write_vector(layer, n, float(dose))
+        iv = Intervention(layer, "write", label(layer, n), unit.to(self.s.device, torch.float32),
+                          strength=float(dose), value=length, phase=phase, run=run)
         with self.lock:
             self.interventions[iv.id] = iv
             self._sync_interventions()

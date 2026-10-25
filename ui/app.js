@@ -592,7 +592,8 @@ function renderSteering() {
   banner.hidden = !on.length;
   banner.textContent = on.length ? `Steering is on (${on.length}). New requests are recorded with these edits and marked as intervened.` : "";
   $("#iv-list").innerHTML = ivs.map((iv) => {
-    const what = iv.mode === "add" ? `add ${iv.strength >= 0 ? "+" : ""}${iv.strength}×|h|` : iv.mode === "clamp" ? `clamp to ${iv.value}` : "ablate";
+    const what = iv.mode === "add" ? `add ${iv.strength >= 0 ? "+" : ""}${iv.strength}×|h|` : iv.mode === "clamp" ? `clamp to ${iv.value}`
+      : iv.mode === "write" ? `neuron, dose ${iv.strength >= 0 ? "+" : ""}${iv.strength}` : "ablate";
     return `<li class="${iv.enabled ? "" : "off"}" data-id="${iv.id}"><input type="checkbox" ${iv.enabled ? "checked" : ""} aria-label="Enable">
       <span class="desc">${esc(what)} · ${esc(iv.direction)} @ L${iv.layer} · ${esc(iv.phase)}</span><button aria-label="Remove">✕</button></li>`;
   }).join("") || `<li class="muted" style="border:none;background:none;padding:0">No interventions. Readouts are passive.</li>`;
