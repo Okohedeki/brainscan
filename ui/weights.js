@@ -5,6 +5,7 @@
 
 import { WeightGraph } from "/ui/graph.js";
 import { explainPaths, findPaths } from "/ui/paths.js";
+import { defineBar, noteBar, refreshBar } from "/ui/actionbar.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -46,7 +47,7 @@ const A = {
   cmp: false, attrOrig: null, attrDiff: null,  // "vs original": attribution with the weight edits lifted, and the change
   attrOf: null,                      // the slot of the word being explained, when it was clicked in the conversation
   trace: null, traceOn: true, frameTrace: false, followTimer: 0,  // the explained token's routes, START to END
-  editsOpen: false,
+  editsOpen: false, applied: 0,     // weight edits applied now (from ui/edits.js)
   panelSeq: 0, knockouts: [], koKey: null,
   paths: [], pathMode: "down", pathHops: 3, pathBranch: 4, pathActivity: true, pathsOpen: false,
   expanded: new Map(),               // cluster g -> Float32Array neuron activity in [-1, 1] at the cursor
@@ -354,6 +355,7 @@ function pushState() {
     signed, selection: A.sel, paths: A.paths, expanded: A.expanded,
     trace: A.trace && !A.pathsOpen ? { start: A.trace.start, end: A.trace.end } : null,
     insets: { l: A.pathsOpen || A.editsOpen ? 396 : 0, r: $("#gv-drawer").hidden ? 0 : 452 } });
+  refreshBar("weights");
 }
 const isLive = () => A.follow && performance.now() - A.lastAnat < 2500;
 
@@ -1232,6 +1234,7 @@ function knockoutHtml(k, i) {
 
 function renderKnockouts() {
   const list = $("#tp-ko-list"), kos = A.knockouts || [];
+  refreshBar("weights");
   const onClick = (ev) => {
     const b = ev.target.closest("[data-ko-perm]");
     if (b) makePermanent(kos[Number(b.dataset.koPerm)]);
@@ -1269,14 +1272,116 @@ function forgetFromToken(info) {
 async function addCheckFromToken() {
   const info = A.attrInfo, btn = $("#tp-add-check");
   if (!info?.target || !A.runId) return;
-  btn.disabled = true;
+  if (btn) btn.disabled = true;
   try {
     await post("/brainscan/checks", { run: A.runId, t: info.t, target: info.target.id });
-    btn.textContent = "Saved as a check ✓";
+    if (btn) btn.textContent = "Saved as a check ✓";
+    noteBar("weights", `Saved “${visTok(info.target.text)}” as a behavior check`);
     document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } }));
   } catch (err) {
-    btn.textContent = "Couldn't save"; btn.title = err.message; btn.disabled = false;
+    if (btn) { btn.textContent = "Couldn't save"; btn.title = err.message; btn.disabled = false; }
+    noteBar("weights", `Couldn't save the check: ${err.message}`);
   }
+}
+
+// ---------------------------------------------------------------- the action bar (ui/actionbar.js)
+/** The traced word, once its explanation has loaded. */
+const traced = () => {
+  const info = A.attrInfo;
+  return A.mode === "attr" && info && info.t === A.cursor && !info.loading && info.target ? info : null;
+};
+const needWord = () => (!A.runId ? ($("#run-select")?.value ? "a word: click one in Trace's conversation" : "a run: ask the model in the conversation")
+  : traced() ? null : A.cursor == null ? "a word: click one in the conversation" : "the word's trace to load (click a word)");
+/** The latest knockout on this token that hasn't been made permanent. */
+const lastKnockout = () => (A.koKey === `${A.runId}|${A.cursor}|${A.attrTarget ?? ""}`
+  ? (A.knockouts || []).find((k) => k.res && !k.permanent) : null);
+
+async function lesionSelection() {
+  const units = [...A.sel];
+  try {
+    await post("/brainscan/anatomy/lesion", { units, apply: true, note: `lesion of ${units.length} selected units` });
+    A.cmp = true;
+    setEditsPanel(true);
+    document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } }));
+    noteBar("weights", `Removed ${units.length} unit${units.length === 1 ? "" : "s"} from the weights: one edit, applied`);
+  } catch (err) { noteBar("weights", `Couldn't lesion: ${err.message}`); }
+}
+
+async function restoreOriginal() {
+  try {
+    await post("/brainscan/workbench/revert");
+    document.dispatchEvent(new CustomEvent("brainscan:workbench"));
+    document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } }));
+    noteBar("weights", "Original weights restored");
+  } catch (err) { noteBar("weights", `Couldn't restore: ${err.message}`); }
+}
+
+/** Open the Edits panel and press its "Re-run this chat" once it has rendered. */
+function rerunChat() {
+  setEditsPanel(true);
+  let tries = 0;
+  const press = () => {
+    const b = $("#gv-edits [data-replay]");
+    if (b && !b.disabled) { b.click(); return; }
+    if (++tries < 20) setTimeout(press, 100);
+  };
+  setTimeout(press, 100);
+}
+
+function setupBar() {
+  defineBar("weights", {
+    groups: ["Read", "Ablate", "Change", "Verify"],
+    context: () => {
+      const info = traced(), n = A.sel.size;
+      const sel = n ? ` · <b>${n}</b> unit${n === 1 ? "" : "s"} selected` : "";
+      if (info) {
+        const prev = A.tok[info.t]?.tx ?? info.token;
+        return `Acting on <b>“${esc(visTok(info.target.text))}”</b> after “${esc(visTok(prev))}” · p ${fmtP(info.target.prob)}${sel}`;
+      }
+      if (n) return `Acting on <b>${n}</b> selected unit${n === 1 ? "" : "s"}: ${[...A.sel].slice(0, 4).map(shortName).join(", ")}${n > 4 ? "…" : ""}`;
+      return !A.runId ? "No run open · ask the model in the conversation" : "Nothing selected · click a word in the conversation, or shift-drag units on the graph";
+    },
+    actions: [
+      { id: "why", group: "Read", label: "Why this word", hint: "Where its logit came from, layer by layer, and the units behind it (W)",
+        need: needWord, run: () => openTokenPanel() },
+      { id: "runner", group: "Read", label: "Runner-up", hint: "Trace a word the model also considered instead",
+        need: () => needWord() || (traced().alternatives.some((a) => a.id !== traced().target.id) ? null : "a word with runners-up"),
+        choices: () => traced().alternatives.filter((a) => a.id !== traced().target.id).slice(0, 5).map((a) => ({
+          label: `${visTok(a.text)} (p ${fmtP(a.prob)})`,
+          run: () => { A.attrTarget = String(a.id); A.attrOf = null; openTokenPanel(); loadExplain(); } })) },
+      { id: "follow", group: "Read", label: "Follow route", hint: "Walk the strongest route on the graph: START, each unit, END",
+        need: () => needWord() || (A.trace?.routes?.length ? null : "the word's routes to load"), run: () => followRoute(A.traceFocus || 0) },
+      { id: "paths", group: "Read", label: "Find paths", hint: "Routes out of or into the selection, between units, or behind the next token (P)",
+        need: () => (A.atlas ? null : "the model's unit map"), run: () => (A.pathsOpen ? runPathSearch(true) : openPaths()) },
+      { id: "jump", group: "Read", label: "Jump to a unit", hint: "Find a unit or a parameter by name (/)",
+        need: () => (A.atlas ? null : "the model's unit map"), run: openPalette },
+      { id: "ko5", group: "Ablate", label: "Knock out top 5", hint: "Remove the five units that pushed this word up and run it again",
+        need: needWord, run: () => { openTokenPanel(); runKnockout(topUnits(traced(), 5, true), "top 5 units that pushed it up"); } },
+      { id: "kosel", group: "Ablate", label: "Knock out selection", hint: "Remove the selected units and run the word again",
+        need: () => (!A.sel.size ? "units selected on the graph (shift-click or shift-drag)" : A.cursor == null ? "a word: click one in the conversation" : null),
+        run: () => { if (A.mode !== "attr") setMode("attr"); openTokenPanel(); knockOutSet([...A.sel], "selected units"); } },
+      { id: "kopaths", group: "Ablate", label: "Knock out path units", hint: "Remove the units on the paths shown in the path explorer",
+        need: () => (!(A.pathsOpen && A.paths.some((p) => p.on)) ? "paths shown in the path explorer" : A.cursor == null ? "a word: click one in the conversation" : null),
+        run: () => pathAction("ko") },
+      { id: "perm", group: "Change", label: "Make permanent", hint: "Turn the latest knockout into a weight edit, applied now",
+        need: () => (lastKnockout() ? null : "a knockout on this word to keep: run one first"), run: () => makePermanent(lastKnockout()) },
+      { id: "lesion", group: "Change", label: "Lesion selection", hint: "Remove the selected units from the weights now, as one edit",
+        need: () => (A.sel.size ? null : "units selected on the graph (shift-click or shift-drag)"), run: lesionSelection },
+      { id: "forget", group: "Change", label: "Forget this fact", hint: "Guided: find the units that carry this word, try without them, measure, keep",
+        need: needWord, run: () => forgetFromToken(traced()) },
+      { id: "restore", group: "Change", label: "Restore original", hint: "Undo every applied weight edit, exactly",
+        need: () => (A.applied ? null : "an applied weight edit"), run: restoreOriginal },
+      { id: "check", group: "Verify", label: "Add as a check", hint: "Save: after this context, this word. Checks show what every edit changes",
+        need: needWord, run: addCheckFromToken },
+      { id: "rerun", group: "Verify", label: "Re-run the chat", hint: "Ask the chat's question again on the original and the edited weights",
+        need: () => (!A.applied ? "an applied weight edit" : !A.runId ? "a chat" : null), run: rerunChat },
+      { id: "checks", group: "Verify", label: "Run checks", hint: "Every saved behavior check, before and after the applied edits",
+        run: () => { setEditsPanel(true); document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } })); } },
+      { id: "cmp", group: "Verify", label: () => (A.cmp ? "vs original: on" : "vs original"), hint: "Color units by how the applied edits changed their effect on this word",
+        need: () => (!A.applied ? "an applied weight edit" : needWord()), run: toggleCompare },
+    ],
+  });
+  document.addEventListener("brainscan:edit-state", (ev) => { A.applied = ev.detail?.applied || 0; refreshBar("weights"); });
 }
 
 // ---------------------------------------------------------------- dock trace
@@ -1994,7 +2099,6 @@ function setupInput() {
   document.addEventListener("keydown", (ev) => {
     if (!A.visible) return;
     const typing = /^(INPUT|TEXTAREA|SELECT)$/.test(document.activeElement?.tagName || "");
-    if ((ev.metaKey || ev.ctrlKey) && ev.key.toLowerCase() === "k") { ev.preventDefault(); openPalette(); return; }
     if (typing) return;
     if (ev.key === "/" && !ev.shiftKey) { ev.preventDefault(); openPalette(); }  // shift-/ is ? (the guide)
     else if (ev.key === "?" || ev.key === "/") { /* the guide handles it */ }
@@ -2069,6 +2173,7 @@ function boot() {
   });
   graph.setColors(C);
   setupInput();
+  setupBar();
   stopPlay();
   document.addEventListener("brainscan:view", (ev) => {
     A.visible = ev.detail === "weights";

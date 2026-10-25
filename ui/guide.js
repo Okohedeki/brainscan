@@ -15,15 +15,9 @@ const scrollTo = (sel) => () => $(sel)?.scrollIntoView({ behavior: "smooth", blo
 
 const STEPS = [
   {
-    view: "actions", n: "▶", title: "Act", lead: "Start from what you want to do to the model. Each action is tried and measured before anything is kept.",
-    tools: [
-      { name: "Make it forget a fact", what: "Name a fact (a lead-in and the answer the model gives) or pick a word in Trace. Brainscan finds the units that carry it after every way of asking for it, ranked two ways: the most direct, and, given facts it should keep, the most specific (units that push the answer more than any fact to keep, added only while every fact to keep survives). It shows answers with and without them, measures the fact against random units, facts to keep and neutral text, then removes the units from the weights if you keep it.", act: () => document.querySelector('#view-actions [data-act="forget"]')?.click() },
-      { name: "Your model", what: "Every change made to the model, applied or not, with apply and restore. Export the edited model from Tune.", act: go("actions", () => document.querySelector(".act-ledger")?.scrollIntoView({ behavior: "smooth", block: "start" })) },
-    ],
-  },
-  {
     view: "scanner", n: 1, title: "Watch", lead: "Run any agent on the model and see every token's internals as it works.",
     tools: [
+      { name: "Action bars and Do…", key: "⌘K", what: "Every tab shows its actions in a bar above the work, always: what you can do right now, and, greyed, what each other action needs first. Do… (⌘K or Ctrl+K) searches every action in every tab and runs it.", act: () => document.querySelector("#do-btn")?.click() },
       { name: "Ask the model", what: "Type a message under the transcript (or in the Trace tab's conversation). Its tokens stream into the transcript, the timeline and the unit graph as they are generated; the chat continues until \"New chat\".", act: go("weights", () => document.querySelector("#tv-convo textarea")?.focus()) },
       { name: "Stop", key: "Esc", what: "While the model answers, Send becomes Stop (or press Esc in the box): the reply ends at the next token, and what it generated so far is kept and recorded. The Trace dock shows a Stop whenever any request is generating, an agent harness's included.", act: go("weights", () => ($("#an-stop:not([hidden])") || $("#tv-convo textarea"))?.focus()) },
       { name: "Choose a model", what: "Click the model name in the top bar to switch to any open-weights model already on this machine: Hugging Face checkpoints and Ollama tags. Nothing is downloaded.", act: () => document.dispatchEvent(new CustomEvent("brainscan:models")) },
@@ -37,7 +31,7 @@ const STEPS = [
     view: "weights", n: 2, title: "Trace", lead: "Open the model as a graph of attention heads and MLP neuron clusters, and follow a token through it.",
     tools: [
       { name: "Why did it write that?", key: "W", what: "Click any word in the conversation: the graph colors by what each unit did to it, and a panel shows where its logit came from layer by layer, the layer where the model first had it as its top guess, the units that pushed it up or down, and the runners-up.", act: go("weights", () => trace({ mode: "attr" })) },
-      { name: "Forget this fact", what: "From a traced word, start the Make it forget a fact action with that word already filled in.", act: go("weights", () => trace({ mode: "attr" })) },
+      { name: "Forget this fact", what: "A knockout made permanent, guided. Start from a traced word, or type a fact (a lead-in and the answer) from Tune or Do…. Brainscan finds the units that carry it after every way of asking for it, ranked two ways: the most direct, and, given facts it should keep, the most specific (units that push the answer more than any fact to keep, added only while every fact to keep survives). It shows answers with and without them, measures the fact against random units, facts to keep and neutral text, then removes the units from the weights if you keep it.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Knockout tests", what: "Remove units (the top ones, your selection, or the units on shown paths) and re-run: the token's probability before → after, its new rank and the new top guesses, with the units' total effect next to their direct effect. \"Make permanent\" turns a knockout into one weight edit, applied at once.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Edits beside the trace", key: "E", what: "The Edits panel in Trace: apply or restore the edit stack, re-run the open chat on the edited weights, and run behavior checks, without leaving the graph.", act: go("weights", () => document.querySelector("#gv-edits-btn")?.click()) },
       { name: "Live unit graph", what: "Every head and neuron cluster, lit by how much it wrote at the current token. Scroll to zoom, drag to pan, replay the run on the timeline.", act: go("weights") },
@@ -61,7 +55,7 @@ const STEPS = [
 ];
 
 const KEYS = [
-  ["?", "this guide"], ["⌘K or /", "jump to a unit"], ["A", "explain next token"], ["P", "paths"],
+  ["?", "this guide"], ["⌘K", "do… any action"], ["/", "jump to a unit"], ["A", "explain next token"], ["P", "paths"],
   ["W", "why this token"], ["E", "weight edits"], ["T", "show/hide text"], ["Space", "replay"], ["← →", "step tokens"], ["F", "fit graph"], ["Esc", "clear / close"],
 ];
 

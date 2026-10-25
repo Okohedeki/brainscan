@@ -128,6 +128,7 @@ function render() {
   }
   const btn = $("#gv-edits-btn .count"), n = applied();
   if (btn) { btn.textContent = n ? String(n) : ""; btn.hidden = !n; }
+  document.dispatchEvent(new CustomEvent("brainscan:edit-state", { detail: { applied: n, edits: (E.stack?.edits || []).length } }));
 }
 
 // ---------------------------------------------------------------- actions

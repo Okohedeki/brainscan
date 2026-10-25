@@ -1,4 +1,5 @@
 // Brainscan workbench: find directions, edit weights, compare original vs edited, export variants.
+import { defineBar, refreshBar } from "/ui/actionbar.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -39,14 +40,14 @@ async function busy(btn, label, fn) {
 }
 
 // ---------------------------------------------------------------- tabs
-const VIEWS = ["actions", "scanner", "weights", "workbench"];
+const VIEWS = ["actions", "scanner", "weights", "workbench"];  // "actions" is the forget flow, which has no tab
 
 function show(view) {
   for (const v of VIEWS) {
     $(`#view-${v}`).hidden = v !== view;
     const tab = document.querySelector(`.tabs [data-view="${v}"]`);
-    tab.setAttribute("aria-selected", String(v === view));
-    tab.classList.toggle("active", v === view);
+    tab?.setAttribute("aria-selected", String(v === view));
+    tab?.classList.toggle("active", v === view);
   }
   try { localStorage.setItem("brainscan-view", view); } catch { /* storage unavailable */ }
   if (view === "workbench") refresh();
@@ -58,6 +59,7 @@ async function refresh() {
   try { W.status = await api("/brainscan/status"); } catch (err) { message("#wb-edit-msg", err.message, "error"); return; }
   if (W.status.status !== "ready") { message("#wb-edit-msg", `Recorder ${W.status.status}: ${W.status.step || W.status.error || ""}`); return; }
   renderDirections(); renderEdits();
+  refreshBar("workbench");
   if (!$("#wb-path").value) {
     const slug = (W.status.model.name || "model").split("/").pop().replace(/[^A-Za-z0-9._-]+/g, "-");
     $("#wb-path").value = `~/brainscan-exports/${slug}-edited-${new Date().toISOString().slice(0, 10)}`;
@@ -247,12 +249,56 @@ async function exportModel(ev) {
   } catch (err) { message("#wb-export-msg", err.message, "error"); }
 }
 
+// ---------------------------------------------------------------- the action bar (ui/actionbar.js)
+function setupBar() {
+  const wb = () => W.status?.workbench || { edits: [], applied: [] };
+  const pending = () => wb().edits.filter((e) => e.enabled).map((e) => e.id).join() !== wb().applied.map((e) => e.id).join();
+  const to = (sel, focus) => () => { $(sel)?.scrollIntoView({ behavior: "smooth", block: "start" }); if (focus) setTimeout(() => $(focus)?.focus(), 350); };
+  const pressWhenReady = (sel) => { let n = 0; const go = () => { const b = $(sel); if (b && !b.disabled) b.click(); else if (++n < 20) setTimeout(go, 100); }; setTimeout(go, 100); };
+  defineBar("workbench", {
+    groups: ["Find", "Change", "Verify", "Ship"],
+    context: () => {
+      const w = wb(), n = w.edits.length, a = w.applied.length;
+      if (!W.status) return "Loading the edit stack…";
+      return n ? `Your model: <b>${n} edit${n === 1 ? "" : "s"}</b> in the stack, ${a ? `<b>${a} applied</b>` : "original weights"}${a && pending() ? " · the stack changed, apply to update" : ""}`
+        : "Your model: original weights, no edits yet";
+    },
+    actions: [
+      { id: "find", group: "Find", label: "Find a direction", hint: "Two sets of examples give a direction in the residual stream, scored at every layer",
+        run: to("#h-find", "#wb-a") },
+      { id: "edit", group: "Change", label: "Edit weights", hint: "Scale or lesion an attention block, MLP block, head or neuron, or add another edit",
+        run: to("#h-edit", "#wb-kind") },
+      { id: "forget", group: "Change", label: "Forget a fact", hint: "Guided: name a fact, find the units that carry it, try, measure, keep",
+        run: () => document.dispatchEvent(new CustomEvent("brainscan:action", { detail: { action: "forget" } })) },
+      { id: "apply", group: "Change", label: "Apply stack", hint: "Apply every checked edit to the weights",
+        need: () => (!wb().edits.some((e) => e.enabled) ? "an edit in the stack" : !pending() ? "a change to the stack: it's already applied" : null),
+        run: () => $("#wb-apply").click() },
+      { id: "restore", group: "Change", label: "Restore original", hint: "Undo every applied edit, exactly",
+        need: () => (wb().applied.length ? null : "an applied edit"), run: () => $("#wb-revert").click() },
+      { id: "rerun", group: "Verify", label: "Re-run the chat", hint: "Ask the open chat's question again on the original and the edited weights",
+        need: () => (wb().applied.length ? null : "an applied edit"), run: () => { to("#h-compare")(); pressWhenReady(".wb-replay [data-replay]"); } },
+      { id: "compare", group: "Verify", label: "Compare prompts", hint: "Your own prompts on both weights, with drift on neutral text",
+        need: () => (wb().applied.length ? null : "an applied edit"), run: to("#h-compare", "#wb-prompts") },
+      { id: "checks", group: "Verify", label: "Run checks", hint: "Every saved behavior check, original → now",
+        run: () => { to("#h-checks")(); pressWhenReady(".wb-checks [data-run-checks]"); } },
+      { id: "export", group: "Ship", label: "Export", hint: "Save the edited model as a Hugging Face checkpoint, with every edit recorded",
+        need: () => (wb().applied.length ? null : "an applied edit"), run: to("#h-export", "#wb-path") },
+    ],
+  });
+}
+
 // ---------------------------------------------------------------- boot
 function boot() {
+  setupBar();
   document.querySelectorAll(".tabs [data-view]").forEach((b) => { b.onclick = () => show(b.dataset.view); });
   document.addEventListener("brainscan:show", (ev) => { if (VIEWS.includes(ev.detail)) show(ev.detail); });  // from the guide
   // The stack changed elsewhere (a knockout made permanent in Trace, the Edits panel).
   document.addEventListener("brainscan:workbench", () => { if (!$("#view-workbench").hidden) refresh(); });
+  // The edit panels report the stack from any tab; keep this tab's bar (and Do…) in step with it.
+  document.addEventListener("brainscan:edit-state", (ev) => {
+    const w = W.status?.workbench;
+    if (!w || w.applied.length !== ev.detail.applied || w.edits.length !== ev.detail.edits) refresh();
+  });
   document.addEventListener("brainscan:model", () => {  // layer sweeps, comparisons and export names belong to one model
     W.sweep = null;
     $("#wb-sweep").innerHTML = ""; $("#wb-save-row").hidden = true; $("#wb-path").value = "";
@@ -271,10 +317,8 @@ function boot() {
   $("#wb-run").onclick = runCompare;
   $("#wb-export").onclick = exportModel;
   syncForm();
-  // Actions are home: shown on a first visit, and once to everyone who saved a view before they existed.
-  const stored = (key) => { try { return localStorage.getItem(key); } catch { return null; } };
-  const saved = stored("brainscan-view"), seen = stored("brainscan-actions-seen");
-  try { localStorage.setItem("brainscan-actions-seen", "1"); } catch { /* storage unavailable */ }
-  show(VIEWS.includes(saved) && seen ? saved : "actions");
+  // The forget flow is a step inside a tab's work, never a place to land on reload.
+  const saved = (() => { try { return localStorage.getItem("brainscan-view"); } catch { return null; } })();
+  show(VIEWS.includes(saved) && saved !== "actions" ? saved : "scanner");
 }
 boot();

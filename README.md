@@ -6,12 +6,11 @@ internals are recorded and lined up with what the agent does: tool calls, tool r
 test outcomes, file edits, verdicts. You can then trace any token back through the model's
 attention heads and neurons, and change the weights and measure what changed.
 
-The UI opens on **Actions**: what you want to do to the model. Each action is tried and measured
-before anything is kept, and the traces are evidence you open when a result needs explaining.
-The first is **Make it forget a fact** (see [Actions](#actions-forget-a-fact)). The cards for
-other jobs open the tool that does them today.
-
-To look around instead, three tabs show the model at work:
+The UI follows that workflow in three tabs. Each tab has an **action bar** above its work, always
+visible: what you can do right now, grouped (Watch: run, read, steer, hand off; Trace: read,
+ablate, change, verify; Tune: find, change, verify, ship), with every other action greyed and
+saying what it needs first ("a knockout on this word to keep: run one first"). **Do… (⌘K or
+Ctrl+K)** searches every action in every tab and runs it, switching tabs if needed.
 
 1. **Watch**: the run live: transcript, a per-token timeline (logit lens, surprisal,
    projections onto directions), a token inspector, and runtime steering. Ask the model directly
@@ -72,11 +71,14 @@ experience.
   collapsible thinking in the transcript; `--thinking on|off` on the harness, or
   `chat_template_kwargs` per request.
 
-## Actions: forget a fact
+## Forget a fact: a guided knockout made permanent
 
-A fact is a lead-in and the answer the model gives after it ("The capital of Australia is" →
-"Canberra"), typed, or picked from a chat: click a word in Trace and press **Forget this fact**.
-The flow has five steps (`brainscan/recorder/actions.py`, `POST /brainscan/actions/forget/{step}`):
+Forgetting a fact is ablation: find the units that carry an answer, knock them out, keep the
+knockout as a weight edit. **Forget this fact** in Trace's action bar walks through it with
+measurements at each step. A fact is a lead-in and the answer the model gives after it ("The
+capital of Australia is" → "Canberra"): the traced word, or typed (Forget a fact in Tune's bar or
+in Do…). The flow has five steps (`brainscan/recorder/actions.py`,
+`POST /brainscan/actions/forget/{step}`); its back link returns to the tab it came from:
 
 1. **Goal**: the fact, other lead-ins and questions to test it with, and facts it should keep
    (`lead-in → answer`, one per line). Saved behavior checks are measured too.
@@ -120,8 +122,8 @@ The flow has five steps (`brainscan/recorder/actions.py`, `POST /brainscan/actio
 5. **Keep**: the units' output weights are zeroed as one edit in the stack and applied now, and
    the facts to keep (and the forgotten fact) can be saved as behavior checks. Knocking out a unit
    at run time is the same as zeroing its output weights, so what was measured is what is kept.
-   Restore the original weights, or export the edited model, from **Your model** on the Actions
-   home and from Tune.
+   Restore the original weights, or export the edited model, from the action bars (Trace and
+   Tune) or Do….
 
 Everything is measured on the weights as they are, including any edits already applied.
 
@@ -410,7 +412,8 @@ brainscan/recorder/   model loading, hooks, chat rendering, events, storage, ses
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
-ui/                   Actions (actions.js, the home), Watch (app.js, models.js, chat.js), Trace
+ui/                   action bars and Do… (actionbar.js), the forget flow (actions.js), Watch
+                      (app.js, models.js, chat.js), Trace
                       (graph.js, weights.js, paths.js), Tune (workbench.js), the edit stack and
                       checks (edits.js) and the guide (guide.js): plain HTML, CSS and canvas
                       JavaScript; no build step

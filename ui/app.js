@@ -1,4 +1,5 @@
 // Brainscan scanner: a live view of a model's internals, time-locked to what the agent does.
+import { defineBar, noteBar, refreshBar } from "/ui/actionbar.js";
 //
 // One shared x axis (tokens on the run's tape) carries every track:
 //   events   tool calls, results, errors, test outcomes, edits, verdicts
@@ -531,6 +532,8 @@ async function selectToken(t, scrollIntoView = false) {
 }
 
 function renderInspector(d) {
+  S.inspected = d;
+  refreshBar("scanner");
   $("#insp-where").textContent = `t${d.t} · position ${d.pos} · request ${d.req}`;
   const s = surprisal(d.p);
   const facts = [
@@ -665,6 +668,7 @@ async function openRun(id) {
   schedule();
 }
 function renderMeta() {
+  refreshBar("scanner");
   const m = S.meta; if (!m) { $("#run-meta").textContent = ""; return; }
   const out = m.outcome ? (m.outcome.success ? "✓ pass" : "✕ fail") : "in progress";
   $("#run-meta").textContent = `${m.requests} requests · ${m.tokens} tokens · ${out}`;
@@ -674,6 +678,7 @@ function renderMeta() {
 function setGenerating(g) {
   S.genAt = performance.now();
   S.generating = g;
+  refreshBar("scanner");
   document.dispatchEvent(new CustomEvent("brainscan:generating", { detail: g }));
 }
 
@@ -766,6 +771,7 @@ async function pollStatus() {
   if (st.directions) S.dirs = st.directions;
   if (dirsChanged) renderLegend();
   renderSteering();
+  refreshBar("scanner");
   schedule();
 }
 
@@ -784,8 +790,58 @@ function setupTheme() {
   matchMedia("(prefers-color-scheme: dark)").addEventListener("change", () => { readColors(); renderLegend(); schedule(); });
 }
 
+// ---------------------------------------------------------------- the action bar (ui/actionbar.js)
+function setupBar() {
+  const composer = () => $("#view-scanner .composer");
+  const steering = () => S.status?.interventions || [];
+  const traceable = () => (S.selected == null ? "a token: click one on the timeline or in the transcript"
+    : S.inspected?.t === S.selected && (S.inspected.p == null || S.inspected.model_mismatch) ? "a token the model predicted (with the loaded model)" : null);
+  defineBar("scanner", {
+    groups: ["Run", "Read", "Steer", "Hand off"],
+    context: () => {
+      const run = S.runs?.find((r) => r.id === S.runId);
+      const where = run ? `<b>${esc(run.label || run.id)}</b> · ${run.tokens || 0} tokens` : "No run open · ask the model below";
+      const tok = S.inspected && S.inspected.t === S.selected ? ` · token <b>“${esc(visTok(S.inspected.text))}”</b> (t${S.selected}) selected` : "";
+      const st = steering().filter((iv) => iv.enabled).length;
+      return `${where}${tok}${S.generating ? " · <b>generating</b>" : ""}${st ? ` · steering on (${st})` : ""}`;
+    },
+    actions: [
+      { id: "ask", group: "Run", label: "Ask the model", hint: "Type a message under the transcript; it continues the open chat",
+        run: () => composer()?.querySelector("textarea")?.focus() },
+      { id: "new", group: "Run", label: "New chat", hint: "The next message starts a new conversation",
+        run: () => { composer()?.querySelector(".composer-new")?.click(); composer()?.querySelector("textarea")?.focus(); } },
+      { id: "stop", group: "Run", label: "Stop", hint: "End the answer at the next token, keeping what it wrote",
+        need: () => (S.generating ? null : "a request that is generating"),
+        run: async () => {
+          try { await api("/brainscan/cancel", { method: "POST", headers: { "Content-Type": "application/json" }, body: "{}" }); noteBar("scanner", "Stopping at the next token"); }
+          catch (err) { noteBar("scanner", `Couldn't stop: ${err.message}`); }
+        } },
+      { id: "model", group: "Run", label: "Switch model", hint: "Any open-weights model already on this machine",
+        run: () => document.dispatchEvent(new CustomEvent("brainscan:models")) },
+      { id: "fit", group: "Read", label: "Fit timeline", hint: "Show the whole run on the timeline",
+        need: () => (S.view.length ? null : "a run with tokens"), run: () => $("#fit").click() },
+      { id: "live", group: "Read", label: () => (S.follow ? "Following live" : "Follow live"), hint: "Keep the newest token in view",
+        run: () => { const f = $("#follow"); f.checked = !f.checked; f.dispatchEvent(new Event("change")); refreshBar("scanner"); } },
+      { id: "steer", group: "Steer", label: "Add steering", hint: "Add, ablate or clamp a saved direction at a layer while the model writes",
+        run: () => { $("#h-steer")?.scrollIntoView({ behavior: "smooth", block: "start" }); $("#iv-direction")?.focus(); } },
+      { id: "unsteer", group: "Steer", label: "Remove steering", hint: "Turn every intervention off and remove it",
+        need: () => (steering().length ? null : "steering to remove"),
+        run: async () => {
+          for (const iv of steering()) await api(`/brainscan/interventions/${iv.id}`, { method: "DELETE" });
+          await pollStatus(); noteBar("scanner", "Steering removed");
+        } },
+      { id: "trace", group: "Hand off", label: "Trace this token →", hint: "Open it in Trace: the layers, units and knockouts behind it",
+        need: traceable,
+        run: () => {
+          document.dispatchEvent(new CustomEvent("brainscan:show", { detail: "weights" }));
+          document.dispatchEvent(new CustomEvent("brainscan:trace", { detail: { word: S.selected } }));
+        } },
+    ],
+  });
+}
+
 async function boot() {
-  setupTheme(); readColors(); setupScopeInput(); setupSteering();
+  setupTheme(); readColors(); setupScopeInput(); setupSteering(); setupBar();
   $("#run-select").onchange = (ev) => openRun(ev.target.value);
   // A message sent from a composer: open its run in every view as soon as it appears (ui/chat.js).
   document.addEventListener("brainscan:expect-run", (ev) => {

@@ -1,7 +1,7 @@
-// Actions: things to do to the model, each tried and measured before it is kept. The home lists
-// them; "Make it forget a fact" runs as a five-step flow (Goal, Target, Try, Measure, Keep) on
-// /brainscan/actions/forget/* (see brainscan/recorder/actions.py). The other cards open the tool
-// that does that job today. Trace hands a traced word over with "Forget this fact" (brainscan:action).
+// "Forget this fact": a guided knockout made permanent, as a five-step flow (Goal, Target, Try,
+// Measure, Keep) on /brainscan/actions/forget/* (see brainscan/recorder/actions.py). It opens from
+// the action bars (Trace hands over the traced word through brainscan:action; Tune and Do… open it
+// with a typed fact), and its back link returns to the tab it was opened from.
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
@@ -65,10 +65,11 @@ const parseKeep = (text) => text.split("\n").map((l) => l.trim()).filter(Boolean
 }).filter(Boolean);
 
 // ---------------------------------------------------------------- views
-function showHome() { $("#act-home").hidden = false; $("#act-flow").hidden = true; }
+let current = "scanner", from = "weights";  // the tab on screen, and the one the flow was opened from
+function close() { go(from); }
 function openForget(source = null) {
+  if (current !== "actions") from = current;
   reset(source && { ...source, lead: cleanText(source.lead) });
-  $("#act-home").hidden = true; $("#act-flow").hidden = false;
   document.dispatchEvent(new CustomEvent("brainscan:show", { detail: "actions" }));
   render();
   if (F.source && !F.questions) prefillQuestion(F.source);
@@ -380,8 +381,8 @@ function bind(body) {
   body.querySelector("#fl-rerun")?.addEventListener("click", runTry);
   body.querySelector("#fl-remeasure")?.addEventListener("click", runMeasure);
   body.querySelector("#fl-apply")?.addEventListener("click", keep);
-  body.querySelector("#fl-discard")?.addEventListener("click", () => { reset(); showHome(); });
-  body.querySelector("#fl-home")?.addEventListener("click", () => { reset(); showHome(); });
+  body.querySelector("#fl-discard")?.addEventListener("click", () => { reset(); close(); });
+  body.querySelector("#fl-home")?.addEventListener("click", () => { reset(); close(); });
   body.querySelector("#fl-ask")?.addEventListener("click", () => go("weights", () => $("#tv-convo textarea")?.focus()));
   body.querySelector("#fl-export")?.addEventListener("click", () => go("workbench", scrollTo("#h-export")));
   body.querySelector("#fl-revert")?.addEventListener("click", revert);
@@ -453,22 +454,15 @@ function revert() {
 
 // ---------------------------------------------------------------- boot
 function boot() {
-  const cards = {
-    forget: () => openForget(),
-    knockout: () => go("weights", () => document.dispatchEvent(new CustomEvent("brainscan:trace", { detail: { mode: "attr" } }))),
-    steer: () => go("scanner", scrollTo("#h-steer")),
-    checks: () => go("workbench", scrollTo("#h-checks")),
-    compare: () => go("workbench", scrollTo("#h-compare")),
-    export: () => go("workbench", scrollTo("#h-export")),
-  };
-  document.querySelectorAll("#view-actions [data-act]").forEach((b) => { b.onclick = () => cards[b.dataset.act]?.(); });
-  $("#fl-back").onclick = () => { if (!F.busy) showHome(); };
-  // A word traced in Trace: "Forget this fact".
+  document.addEventListener("brainscan:view", (ev) => { current = ev.detail; });
+  $("#fl-back").onclick = () => { if (!F.busy) close(); };
+  // From an action bar or Do…: a traced word from Trace, or nothing (type a fact).
   document.addEventListener("brainscan:action", (ev) => {
     const d = ev.detail || {};
-    if (d.action === "forget") openForget({ run: d.run, t: d.t, target: d.target, of: d.of, word: d.word, lead: d.lead, question: d.question });
+    if (d.action !== "forget") return;
+    openForget(d.run ? { run: d.run, t: d.t, target: d.target, of: d.of, word: d.word, lead: d.lead, question: d.question } : null);
   });
   // Units belong to one model: a switch starts over.
-  document.addEventListener("brainscan:model", () => { if (!$("#act-flow").hidden && !F.busy) { reset(); showHome(); } });
+  document.addEventListener("brainscan:model", () => { if (current === "actions" && !F.busy) { reset(); close(); } });
 }
 boot();
