@@ -127,20 +127,40 @@ corpus, on the original weights, keeps for every neuron:
 
 It is cached per model under `<data>/neuron_index/<model>/`. The corpus is `BRAINSCAN_CORPUS` (a
 `.txt`, `.md` or `.jsonl` file or folder; jsonl rows carry `"text"`) when it is set. Otherwise it
-is a bundled starter corpus (`starter_corpus.py`: about 70 short texts across topics and registers),
-every recorded run's messages (deduplicated) and the calibration texts.
+is, in order:
+- a bundled starter corpus (`starter_corpus.py`: about 70 short texts across topics and registers);
+- every recorded run's messages, deduplicated;
+- the calibration texts;
+- any such files in `<data>/corpus/`.
+
+A build reads up to 500,000 tokens by default and trims from the end. The local texts above come to
+about 32,000 tokens, too few for good top contexts, so add web text to `<data>/corpus/`:
+
+```bash
+wsl -e bash scripts/run.sh scripts/fetch_corpus.py --tokens 400000
+```
+
+This reads random pages of FineWeb-Edu (`sample-10BT`) through the Hugging Face dataset viewer's
+rows API: about 700 documents, 2 MB, cut to 4,000 characters each. Then rebuild the index (Neurons ›
+Rebuild index).
 
 Search takes a query and returns three lists:
 - neurons that **fire on it** where it occurs in the corpus, or on the query itself, in units of
   each one's spread;
-- neurons that **push it** (a logit-lens top token contains it);
+- neurons that **push it** (a logit-lens top token starts with it);
 - neurons that **have it in their top contexts**.
 
+The query matches whole words: "Paris" finds neither "comparison" nor "parish". Case matters only
+when the query has a capital letter.
+
 Then the method is: read a candidate's card, filter by what it pushes, and steer to verify. On
-Qwen2.5-1.5B with the default corpus (32,260 tokens, built in 12 s), "conspiracy" finds L10 N3859
-under "push it". Its steer lens raises "conject, assumption, hypotheses" instead, and a sweep turns
-answers into "assuming assuming…". It is an assumption neuron, which the weights-only lens alone
-would have hidden. A larger corpus gives far better top contexts: point `BRAINSCAN_CORPUS` at one.
+Qwen2.5-1.5B, "conspiracy" finds L10 N3859 under "push it". Its steer lens raises "conject,
+assumption, hypotheses" instead, and a sweep turns answers into "assuming assuming…". It is an
+assumption neuron, which the weights-only lens alone would have hidden.
+
+With the FineWeb sample the 1.5B's index covers 423,496 tokens and builds in 39 s. "president" goes
+from no occurrences to 42. Its top contexts go from none to real ones, like "Mexican President
+Enrique Pena Nieto" (L24 N4291). "Paris" occurs 8 times, and L4 N3300 fires on it at z 102.
 
 API:
 - `GET /brainscan/neurons/index` returns the index's status; `POST /brainscan/neurons/index`
@@ -470,7 +490,7 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 | `BRAINSCAN_ANATOMY` | `1` | Record per-token unit activity for the Trace tab; `0` turns it off |
 | `BRAINSCAN_ANATOMY_CLUSTERS` | `64` | MLP neuron clusters per layer in the Trace tab |
 | `BRAINSCAN_GRAPH_DECODE` | `1` | Replay decode steps from CUDA graphs (same outputs, about 3x faster); `0` decodes eagerly |
-| `BRAINSCAN_CORPUS` | none | Text for the neuron index: a `.txt`, `.md` or `.jsonl` file, or a folder of them. Unset: the bundled starter corpus, recorded runs' messages and the calibration texts |
+| `BRAINSCAN_CORPUS` | none | Text for the neuron index: a `.txt`, `.md` or `.jsonl` file, or a folder of them. Unset: the bundled starter corpus, recorded runs' messages, the calibration texts and any text in `<data>/corpus/` (`scripts/fetch_corpus.py` puts a FineWeb-Edu sample there) |
 | `BRAINSCAN_GPU_FRACTION` | `0` (no cap) | The share of GPU memory the recorder may hold, e.g. `0.25` to leave three quarters to other apps. Going over raises an out-of-memory error instead of spilling into system RAM. `/brainscan/status` reports the process's own use (`gpu.process`, `gpu.process_peak`) |
 
 ## Known limits
@@ -535,6 +555,7 @@ ui/                   the actions and their steps (verbs.js), the bars and Do…
                       checks (edits.js) and the guide (guide.js): plain HTML, CSS and canvas
                       JavaScript; no build step
 scripts/demo/         product-video recorder (headless Chrome + ffmpeg) and its scenes
+scripts/fetch_corpus.py  a FineWeb-Edu sample for the neuron index
 reports/              research reports
 tests/                unit tests (pytest)
 ```

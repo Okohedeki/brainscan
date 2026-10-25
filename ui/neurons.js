@@ -123,7 +123,7 @@ function renderIndex() {
   el.innerHTML = x.status === "building" ? `Building the neuron index: ${esc(x.step || "")} ${Math.round((x.progress || 0) * 100)}%. The model is busy until it's done.`
     : x.status === "error" ? `<span class="warn-text">The index build failed: ${esc(x.error)}</span> ${esc(built)}`
     : m ? `${esc(built)} <button type="button" class="link" data-build>Rebuild</button>`
-    : `No neuron index for this model yet. <button type="button" class="link" data-build>Build it</button>: one read of the corpus (the starter texts, your recorded runs, or BRAINSCAN_CORPUS) keeps every neuron's top contexts and lens.`;
+    : `No neuron index for this model yet. <button type="button" class="link" data-build>Build it</button>: one read of the corpus (the starter texts, your recorded runs and any text in the data folder's corpus/, or BRAINSCAN_CORPUS) keeps every neuron's top contexts and lens.`;
 }
 
 async function buildIndex() {

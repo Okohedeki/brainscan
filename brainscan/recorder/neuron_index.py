@@ -3,8 +3,9 @@ pushes, cached per model, so neurons can be found by text.
 
 Corpus: BRAINSCAN_CORPUS (a .txt, .md or .jsonl file, or a folder of them; jsonl rows carry a
 "text" field) when it is set, else the starter corpus bundled with Brainscan (starter_corpus.py:
-short texts across many topics and registers), every recorded run's messages (deduplicated) and the
-calibration texts. The texts are joined into one token stream and read in windows of WINDOW tokens,
+short texts across many topics and registers), every recorded run's messages (deduplicated), the
+calibration texts, and then any such files in <data>/corpus/ (scripts/fetch_corpus.py puts a sample
+of web text there). The texts are joined into one token stream and read in windows of WINDOW tokens,
 each after the sink token, on the original weights (applied edits are lifted for the build).
 
 Kept per neuron: its TOP_K highest activations with their stream positions, its mean and spread
@@ -14,8 +15,10 @@ the final norm and the unembedding). Saved under <data>/neuron_index/<model>/.
 Search (search) for a text query returns three lists:
   fires on it    neurons that fire most on the query's words where they occur in the corpus (or on
                  the query itself when it doesn't occur), in units of each neuron's spread
-  pushes it      neurons whose logit lens has a token containing the query among its top tokens
+  pushes it      neurons whose logit lens has a token starting with the query among its top tokens
   top contexts   neurons whose own top activations fall on an occurrence of the query
+The query matches whole words ("Paris" finds neither "comparison" nor "parish"), and case matters
+only when it has a capital letter.
 """
 
 from __future__ import annotations
@@ -42,35 +45,60 @@ WINDOW = 128          # tokens per window, the sink token included
 TOP_K = 16            # top activations kept per neuron
 LENS_UP, LENS_DOWN = 8, 4
 BATCH = 8             # windows per forward pass
-DEFAULT_TOKENS = 400_000
+DEFAULT_TOKENS = 500_000
 MAX_SPANS = 48        # occurrences of a query read again for "fires on it"
 LIMIT = 20
 SEP = "\n\n"
 VERSION = 1
 
 
+def _spaced(c: str) -> bool:
+    """A letter or digit of a script that puts spaces between words (not Chinese, Japanese, Korean or Thai)."""
+    return c.isalnum() and not ("\u0e00" <= c <= "\u0e7f" or "\u2e80" <= c <= "\ufaff" or "\uac00" <= c <= "\ud7af")
+
+
+def pattern(q: str, whole: bool = True) -> re.Pattern:
+    """The query as a regex: starting a word (and, when whole, ending one) wherever its ends are
+    letters or digits of a spaced script, and case-blind unless the query has a capital letter."""
+    body = re.escape(q)
+    if _spaced(q[0]):
+        body = r"(?<!\w)" + body
+    if whole and _spaced(q[-1]):
+        body += r"(?!\w)"
+    return re.compile(body, 0 if any(c.isupper() for c in q) else re.IGNORECASE)
+
+
+def text_files(root: Path) -> list[Path]:
+    """The .txt, .md and .jsonl files at a path: the file itself, or every one under a folder."""
+    return sorted(p for p in (root.rglob("*") if root.is_dir() else [root])
+                  if p.is_file() and p.suffix.lower() in (".txt", ".md", ".jsonl"))
+
+
+def read_texts(files: list[Path]) -> list[tuple[str, str]]:
+    """(file name, text) pairs: a jsonl row's "text", or a .txt or .md file's paragraphs."""
+    texts = []
+    for f in files:
+        if f.suffix.lower() == ".jsonl":
+            for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
+                try:
+                    row = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(row, dict) and isinstance(row.get("text"), str) and row["text"].strip():
+                    texts.append((f.name, row["text"]))
+        else:
+            texts += [(f.name, t) for t in re.split(r"\n\s*\n", f.read_text(encoding="utf-8", errors="replace")) if t.strip()]
+    return texts
+
+
 def corpus_texts(recorder) -> tuple[list[tuple[str, str]], list[str]]:
     """(source, text) pairs, and a line per source saying where they came from."""
     path = os.environ.get("BRAINSCAN_CORPUS", "").strip()
     if path:
-        root = Path(path).expanduser()
-        files = sorted(p for p in (root.rglob("*") if root.is_dir() else [root])
-                       if p.is_file() and p.suffix.lower() in (".txt", ".md", ".jsonl"))
+        files = text_files(Path(path).expanduser())
         if not files:
             raise ValueError(f"BRAINSCAN_CORPUS has no .txt, .md or .jsonl files: {path}")
-        texts = []
-        for f in files:
-            if f.suffix.lower() == ".jsonl":
-                for line in f.read_text(encoding="utf-8", errors="replace").splitlines():
-                    try:
-                        row = json.loads(line)
-                    except ValueError:
-                        continue
-                    if isinstance(row, dict) and isinstance(row.get("text"), str) and row["text"].strip():
-                        texts.append((f.name, row["text"]))
-            else:
-                texts += [(f.name, t) for t in re.split(r"\n\s*\n", f.read_text(encoding="utf-8", errors="replace")) if t.strip()]
-        return texts, [f"BRAINSCAN_CORPUS: {len(files)} file{'' if len(files) == 1 else 's'} under {path}"]
+        return read_texts(files), [f"BRAINSCAN_CORPUS: {len(files)} file{'' if len(files) == 1 else 's'} under {path}"]
     texts = [(f"starter:{topic}", text) for topic, text in STARTER]
     seen, runs = set(), []
     for meta in recorder.store.list_runs():
@@ -80,8 +108,15 @@ def corpus_texts(recorder) -> tuple[list[tuple[str, str]], list[str]]:
                 seen.add(c)
                 runs.append((f"run:{meta['id']}", c[:6000]))
     texts += runs + [("calibration", t) for t in REFERENCE_TEXTS]
-    return texts, [f"the starter corpus ({len(STARTER)} texts)", f"recorded runs' messages ({len(runs)} unique)",
-                   f"the calibration texts ({len(REFERENCE_TEXTS)})"]
+    sources = [f"the starter corpus ({len(STARTER)} texts)", f"recorded runs' messages ({len(runs)} unique)",
+               f"the calibration texts ({len(REFERENCE_TEXTS)})"]
+    folder = recorder.store.root / "corpus"
+    files = text_files(folder) if folder.is_dir() else []
+    if files:  # last, so a token cap trims the downloaded text before the texts above
+        more = read_texts(files)
+        texts += more
+        sources.append(f"{', '.join(f.name for f in files)} in {folder.name}/ ({len(more):,} texts)")
+    return texts, sources
 
 
 class NeuronIndex:
@@ -309,7 +344,7 @@ class NeuronIndex:
         """Token spans (first, last) where the query occurs in the stream."""
         self._ensure_text()
         out = []
-        for m in re.finditer(re.escape(q), self._text, re.IGNORECASE):
+        for m in pattern(q).finditer(self._text):
             a = bisect.bisect_right(self._starts, m.start()) - 1
             b = bisect.bisect_right(self._starts, m.end() - 1) - 1
             out.append((a, b))
@@ -366,11 +401,11 @@ class NeuronIndex:
         return [{"neuron": f"L{i} N{n}", "layer": i, "index": n, "z": round(z, 2), "context": ctx} for z, i, n in rows[:limit]]
 
     def _pushes(self, q: str, limit: int) -> list[dict]:
-        """Neurons whose logit lens has a token containing the query among its top tokens."""
+        """Neurons whose logit lens has a token starting with the query among its top tokens."""
         if self._vocab is None:
             self._vocab = [self._tok(i) for i in range(self.s.vocab_size)]
-        ql = q.lower()
-        hits = [i for i, t in enumerate(self._vocab) if ql in t.lower().strip() and t.strip()]
+        p = pattern(q, whole=False)
+        hits = [i for i, t in enumerate(self._vocab) if t.strip() and p.match(t.strip())]
         if not hits:
             return []
         S = torch.tensor(hits[:5000])

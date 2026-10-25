@@ -67,6 +67,17 @@ def test_the_build_matches_a_brute_force_read(rec):
     assert idx.data[f"lens_up.{layer}"][n].tolist() == logits.topk(ni.LENS_UP).indices.tolist()
 
 
+def test_queries_match_whole_words_with_smart_case():
+    paris = ni.pattern("Paris")
+    assert paris.search("in Paris, France") and paris.search("(Paris)")
+    assert not any(paris.search(t) for t in ("comparison", "parish", "PARIS", "Parisian"))
+    lower = ni.pattern("paris")
+    assert lower.search("PARIS") and lower.search("Paris") and not lower.search("parish")
+    assert ni.pattern("Paris", whole=False).match("Parisian") and not ni.pattern("Paris", whole=False).match("comparison")
+    assert ni.pattern("->").search("a->b") and ni.pattern("def ").search("    def f")
+    assert ni.pattern("北京").search("我在北京工作")  # no spaces between words: matched anywhere
+
+
 def test_search(rec):
     idx = rec.neuron_index
     r = idx.search("Canberra")
@@ -110,6 +121,24 @@ def test_a_corpus_of_your_own(rec, tmp_path, monkeypatch):
     monkeypatch.setenv("BRAINSCAN_CORPUS", str(empty))
     with pytest.raises(ValueError):
         ni.corpus_texts(rec)
+
+
+def test_text_in_the_data_folder_comes_after_the_default_mix(rec, monkeypatch):
+    monkeypatch.delenv("BRAINSCAN_CORPUS", raising=False)
+    base, sources = ni.corpus_texts(rec)
+    folder = rec.store.root / "corpus"
+    folder.mkdir()
+    try:
+        (folder / "web.jsonl").write_text('{"text": "Photosynthesis turns light into sugar."}\n'
+                                          '{"text": "Rivers carve canyons over millennia."}\n')
+        texts, more = ni.corpus_texts(rec)
+        assert texts[:len(base)] == base and [t for _, t in texts[len(base):]] == [
+            "Photosynthesis turns light into sugar.", "Rivers carve canyons over millennia."]
+        assert more[:len(sources)] == sources and "web.jsonl in corpus/ (2 texts)" in more[-1]
+    finally:
+        for f in folder.iterdir():
+            f.unlink()
+        folder.rmdir()
 
 
 def test_endpoints(rec):
