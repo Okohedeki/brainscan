@@ -259,6 +259,9 @@ def test_trace_endpoints(traced):
         assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": [0, 1]}).json()["after"]["logit"] is not None
         assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": "0"}).status_code == 400
         assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": []}).status_code == 400
+        assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": [0], "factor": 0.5}).json()["factor"] == 0.5
+        assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": [0], "factor": "x"}).status_code == 400
+        assert client.post(f"/brainscan/runs/{run.id}/tokens/{t}/knockout", json={"units": [0], "factor": 40}).status_code == 400
         assert client.get(f"/brainscan/runs/nope/tokens/{t}/explain").status_code == 404
         assert client.get(f"/brainscan/runs/{run.id}/tokens/99999/explain").status_code == 404
     finally:

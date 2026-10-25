@@ -1,10 +1,12 @@
-// The guide: every tool in Brainscan on one page, in workflow order (watch a run, trace it, tune the
-// weights), each with a "Show me" that takes you there. Opens from the ? button or the ? key, and on
-// the first visit.
+// The guide: the actions first (what you can do to the model, each with its steps and a Start), then
+// every tool on the three screens they run on (watch a run, trace it, tune the weights), each with a
+// "Show me" that takes you there. Opens from the ? button or the ? key, and on the first visit.
+import { actionList } from "/ui/actionbar.js";
 
 const $ = (sel) => document.querySelector(sel);
 const esc = (s) => String(s ?? "").replace(/[&<>"']/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;" }[c]));
 const SEEN = "brainscan-guide-seen";
+const SCREEN = { scanner: "Watch", weights: "Trace", workbench: "Tune" };
 
 const go = (view, then) => () => {
   document.dispatchEvent(new CustomEvent("brainscan:show", { detail: view }));
@@ -17,7 +19,7 @@ const STEPS = [
   {
     view: "scanner", n: 1, title: "Watch", lead: "Run any agent on the model and see every token's internals as it works.",
     tools: [
-      { name: "Action bars and Do…", key: "⌘K", what: "Every tab shows its actions in a bar above the work, always: what you can do right now, and, greyed, what each other action needs first. Do… (⌘K or Ctrl+K) searches every action in every tab and runs it.", act: () => document.querySelector("#do-btn")?.click() },
+      { name: "The bar and Do…", key: "⌘K", what: "Each screen has a bar above the work. With an action picked it shows the action's steps, the step you're on, its tools and the next step; in Explore it shows every tool on the screen. Greyed tools say what they need first. Do… (⌘K or Ctrl+K) searches every action and tool and runs it.", act: () => document.querySelector("#do-btn")?.click() },
       { name: "Ask the model", what: "Type a message under the transcript (or in the Trace tab's conversation). Its tokens stream into the transcript, the timeline and the unit graph as they are generated; the chat continues until \"New chat\".", act: go("weights", () => document.querySelector("#tv-convo textarea")?.focus()) },
       { name: "Stop", key: "Esc", what: "While the model answers, Send becomes Stop (or press Esc in the box): the reply ends at the next token, and what it generated so far is kept and recorded. The Trace dock shows a Stop whenever any request is generating, an agent harness's included.", act: go("weights", () => ($("#an-stop:not([hidden])") || $("#tv-convo textarea"))?.focus()) },
       { name: "Choose a model", what: "Click the model name in the top bar to switch to any open-weights model already on this machine: Hugging Face checkpoints and Ollama tags. Nothing is downloaded.", act: () => document.dispatchEvent(new CustomEvent("brainscan:models")) },
@@ -32,7 +34,7 @@ const STEPS = [
     tools: [
       { name: "Why did it write that?", key: "W", what: "Click any word in the conversation: the graph colors by what each unit did to it, and a panel shows where its logit came from layer by layer, the layer where the model first had it as its top guess, the units that pushed it up or down, and the runners-up.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Forget this fact", what: "A knockout made permanent, guided. Start from a traced word, or type a fact (a lead-in and the answer) from Tune or Do…. Brainscan finds the units that carry it after every way of asking for it, ranked two ways: the most direct, and, given facts it should keep, the most specific (units that push the answer more than any fact to keep, added only while every fact to keep survives). It shows answers with and without them, measures the fact against random units, facts to keep and neutral text, then removes the units from the weights if you keep it.", act: go("weights", () => trace({ mode: "attr" })) },
-      { name: "Knockout tests", what: "Remove units (the top ones, your selection, or the units on shown paths) and re-run: the token's probability before → after, its new rank and the new top guesses, with the units' total effect next to their direct effect. \"Make permanent\" turns a knockout into one weight edit, applied at once.", act: go("weights", () => trace({ mode: "attr" })) },
+      { name: "Knockout and scale tests", what: "Remove units (the top ones, your selection, or the units on shown paths), or scale the selection (×0.5 dampens, ×2 boosts), and re-run: the token's probability before → after, its new rank and the new top guesses, with the units' total effect next to their direct effect. \"Make permanent\" turns a test into one weight edit, applied at once.", act: go("weights", () => trace({ mode: "attr" })) },
       { name: "Edits beside the trace", key: "E", what: "The Edits panel in Trace: apply or restore the edit stack, re-run the open chat on the edited weights, and run behavior checks, without leaving the graph.", act: go("weights", () => document.querySelector("#gv-edits-btn")?.click()) },
       { name: "Live unit graph", what: "Every head and neuron cluster, lit by how much it wrote at the current token. Scroll to zoom, drag to pan, replay the run on the timeline.", act: go("weights") },
       { name: "Explain the next token", key: "A", what: "Color each unit by how much it pushed the next token up or down. Click a runner-up token to explain it instead.", act: go("weights", () => trace({ mode: "attr" })) },
@@ -61,7 +63,20 @@ const KEYS = [
 
 function render() {
   const endpoint = `${location.origin}/v1`;
+  const { list, planned } = actionList();
+  const acts = list.filter((v) => !v.explore);
   $("#guide-body").innerHTML = `
+    <h3 class="guide-sec">Actions: what you can do to the model</h3>
+    <div class="guide-acts">${acts.map((v) => `
+      <section class="guide-act">
+        <header><span class="eyebrow">${esc(v.group || "")}</span><h3>${esc(v.label)}</h3></header>
+        <p>${esc(v.lead)}</p>
+        <p class="ga-steps">${v.steps.map((s, i) => `<b>${i + 1} ${esc(s.label)}</b> <span>${SCREEN[s.view]}</span>`).join(" › ")}</p>
+        <button type="button" class="link" data-pick="${esc(v.id)}">Start ${esc(v.label.toLowerCase())} →</button>
+      </section>`).join("")}
+    </div>
+    ${planned.length ? `<p class="guide-planned"><b>Planned:</b> ${planned.map((p) => `<span title="${esc(p.what)}">${esc(p.label)}</span>`).join(" · ")}</p>` : ""}
+    <h3 class="guide-sec">The screens the steps run on</h3>
     <div class="guide-steps">${STEPS.map((s, si) => `
       <section class="guide-step">
         <header><span class="step-n">${s.n}</span><div><h3>${s.title}</h3><p>${esc(s.lead)}</p></div></header>
@@ -74,6 +89,9 @@ function render() {
       </section>`).join("")}
     </div>
     <div class="guide-keys">${KEYS.map(([k, v]) => `<span><kbd>${esc(k)}</kbd> ${esc(v)}</span>`).join("")}</div>`;
+  $("#guide-body").querySelectorAll("[data-pick]").forEach((b) => {
+    b.onclick = () => { close(); document.dispatchEvent(new CustomEvent("brainscan:pick", { detail: b.dataset.pick })); };
+  });
   $("#guide-body").querySelectorAll("[data-step]").forEach((b) => {
     b.onclick = () => { close(); STEPS[Number(b.dataset.step)].tools[Number(b.dataset.tool)].act(); };
   });

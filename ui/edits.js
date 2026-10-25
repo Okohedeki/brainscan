@@ -21,6 +21,7 @@ const E = { stack: null, checks: [], results: null, replay: null, busy: null, ms
 const currentRun = () => $("#run-select")?.value || null;
 const chatSettings = () => { try { return JSON.parse(localStorage.getItem("brainscan-chat") || "{}"); } catch { return {}; } };
 const applied = () => (E.stack?.applied || []).length;
+const appliedIds = () => (E.stack?.applied || []).map((e) => e.id).join();
 
 async function refresh() {
   try {
@@ -128,14 +129,17 @@ function render() {
   }
   const btn = $("#gv-edits-btn .count"), n = applied();
   if (btn) { btn.textContent = n ? String(n) : ""; btn.hidden = !n; }
-  document.dispatchEvent(new CustomEvent("brainscan:edit-state", { detail: { applied: n, edits: (E.stack?.edits || []).length } }));
+  // checked: the checks were run on the weights as they are now
+  document.dispatchEvent(new CustomEvent("brainscan:edit-state", { detail: { applied: n, edits: (E.stack?.edits || []).length,
+    checks: E.checks.length, checked: !!E.results && E.resultsFor === appliedIds() } }));
 }
 
 // ---------------------------------------------------------------- actions
 async function runChecks() {
   if (!E.checks.length) return;
   E.busy = "Running checks"; render();
-  try { E.results = await send("POST", "/brainscan/checks/run"); } catch (err) { E.msg = { text: err.message, tone: "error" }; }
+  const on = appliedIds();
+  try { E.results = await send("POST", "/brainscan/checks/run"); E.resultsFor = on; } catch (err) { E.msg = { text: err.message, tone: "error" }; }
   E.busy = null; render();
 }
 

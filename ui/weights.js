@@ -1162,16 +1162,18 @@ function traceJson(info, lens) {
     knockouts: (A.knockouts || []).filter((k) => k.res).map((k) => ({ label: k.label, units: k.units.map(shortName), ...k.res })) };
 }
 
-async function runKnockout(units, label) {
+/** Test removing units (factor 0) or scaling their writes (0.5 dampens, 2 boosts) on this token. */
+async function runKnockout(units, label, factor = 0) {
   const t = A.cursor;
   if (t == null || !A.runId || !units.length) return;
   const key = `${A.runId}|${t}|${A.attrTarget ?? ""}`;
   if (A.koKey !== key) { A.koKey = key; A.knockouts = []; }
-  const item = { label, units: [...units], pending: true };
+  const item = { label, units: [...units], factor, pending: true };
   A.knockouts.unshift(item);
   renderKnockouts();
+  $("#tp-ko-list")?.scrollIntoView({ block: "nearest", behavior: "smooth" });  // the result shows here
   try {
-    item.res = await post(`${tokenUrl(t)}/knockout`, { units, target: A.attrTarget });
+    item.res = await post(`${tokenUrl(t)}/knockout`, { units, target: A.attrTarget, factor });
   } catch (err) {
     item.error = err.status === 409 ? "The model is generating; try again when it pauses." : err.message;
   }
@@ -1183,13 +1185,17 @@ const MAX_KO = 64;  // the most units one knockout removes (MAX_KNOCKOUT in reco
 
 /** Knock out a set of units. Past the limit, the ones with the largest direct effect on the token
  * are kept, and the label says how many of the set were removed. */
-function knockOutSet(units, what) {
+function knockOutSet(units, what, factor = 0) {
   if (!units.length) return;
-  if (units.length <= MAX_KO) { runKnockout(units, `${units.length} ${what}`); return; }
+  const how = factor ? ` ×${factor}` : "";
+  if (units.length <= MAX_KO) { runKnockout(units, `${units.length} ${what}${how}`, factor); return; }
   const c = A.attrInfo?.t === A.cursor ? A.attrInfo.contrib : null;
   const kept = c ? [...units].sort((a, b) => Math.abs(c[b]) - Math.abs(c[a])).slice(0, MAX_KO) : units.slice(0, MAX_KO);
-  runKnockout(kept, `${MAX_KO} of ${units.length} ${what}${c ? ", the largest direct effects" : ""}`);
+  runKnockout(kept, `${MAX_KO} of ${units.length} ${what}${how}${c ? ", the largest direct effects" : ""}`, factor);
 }
+
+/** Scale tests offered for a selection: [factor, what it does]. */
+const SCALES = [[0.5, "dampen"], [0.25, "dampen more"], [1.5, "boost"], [2, "boost more"]];
 
 /** Remove a knockout's units from the weights for real: one grouped edit, applied now. */
 async function makePermanent(k) {
@@ -1197,7 +1203,8 @@ async function makePermanent(k) {
   k.permanent = "pending"; k.permError = null;
   renderKnockouts();
   try {
-    await post("/brainscan/anatomy/lesion", { units: k.units, apply: true, note: `knockout for ${visTok(k.res.target.text)}` });
+    await post("/brainscan/anatomy/lesion", { units: k.units, factor: k.factor || 0, apply: true,
+      note: `${k.factor ? `scale test ×${k.factor}` : "knockout"} for ${visTok(k.res.target.text)}` });
     k.permanent = "done";
     A.cmp = true;  // the trace now shows what the edit changed on this token
     document.dispatchEvent(new CustomEvent("brainscan:checks", { detail: { run: true } }));
@@ -1214,7 +1221,9 @@ function knockoutHtml(k, i) {
   if (k.error) return `<li class="err"><b>${esc(k.label)}</b><span class="warn-text">${esc(k.error)}</span></li>`;
   const r = k.res, d = r.direct_effect, tot = r.total_effect, sgn = (x) => `${x >= 0 ? "+" : "−"}${Math.abs(x).toFixed(2)}`;
   let why;
-  if (Math.abs(d) < 0.05 && Math.abs(tot) < 0.05) why = "Removing them barely changes this token.";
+  if (k.factor) why = Math.abs(tot) < 0.05 ? `Scaling them ×${k.factor} barely changes this token.`
+    : `Scaling them ×${k.factor} moves its logit ${sgn(-tot)}${Math.abs(d) >= 0.05 ? `; their own writes alone would move it ${sgn(-d)}` : ""}.`;
+  else if (Math.abs(d) < 0.05 && Math.abs(tot) < 0.05) why = "Removing them barely changes this token.";
   else if (d > 0 && tot >= 0 && tot < d) why = `The rest of the network made up ${(d - tot).toFixed(2)} of their ${d.toFixed(2)} direct effect (${Math.round((1 - tot / d) * 100)}%).`;
   else if (d > 0 && tot > d) why = `Removing them costs more than their direct writes: they also help this token through later layers (+${(tot - d).toFixed(2)}).`;
   else if (d > 0 && tot < 0) why = "Without them the token gets more likely: their indirect effect outweighs their direct push.";
@@ -1228,7 +1237,7 @@ function knockoutHtml(k, i) {
     <p class="hint">${why} Most likely now: ${after}.</p>
     <div class="ko-actions">${k.permanent === "done"
       ? `<span class="pill ok">made permanent: applied in the weights</span>`
-      : `<button type="button" class="btn sm" data-ko-perm="${i}" ${k.permanent ? "disabled" : ""} title="Remove these units from the weights for real: one edit in the stack, applied now. Restore any time from Edits.">${k.permanent ? "Applying…" : "Make permanent"}</button>`}
+      : `<button type="button" class="btn sm" data-ko-perm="${i}" ${k.permanent ? "disabled" : ""} title="${k.factor ? `Scale these units ×${k.factor} in the weights for real` : "Remove these units from the weights for real"}: one edit in the stack, applied now. Restore any time from Edits.">${k.permanent ? "Applying…" : "Make permanent"}</button>`}
       ${k.permError ? `<span class="warn-text small">${esc(k.permError)}</span>` : ""}</div></li>`;
 }
 
@@ -1329,8 +1338,12 @@ function rerunChat() {
 }
 
 function setupBar() {
+  const koKey = () => `${A.runId}|${A.cursor}|${A.attrTarget ?? ""}`;
   defineBar("weights", {
-    groups: ["Read", "Ablate", "Change", "Verify"],
+    groups: ["Read", "Test", "Change", "Verify"],
+    // What the action steps read (ui/verbs.js): the traced word, the selection, a test on this word.
+    state: () => ({ word: traced() ? visTok(traced().target.text) : null, selection: A.sel.size,
+      tested: A.koKey === koKey() && (A.knockouts || []).some((k) => k.res) }),
     context: () => {
       const info = traced(), n = A.sel.size;
       const sel = n ? ` · <b>${n}</b> unit${n === 1 ? "" : "s"} selected` : "";
@@ -1355,16 +1368,20 @@ function setupBar() {
         need: () => (A.atlas ? null : "the model's unit map"), run: () => (A.pathsOpen ? runPathSearch(true) : openPaths()) },
       { id: "jump", group: "Read", label: "Jump to a unit", hint: "Find a unit or a parameter by name (/)",
         need: () => (A.atlas ? null : "the model's unit map"), run: openPalette },
-      { id: "ko5", group: "Ablate", label: "Knock out top 5", hint: "Remove the five units that pushed this word up and run it again",
+      { id: "ko5", group: "Test", label: "Knock out top 5", hint: "Remove the five units that pushed this word up and run it again",
         need: needWord, run: () => { openTokenPanel(); runKnockout(topUnits(traced(), 5, true), "top 5 units that pushed it up"); } },
-      { id: "kosel", group: "Ablate", label: "Knock out selection", hint: "Remove the selected units and run the word again",
+      { id: "kosel", group: "Test", label: "Knock out selection", hint: "Remove the selected units and run the word again",
         need: () => (!A.sel.size ? "units selected on the graph (shift-click or shift-drag)" : A.cursor == null ? "a word: click one in the conversation" : null),
         run: () => { if (A.mode !== "attr") setMode("attr"); openTokenPanel(); knockOutSet([...A.sel], "selected units"); } },
-      { id: "kopaths", group: "Ablate", label: "Knock out path units", hint: "Remove the units on the paths shown in the path explorer",
+      { id: "kopaths", group: "Test", label: "Knock out path units", hint: "Remove the units on the paths shown in the path explorer",
         need: () => (!(A.pathsOpen && A.paths.some((p) => p.on)) ? "paths shown in the path explorer" : A.cursor == null ? "a word: click one in the conversation" : null),
         run: () => pathAction("ko") },
-      { id: "perm", group: "Change", label: "Make permanent", hint: "Turn the latest knockout into a weight edit, applied now",
-        need: () => (lastKnockout() ? null : "a knockout on this word to keep: run one first"), run: () => makePermanent(lastKnockout()) },
+      { id: "scale", group: "Test", label: "Scale selection", hint: "Scale the selected units' writes and read the word again: ×0.5 dampens, ×2 boosts",
+        need: () => (!A.sel.size ? "units selected on the graph (shift-click or shift-drag)" : A.cursor == null ? "a word: click one in the conversation" : null),
+        choices: () => SCALES.map(([f, what]) => ({ label: `×${f}: ${what}`,
+          run: () => { if (A.mode !== "attr") setMode("attr"); openTokenPanel(); knockOutSet([...A.sel], "selected units", f); } })) },
+      { id: "perm", group: "Change", label: "Make permanent", hint: "Turn the latest test (a knockout or a scale) into a weight edit, applied now",
+        need: () => (lastKnockout() ? null : "a test on this word to keep: knock out or scale units first"), run: () => makePermanent(lastKnockout()) },
       { id: "lesion", group: "Change", label: "Lesion selection", hint: "Remove the selected units from the weights now, as one edit",
         need: () => (A.sel.size ? null : "units selected on the graph (shift-click or shift-drag)"), run: lesionSelection },
       { id: "forget", group: "Change", label: "Forget this fact", hint: "Guided: find the units that carry this word, try without them, measure, keep",

@@ -40,15 +40,11 @@ async function busy(btn, label, fn) {
 }
 
 // ---------------------------------------------------------------- tabs
-const VIEWS = ["actions", "scanner", "weights", "workbench"];  // "actions" is the forget flow, which has no tab
+// The screens. Actions move between them (ui/actionbar.js); "actions" is the forget-a-fact flow.
+const VIEWS = ["actions", "scanner", "weights", "workbench"];
 
 function show(view) {
-  for (const v of VIEWS) {
-    $(`#view-${v}`).hidden = v !== view;
-    const tab = document.querySelector(`.tabs [data-view="${v}"]`);
-    tab?.setAttribute("aria-selected", String(v === view));
-    tab?.classList.toggle("active", v === view);
-  }
+  for (const v of VIEWS) $(`#view-${v}`).hidden = v !== view;
   try { localStorage.setItem("brainscan-view", view); } catch { /* storage unavailable */ }
   if (view === "workbench") refresh();
   document.dispatchEvent(new CustomEvent("brainscan:view", { detail: view }));
@@ -290,7 +286,6 @@ function setupBar() {
 // ---------------------------------------------------------------- boot
 function boot() {
   setupBar();
-  document.querySelectorAll(".tabs [data-view]").forEach((b) => { b.onclick = () => show(b.dataset.view); });
   document.addEventListener("brainscan:show", (ev) => { if (VIEWS.includes(ev.detail)) show(ev.detail); });  // from the guide
   // The stack changed elsewhere (a knockout made permanent in Trace, the Edits panel).
   document.addEventListener("brainscan:workbench", () => { if (!$("#view-workbench").hidden) refresh(); });

@@ -77,6 +77,30 @@ def test_a_knockout_made_permanent_matches_the_knockout(tuned, clean):
     assert rec.tracer.explain(run.id, t)["logit"] == pytest.approx(ex["logit"], abs=1e-6)
 
 
+def test_a_scale_test_matches_the_same_scale_made_permanent(tuned, clean):
+    """A knockout with a factor scales the units' writes at run time; the same factor kept as a
+    weight edit reads the same logits. Factor 1 changes nothing."""
+    rec, run = tuned
+    t = last_prompt_slot(run)
+    ex = rec.tracer.explain(run.id, t)
+    units = top_units(rec, ex, "head", 2) + top_units(rec, ex, "cluster", 1)
+    same = rec.tracer.knockout(run.id, t, units, factor=1.0)
+    assert same["after"]["logit"] == pytest.approx(same["before"]["logit"], abs=1e-4)
+    assert same["direct_effect"] == pytest.approx(0.0, abs=1e-6)
+    half = rec.tracer.knockout(run.id, t, units, factor=0.5)
+    assert half["factor"] == 0.5
+    assert half["direct_effect"] == pytest.approx(0.5 * sum(ex["contrib"][g] for g in units), abs=1e-3)
+    edit = rec.add_weight_edit(**rec.anatomy.lesion_units(units, 0.5, note="from a scale test"))
+    assert edit.summary().startswith("scale ×0.5 3 units")
+    rec.apply_weight_edits()
+    scaled = rec.tracer.explain(run.id, t)
+    assert scaled["logit"] == pytest.approx(half["after"]["logit"], abs=1e-4)
+    rec.revert_weight_edits()
+    for bad in (float("nan"), 9.0):
+        with pytest.raises(ValueError):
+            rec.tracer.knockout(run.id, t, units, factor=bad)
+
+
 def test_replay_asks_the_chat_again_on_both_weights(tuned, clean):
     rec, run = tuned
     with pytest.raises(ValueError):

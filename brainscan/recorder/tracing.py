@@ -17,6 +17,8 @@ and captures, at t's position:
                zeroed at every position, and the target's logit compared with the intact model. Unlike
                attribution this counts everything routed through later layers (and the final norm), so
                the gap between the two shows how much the rest of the network makes up for the units.
+               With a factor the writes are scaled instead of zeroed (0.5 dampens, 2 boosts): the
+               same test for a scale edit before it is kept.
 
 Tracing uses the current weights with runtime steering paused, and says when the run was recorded
 under different weight edits or with steering on. With weights="original" it lifts the applied
@@ -28,6 +30,7 @@ shows what an edit changed in the circuit behind a token.
 from __future__ import annotations
 
 import contextlib
+import math
 import time
 from collections import OrderedDict
 from dataclasses import dataclass, field
@@ -41,6 +44,7 @@ CACHE_SIZE = 6
 TOP_UNITS = 24
 WEIGHTS = ("current", "original")
 MAX_KNOCKOUT = 64  # units removed in one knockout
+MAX_FACTOR = 4.0   # a knockout's scale factor stays within ±MAX_FACTOR
 
 
 class Busy(Exception):
@@ -397,10 +401,10 @@ class Tracer:
 
     # ---- causal: knockout --------------------------------------------------------------
 
-    def _knockout_hooks(self, units: list[int]) -> list:
-        """Pre-hooks that zero the given units' writes: a head's slice of its output projection's
-        input, a cluster's neurons at the MLP's down projection. Same effect as zeroing their output
-        weights (a lesion), without touching the weights."""
+    def _knockout_hooks(self, units: list[int], factor: float = 0.0) -> list:
+        """Pre-hooks that zero (or scale by factor) the given units' writes: a head's slice of its
+        output projection's input, a cluster's neurons at the MLP's down projection. Same effect as
+        scaling their output weights (a lesion at 0), without touching the weights."""
         heads: dict[int, list[int]] = {}
         neurons: dict[int, list[torch.Tensor]] = {}
         maps = {}
@@ -415,7 +419,10 @@ class Tracer:
         def zero(cols):
             def fn(module, args):
                 x = args[0].clone()
-                x[..., cols] = 0
+                if factor == 0:
+                    x[..., cols] = 0
+                else:
+                    x[..., cols] *= factor
                 return (x, *args[1:])
             return fn
 
@@ -440,21 +447,29 @@ class Tracer:
             self.an.locate(g)  # KeyError for a unit that doesn't exist
         return units
 
+    @staticmethod
+    def check_factor(factor) -> float:
+        """A knockout's scale factor: 0 removes the units, 0.5 dampens them, 2 boosts them."""
+        factor = float(factor)
+        if not math.isfinite(factor) or abs(factor) > MAX_FACTOR:
+            raise ValueError(f"factor must be a number between -{MAX_FACTOR:g} and {MAX_FACTOR:g}")
+        return factor
+
     @contextlib.contextmanager
-    def knocked_out(self, units: list[int] | None):
-        """Run the model with these units' writes zeroed everywhere (nothing when units is empty).
-        The caller holds the model (_model()), so no request runs with the units missing."""
-        handles = self._knockout_hooks(units) if units else []
+    def knocked_out(self, units: list[int] | None, factor: float = 0.0):
+        """Run the model with these units' writes zeroed (or scaled by factor) everywhere, nothing when
+        units is empty. The caller holds the model (_model()), so no request runs with the units missing."""
+        handles = self._knockout_hooks(units, factor) if units else []
         try:
             yield
         finally:
             for h in handles:
                 h.remove()
 
-    def last_logits(self, ids: list[int], units: list[int] | None = None) -> torch.Tensor:
-        """fp32 logits at the last position of ids, optionally with units knocked out. The caller
-        holds the model."""
-        with self.knocked_out(units):
+    def last_logits(self, ids: list[int], units: list[int] | None = None, factor: float = 0.0) -> torch.Tensor:
+        """fp32 logits at the last position of ids, optionally with units knocked out (or scaled by
+        factor). The caller holds the model."""
+        with self.knocked_out(units, factor):
             kv, chunk = None, self.s.prefill_chunk
             for cs in range(0, len(ids), chunk):
                 out = self.s.model(input_ids=torch.tensor([ids[cs:cs + chunk]], device=self.s.device),
@@ -464,21 +479,22 @@ class Tracer:
             del out, kv
         return logits
 
-    def knockout(self, run_id: str, t: int, units, target=None, weights: str = "current") -> dict:
+    def knockout(self, run_id: str, t: int, units, target=None, weights: str = "current", factor=0.0) -> dict:
         run = self._run(run_id)
         units = self.check_units(units)
+        factor = self.check_factor(factor)
         with self._weights(weights):
-            return self._knockout(run, t, units, target) | {"model_weights": weights}
+            return self._knockout(run, t, units, target, factor) | {"model_weights": weights}
 
     @torch.no_grad()
-    def _knockout(self, run, t: int, units: list[int], target) -> dict:
+    def _knockout(self, run, t: int, units: list[int], target, factor: float = 0.0) -> dict:
         ids, pos, req = self.context(run, t)
         ex = self._explain(run, t, target)  # the intact model: capture (cached) and direct effects
         tid = ex["target"]["id"]
         base = self.capture(run, t).logits
         t0 = time.perf_counter()
         with self._model():
-            after = self.last_logits(ids, units)
+            after = self.last_logits(ids, units, factor)
 
         def summary(logits):
             probs = torch.softmax(logits, -1)
@@ -487,7 +503,7 @@ class Tracer:
 
         top_p, top_i = torch.softmax(after, -1).topk(5)
         before, now = summary(base), summary(after)
-        direct = sum(ex["contrib"][g] for g in units)
+        direct = (1 - factor) * sum(ex["contrib"][g] for g in units)  # what the change takes off their direct writes
         # Logits move together when the final norm rescales, so effects are read on the target's
         # margin over the best other token as well as on its raw logit.
         def margin(logits):
@@ -495,7 +511,7 @@ class Tracer:
             other[tid] = -float("inf")
             return float(logits[tid] - other.max())
         return {
-            "run": run.id, "t": t, "token": ex["token"], "target": ex["target"],
+            "run": run.id, "t": t, "token": ex["token"], "target": ex["target"], "factor": factor,
             "units": [{"g": g, "layer": self.an.locate(g)[0].index, "kind": self.an.locate(g)[1],
                        "i": self.an.locate(g)[2], "direct": ex["contrib"][g]} for g in units],
             "before": before, "after": now,

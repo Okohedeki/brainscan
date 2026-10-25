@@ -783,7 +783,11 @@ async def token_knockout(run_id: str, t: int, body: dict):
     units = body.get("units")
     if not isinstance(units, list):
         raise HTTPException(400, "units must be a list of unit ids")
-    return await _trace("knockout", run_id, t, units, body.get("target"), body.get("weights") or "current")
+    try:
+        factor = float(body.get("factor", 0.0))  # 0 removes them; 0.5 dampens, 2 boosts (a scale test)
+    except (TypeError, ValueError):
+        raise HTTPException(400, "factor must be a number") from None
+    return await _trace("knockout", run_id, t, units, body.get("target"), body.get("weights") or "current", factor)
 
 
 @app.get("/brainscan/runs/{run_id}/tokens/{t}/attention")

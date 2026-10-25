@@ -760,7 +760,7 @@ async function pollStatus() {
     const q = prov.quantization ? `<span class="warn" title="${esc(prov.note || "")}">${esc(prov.quantization)} → ${esc(st.model.dtype)} · exploratory</span>` : `<span>${esc(st.model.dtype)}</span>`;
     const edited = st.workbench?.applied?.length;
     const ed = edited ? ` · <span class="warn" title="${esc(st.workbench.applied.map((e) => e.summary).join("\n"))}">weights edited (${edited})</span>` : "";
-    $("#model-badge").innerHTML = `${esc(st.model.name)} · ${st.model.n_layers} layers · ${q}${ed}`;
+    $("#model-badge").innerHTML = `${esc(st.model.name)}<span class="mb-more"> · ${st.model.n_layers} layers · ${q}</span>${ed}`;
   } else {
     $("#model-badge").textContent = st.status === "error" ? "Recorder error" : `Loading: ${st.step || ""}`;
   }
@@ -796,8 +796,12 @@ function setupBar() {
   const steering = () => S.status?.interventions || [];
   const traceable = () => (S.selected == null ? "a token: click one on the timeline or in the transcript"
     : S.inspected?.t === S.selected && (S.inspected.p == null || S.inspected.model_mismatch) ? "a token the model predicted (with the loaded model)" : null);
+  const openRun = () => S.runs?.find((r) => r.id === S.runId);
   defineBar("scanner", {
     groups: ["Run", "Read", "Steer", "Hand off"],
+    // What the action steps read (ui/verbs.js).
+    state: () => ({ run: !!(S.runId && S.view.length), steered: !!(openRun()?.interventions || []).length,
+      steering: steering().filter((iv) => iv.enabled).length, directions: S.dirs.length }),
     context: () => {
       const run = S.runs?.find((r) => r.id === S.runId);
       const where = run ? `<b>${esc(run.label || run.id)}</b> · ${run.tokens || 0} tokens` : "No run open · ask the model below";

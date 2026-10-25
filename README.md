@@ -6,11 +6,24 @@ internals are recorded and lined up with what the agent does: tool calls, tool r
 test outcomes, file edits, verdicts. You can then trace any token back through the model's
 attention heads and neurons, and change the weights and measure what changed.
 
-The UI follows that workflow in three tabs. Each tab has an **action bar** above its work, always
-visible: what you can do right now, grouped (Watch: run, read, steer, hand off; Trace: read,
-ablate, change, verify; Tune: find, change, verify, ship), with every other action greyed and
-saying what it needs first ("a knockout on this word to keep: run one first"). **Do… (⌘K or
-Ctrl+K)** searches every action in every tab and runs it, switching tabs if needed.
+The UI is organized around **actions**: what you can do to the model. Pick one in the top bar:
+
+| Action | What it does | Steps (screen) |
+|---|---|---|
+| **Ablate** | Remove the units a word depends on, test it, keep it as a weight edit | Record (Watch) › Locate › Test › Apply › Measure (Trace) › Export (Tune) |
+| **Scale** | Dampen or boost chosen heads and neuron clusters | Record (Watch) › Locate › Test › Apply › Measure (Trace) › Export (Tune) |
+| **Steer** | Push a direction into the model while it writes; the weights don't change | Direction (Tune) › Steer › Run › Compare (Watch) |
+| **Probe** | Read a state on every token, beside a random direction as the control | Direction (Tune) › Record › Read (Watch) |
+| **Compare** | What the weight edits did, outside and inside | Change › Re-run › Prompts (Tune) › Inside (Trace) |
+| **Check** | Behavior tests for every change, original → now | Save (Trace) › Run (Tune) |
+
+Each step happens on one of three screens, and the bar at the top of that screen shows the
+action's steps (done ones ticked), what to do in this step, the tools it needs, and **Next**.
+Tools that need something first stay greyed and say what ("a test on this word to keep: knock
+out or scale units first"). **Explore** is no action: each screen's bar lists all its tools.
+**Do… (⌘K or Ctrl+K)** searches every action and tool and runs it, switching screens if needed.
+Planned actions (Cap, Rewrite a fact, Monitor, Inject and ask, Faithfulness, Audit) are listed
+under **More**. The screens:
 
 1. **Watch**: the run live: transcript, a per-token timeline (logit lens, surprisal,
    projections onto directions), a token inspector, and runtime steering. Ask the model directly
@@ -24,7 +37,8 @@ Ctrl+K)** searches every action in every tab and runs it, switching tabs if need
 3. **Tune**: find directions from examples, edit the weights (remove a direction, lesion a head
    or neuron), compare original and edited side by side, and export the variant.
 
-Press `?` anywhere in the UI for a guide to every tool, with a "Show me" link to each.
+Press `?` anywhere in the UI for a guide: every action with its steps and a Start link, then
+every tool on the three screens, with a "Show me" link to each.
 
 Readouts are functional measurements (logit-lens probabilities, projections onto contrast
 vectors built from example texts). Each is labelled by how it was built. Nothing here measures
@@ -74,8 +88,8 @@ experience.
 ## Forget a fact: a guided knockout made permanent
 
 Forgetting a fact is ablation: find the units that carry an answer, knock them out, keep the
-knockout as a weight edit. **Forget this fact** in Trace's action bar walks through it with
-measurements at each step. A fact is a lead-in and the answer the model gives after it ("The
+knockout as a weight edit. **Forget this fact**, offered in Ablate's Locate step (and in Trace's
+bar in Explore), walks through it with measurements at each step. A fact is a lead-in and the answer the model gives after it ("The
 capital of Australia is" → "Canberra"): the traced word, or typed (Forget a fact in Tune's bar or
 in Do…). The flow has five steps (`brainscan/recorder/actions.py`,
 `POST /brainscan/actions/forget/{step}`); its back link returns to the tab it came from:
@@ -231,7 +245,9 @@ few hundred tokens on Qwen3.5-9B; results are cached) and reads every unit exact
   units that pushed " Canberra" up for "What is the capital of Australia?" turns the answer to
   " Sydney" (p 0.999 → 0.26; Sydney 0.71); their direct effect was +12.4 logits and the rest of
   the network made up 40% of it. A knockout is the same as lesioning those units' output weights,
-  without touching the weights.
+  without touching the weights. **Scale selection** runs the same test with the units' writes
+  scaled instead (×0.5 or ×0.25 dampens, ×1.5 or ×2 boosts; `"factor"` in the knockout request,
+  within ±4), and *Make permanent* keeps it as a scale edit that reads the same logits.
 
 - **Attribution** (`A`). Colors each unit by its direct effect on the next token's logit: its
   write at this token, read through the final norm (with its scale held at the recorded value)
@@ -412,7 +428,8 @@ brainscan/recorder/   model loading, hooks, chat rendering, events, storage, ses
 brainscan/server.py   FastAPI app: /v1 endpoint, /brainscan API, live WebSocket, UI
 brainscan/harness/    mini coding agent and tasks
 brainscan/hardware.py Phase 0 hardware report
-ui/                   action bars and Do… (actionbar.js), the forget flow (actions.js), Watch
+ui/                   the actions and their steps (verbs.js), the bars and Do… (actionbar.js), the
+                      forget flow (actions.js), Watch
                       (app.js, models.js, chat.js), Trace
                       (graph.js, weights.js, paths.js), Tune (workbench.js), the edit stack and
                       checks (edits.js) and the guide (guide.js): plain HTML, CSS and canvas

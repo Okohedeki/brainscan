@@ -21,11 +21,7 @@
       <span class="wordmark">Brainscan</span>
       <span class="live-dot" id="live-dot" title="Live feed"></span>
     </div>
-    <nav class="tabs" role="tablist" aria-label="View">
-      <button role="tab" data-view="scanner" aria-selected="true" class="active" title="Watch a run: transcript, per-token timeline, logit lens, steering"><span class="tab-n">1</span>Watch</button>
-      <button role="tab" data-view="weights" aria-selected="false" title="Trace a token through the model's heads and neuron clusters"><span class="tab-n">2</span>Trace</button>
-      <button role="tab" data-view="workbench" aria-selected="false" title="Tune the weights: find directions, edit, compare, export"><span class="tab-n">3</span>Tune</button>
-    </nav>
+    <nav class="verbs" id="verbs" aria-label="Action: what to do to the model"></nav>
     <button type="button" class="model-badge" id="model-badge" aria-haspopup="dialog" aria-expanded="false"
       aria-controls="model-picker" title="Switch to another model on this machine">Starting…</button>
     <label class="run-pick">
@@ -37,7 +33,7 @@
       <span class="stat" id="stat-vram" title="GPU memory in use">VRAM –</span>
       <span class="stat" id="stat-disk" title="Recording storage used / budget">Disk –</span>
     </div>
-    <button type="button" class="do-btn" id="do-btn" title="Search every action in every tab and run it (⌘K or Ctrl+K)">Do… <kbd>⌘K</kbd></button>
+    <button type="button" class="do-btn" id="do-btn" title="Search every action and every tool and run it (⌘K or Ctrl+K)">Do… <kbd>⌘K</kbd></button>
     <button class="icon-btn help" id="help-btn" aria-label="Guide: everything Brainscan can do" title="Guide (?)">?</button>
     <button class="icon-btn" id="theme-toggle" aria-label="Switch light or dark theme" title="Theme">
       <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M8 1.5a6.5 6.5 0 1 0 0 13 6.5 6.5 0 0 0 0-13zm0 1.5v10a5 5 0 0 1 0-10z" fill="currentColor"/></svg>
@@ -397,7 +393,7 @@
     <div class="palette-box glass" role="dialog" aria-label="Do: search every action">
       <div class="palette-input">
         <svg viewBox="0 0 16 16" width="15" height="15" aria-hidden="true"><path d="M9.2 1.5 3 9h4.3l-.9 5.5L12.8 7H8.4z" fill="currentColor"/></svg>
-        <input id="do-q" placeholder="Do… knock out, make permanent, add a check, export" autocomplete="off" spellcheck="false" aria-label="Search actions">
+        <input id="do-q" placeholder="Do… ablate, steer, knock out, add a check, export" autocomplete="off" spellcheck="false" aria-label="Search actions and tools">
       </div>
       <ul id="do-list" role="listbox"></ul>
       <div class="palette-foot"><span id="do-note" class="do-note" role="status"></span><span><kbd>↑</kbd><kbd>↓</kbd> move</span><span><kbd>↵</kbd> run</span><span><kbd>esc</kbd> close</span></div>
@@ -409,10 +405,11 @@
       <header class="guide-head">
         <div>
           <span class="eyebrow">Guide</span>
-          <h2 id="guide-title">Trace and tune open-weights models</h2>
-          <p class="hint">Record a model's internals while it works, follow any token through its heads and neurons,
-            then change the weights and measure what changed. Every tab has an action bar showing what you can do right
-            now, and <b>Do… (⌘K)</b> searches every action in every tab.</p>
+          <h2 id="guide-title">Adjust open-weights models, and see what changed</h2>
+          <p class="hint">Pick an action in the top bar: what you want to do to the model. Each one runs as steps on
+            three screens: <b>Watch</b> records the model at work, <b>Trace</b> finds the units behind a word and tests
+            changes, <b>Tune</b> changes the weights, measures and exports. The bar at the top of each screen shows the
+            step you're on, its tools and the next step. <b>Do… (⌘K)</b> searches every action and tool.</p>
         </div>
         <button type="button" class="tbtn icon" id="guide-close" aria-label="Close guide">✕</button>
       </header>
@@ -434,5 +431,6 @@
   <script type="module" src="/ui/app.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
   <script type="module" src="/ui/weights.js"></script>
+  <script type="module" src="/ui/verbs.js"></script>
 </body>
 </html>
