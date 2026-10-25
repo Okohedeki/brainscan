@@ -45,6 +45,9 @@ class DirectionBank:
         for meta_file in sorted(self.root.glob("*.json")):
             meta = json.loads(meta_file.read_text())
             unit = load_file(str(meta_file.with_suffix(".safetensors")))["unit"].to(subject.device)
+            if unit.shape[-1] != subject.d_model:  # filed under this name by a model of another width
+                raise RuntimeError(f"Two models share the name {subject.slug!r}: {self.root} holds directions of a "
+                                   f"different model ({meta.get('model')}). Set BRAINSCAN_MODEL_NAME to tell them apart.")
             self.dirs[meta["name"]] = Direction(meta["name"], meta["layer"], unit, meta["mean"], meta["std"], meta)
 
     @torch.no_grad()

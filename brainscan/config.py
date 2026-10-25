@@ -41,6 +41,9 @@ class Settings:
     # clusters, and the Weights tab. ANATOMY_CLUSTERS sets the clusters per MLP layer.
     anatomy: bool = field(default_factory=lambda: _env("ANATOMY", "1") == "1")
     anatomy_clusters: int = field(default_factory=lambda: int(_env("ANATOMY_CLUSTERS", "64")))
+    # The share of GPU memory the recorder may use (0.25 = a quarter), so it shares the GPU with other
+    # apps: going over raises an out-of-memory error instead of spilling into system RAM. 0: no cap.
+    gpu_fraction: float = field(default_factory=lambda: float(_env("GPU_FRACTION", "0")))
 
     def template_kwargs(self) -> dict:
         return {"on": {"enable_thinking": True}, "off": {"enable_thinking": False}}.get(self.thinking, {})

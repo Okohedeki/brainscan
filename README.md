@@ -386,8 +386,8 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `BRAINSCAN_MODEL` | `ollama:llama3.1:8b` | `ollama:<tag>` (dequantized from the local Ollama GGUF), a Hugging Face repo id, or a local checkpoint folder |
-| `BRAINSCAN_MODEL_NAME` | from the path | Display name for `BRAINSCAN_MODEL`, e.g. `Qwen/Qwen3.5-9B` (an `Org--Name` folder is already shown as `Org/Name`) |
+| `BRAINSCAN_MODEL` | `ollama:llama3.1:8b` | `ollama:<tag>` (dequantized from the local Ollama GGUF), a path to a `.gguf` file (dequantized once into the model cache; the file is only read), a Hugging Face repo id, or a local checkpoint folder |
+| `BRAINSCAN_MODEL_NAME` | from the path | Display name for `BRAINSCAN_MODEL`, e.g. `Qwen/Qwen3.5-9B` (an `Org--Name` folder is already shown as `Org/Name`). Models are filed by name (unit maps, directions, checks, monitors), so two models must not share one; Brainscan refuses to load a model whose name holds another model's unit map or directions |
 | `BRAINSCAN_MODEL_DIRS` | none | Extra folders the model picker searches for checkpoints, separated by `:` (e.g. `/mnt/h/models`) |
 | `BRAINSCAN_DEVICE` | `cuda` | `cpu` for testing without a GPU |
 | `BRAINSCAN_THINKING` | `default` | Reasoning models: `on`, `off`, or the chat template's default |
@@ -400,6 +400,7 @@ Machine-specific defaults go in `brainscan.env` (git-ignored; copy `brainscan.en
 | `BRAINSCAN_ANATOMY` | `1` | Record per-token unit activity for the Trace tab; `0` turns it off |
 | `BRAINSCAN_ANATOMY_CLUSTERS` | `64` | MLP neuron clusters per layer in the Trace tab |
 | `BRAINSCAN_GRAPH_DECODE` | `1` | Replay decode steps from CUDA graphs (same outputs, about 3x faster); `0` decodes eagerly |
+| `BRAINSCAN_GPU_FRACTION` | `0` (no cap) | The share of GPU memory the recorder may hold, e.g. `0.25` to leave three quarters to other apps. Going over raises an out-of-memory error instead of spilling into system RAM. `/brainscan/status` reports the process's own use (`gpu.process`, `gpu.process_peak`) |
 
 ## Known limits
 

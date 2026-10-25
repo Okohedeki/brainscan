@@ -86,6 +86,8 @@ def _load(spec: str | None = None) -> bool:
     spec = spec or settings.model
     state.update(status="loading", error=None, target=spec)
     try:
+        if settings.gpu_fraction and settings.device.startswith("cuda") and torch.cuda.is_available():
+            torch.cuda.set_per_process_memory_fraction(min(max(settings.gpu_fraction, 0.05), 1.0))
         _step(f"loading {display_name(spec)}")
         subject = Subject(spec, device=settings.device)
         _step(f"mapping {subject.name}'s units and edges (cached after the first load)")
@@ -324,7 +326,10 @@ async def get_status():
                         "disk_budget_gb": settings.disk_budget_gb, "max_context": settings.max_context}}
     if torch.cuda.is_available():
         free, total = torch.cuda.mem_get_info()
-        out["gpu"] = {"name": torch.cuda.get_device_name(0), "used": total - free, "total": total}
+        out["gpu"] = {"name": torch.cuda.get_device_name(0), "used": total - free, "total": total,
+                      # this process alone: what PyTorch holds, and the share it may hold (BRAINSCAN_GPU_FRACTION)
+                      "process": torch.cuda.memory_reserved(), "process_peak": torch.cuda.max_memory_reserved(),
+                      "fraction": settings.gpu_fraction or None}
     if state["recorder"]:
         out.update(state["recorder"].status())
     return out

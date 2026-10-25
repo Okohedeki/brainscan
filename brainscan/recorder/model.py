@@ -61,6 +61,8 @@ def display_name(spec: str) -> str:
     """'org/Name' for Hugging Face ids and cache snapshots, the tag for Ollama models."""
     if spec.startswith("ollama:"):
         return spec.split(":", 1)[1]
+    if spec.lower().endswith(".gguf"):
+        return Path(spec).stem
     cached = re.search(r"models--([^/\\]+)--([^/\\]+)", spec)
     if cached:
         return f"{cached.group(1)}/{cached.group(2)}"
@@ -72,26 +74,42 @@ def display_name(spec: str) -> str:
 
 
 def prepare(spec: str, dtype=torch.bfloat16) -> tuple[str, dict]:
-    """Make sure the model exists as a Hugging Face checkpoint; return (path, provenance)."""
+    """Make sure the model exists as a Hugging Face checkpoint; return (path, provenance). An Ollama
+    tag ("ollama:llama3.1:8b") or a GGUF file path is dequantized once into Brainscan's model cache;
+    the GGUF itself is only read."""
+    if spec.lower().endswith(".gguf"):
+        blob = Path(spec).expanduser()
+        if not blob.is_file():
+            raise FileNotFoundError(f"no GGUF file at {spec}")
+        quant = re.search(r"(?i)\b(q\d_[a-z0-9_]+|q\d_\d|f16|bf16|f32)\b", blob.stem)
+        return _dequantize(spec, f"gguf-{_slug(blob.stem)}", blob, dtype, {
+            "source": "gguf", "quantization": quant.group(1).upper() if quant else None, "family": None,
+            "note": "Weights dequantized from a GGUF file; quantization noise remains. "
+                    "Use original bf16 weights for causal claims."})
     if not spec.startswith("ollama:"):
         source = "local" if Path(spec).exists() else "huggingface"
         return spec, {"spec": spec, "source": source, "quantization": None, "exploratory": False}
     tag = spec.split(":", 1)[1]
     local = CACHE / "models" / f"ollama-{_slug(tag)}"
+    if (local / "brainscan_provenance.json").exists():
+        return str(local), json.loads((local / "brainscan_provenance.json").read_text())
+    blob, config = resolve_ollama(tag)
+    return _dequantize(spec, f"ollama-{_slug(tag)}", blob, dtype, {
+        "source": "ollama", "quantization": config.get("file_type"), "family": config.get("model_family"),
+        "note": "Weights dequantized from an Ollama GGUF; quantization noise remains. "
+                "Use original bf16 weights for causal claims."})
+
+
+def _dequantize(spec: str, folder: str, blob: Path, dtype, info: dict) -> tuple[str, dict]:
+    """A GGUF's weights as a Hugging Face checkpoint in Brainscan's model cache (made once)."""
+    local = CACHE / "models" / folder
     prov_file = local / "brainscan_provenance.json"
     if prov_file.exists():
         return str(local), json.loads(prov_file.read_text())
-    blob, config = resolve_ollama(tag)
-    provenance = {
-        "spec": spec, "source": "ollama", "blob": str(blob),
-        "quantization": config.get("file_type"), "family": config.get("model_family"),
-        "exploratory": True,
-        "note": "Weights dequantized from an Ollama GGUF; quantization noise remains. "
-                "Use original bf16 weights for causal claims.",
-    }
+    provenance = {"spec": spec, "blob": str(blob), "exploratory": True, **info}
     gguf_dir = CACHE / "gguf"
     gguf_dir.mkdir(parents=True, exist_ok=True)
-    link = gguf_dir / f"{_slug(tag)}.gguf"
+    link = gguf_dir / f"{folder}.gguf"
     if not link.exists():
         link.symlink_to(blob)
     print(f"[brainscan] dequantizing {blob} -> {local} (one time)", flush=True)

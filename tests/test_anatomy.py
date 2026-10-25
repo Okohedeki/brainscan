@@ -1,4 +1,5 @@
 import base64
+import json
 from types import SimpleNamespace
 
 import numpy as np
@@ -83,6 +84,19 @@ def test_unit_map_covers_every_head_and_neuron(subject, tmp_path):
     again = Anatomy(subject, tmp_path, clusters=8)
     assert again.units == an.units
     assert all(torch.equal(a.assign, b.assign) for a, b in zip(an.layers, again.layers))
+
+
+def test_another_models_unit_map_is_never_overwritten(subject, tmp_path):
+    """Models are filed by name; a unit map of another shape under this name is an error, not a cache miss."""
+    Anatomy(subject, tmp_path, clusters=8)
+    meta = tmp_path / subject.slug / "atlas-k8.json"
+    m = json.loads(meta.read_text())
+    m["key"]["heads"] = [h + 1 for h in m["key"]["heads"]]
+    m["key"]["spec"] = "another-model"
+    meta.write_text(json.dumps(m))
+    with pytest.raises(RuntimeError, match="share the name"):
+        Anatomy(subject, tmp_path, clusters=8)
+    assert json.loads(meta.read_text())["key"]["spec"] == "another-model"  # left as it was
 
 
 def test_kmeans_ignores_sign():

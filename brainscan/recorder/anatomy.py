@@ -254,6 +254,11 @@ class Anatomy:
         meta_path, tensor_path = self.dir / f"atlas-k{self.k}.json", self.dir / f"atlas-k{self.k}.safetensors"
         if meta_path.exists() and tensor_path.exists():
             meta = json.loads(meta_path.read_text())
+            old = meta.get("key") or {}
+            # A cache of a different shape is another model's: never overwrite it (models are filed by name).
+            if old and (old.get("down"), old.get("heads")) != (key["down"], key["heads"]):
+                raise RuntimeError(f"Two models share the name {self.s.slug!r}: {self.dir} holds the unit map of "
+                                   f"a different model ({old.get('spec')}). Set BRAINSCAN_MODEL_NAME to tell them apart.")
             if meta.get("key") == key:
                 tensors = load_file(str(tensor_path), device=str(self.s.device))
                 for lm in self.layers:
