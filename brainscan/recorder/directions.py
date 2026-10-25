@@ -161,6 +161,19 @@ class DirectionBank:
         samples = torch.cat([a["pos"][:, layer], a["neg"][:, layer]]).to(self.s.device)
         return self._save(name, layer, unit, samples, meta)
 
+    def save_probe(self, name: str, layer: int, unit, samples, meta: dict) -> Direction:
+        """A probe trained on recorded runs (recorder/decoding.py): its unit vector at its layer,
+        z-scored on the residuals it was trained on."""
+        if not NAME_RE.match(name):
+            raise ValueError("name: letters, digits, '.', '_' or '-', up to 64 characters")
+        if not 0 <= layer < self.s.n_layers:
+            raise ValueError(f"layer must be in 0..{self.s.n_layers - 1}")
+        unit = torch.as_tensor(unit, dtype=torch.float32, device=self.s.device)
+        samples = torch.as_tensor(samples, dtype=torch.float32, device=self.s.device)
+        if unit.shape[-1] != self.s.d_model:
+            raise ValueError("the probe was trained on another model's residuals")
+        return self._save(name, layer, unit, samples, {"kind": "probe", **meta})
+
     def delete(self, name: str) -> None:
         if name not in self.dirs:
             raise KeyError(name)

@@ -382,6 +382,23 @@
       <div class="wb-msg" id="wb-edit-msg" role="status"></div>
     </section>
 
+    <section class="panel wb-decode" aria-labelledby="h-decode">
+      <div class="panel-head"><h2 id="h-decode">Train a probe on recorded runs</h2></div>
+      <p class="hint">A linear probe on the residual stream just before each agent step, trained to forecast how
+        the run ends. It is cross-validated by run and scored against the same probe on shuffled labels (across runs
+        and within each task) and against what the transcript alone shows: the task, steps, tool errors, failing
+        test runs, edits to tests and repeated calls.</p>
+      <div class="row">
+        <label>Forecast<select id="dc-target"></select></label>
+        <label>From<select id="dc-study"></select></label>
+        <label>Shuffles<input id="dc-perms" type="number" min="0" max="500" value="20"></label>
+        <button type="button" class="primary" id="dc-train">Train probe</button>
+      </div>
+      <p class="muted small" id="dc-data"></p>
+      <div class="wb-msg" id="dc-msg" role="status"></div>
+      <div id="dc-result"></div>
+    </section>
+
     <section class="panel wb-compare" aria-labelledby="h-compare">
       <div class="panel-head"><h2 id="h-compare">3 · Compare original and edited</h2></div>
       <div class="wb-replay" data-edits="replay"></div>
@@ -465,6 +482,7 @@
   <script type="module" src="/ui/app.js"></script>
   <script type="module" src="/ui/monitors.js"></script>
   <script type="module" src="/ui/workbench.js"></script>
+  <script type="module" src="/ui/decode.js"></script>
   <script type="module" src="/ui/weights.js"></script>
   <script type="module" src="/ui/verbs.js"></script>
 </body>

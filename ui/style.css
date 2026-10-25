@@ -572,6 +572,25 @@ table.cmp th { text-align: left; color: var(--ink-2); font-weight: 600; padding:
 table.cmp td { vertical-align: top; padding: 7px 6px; border-bottom: 1px solid var(--grid); word-break: break-word; }
 table.cmp pre { margin: 4px 0 0; white-space: pre-wrap; font: 12px/1.5 var(--mono); max-height: 200px; overflow: auto; }
 .wb-compare { grid-column: 1 / -1; }
+/* train a probe on recorded runs (ui/decode.js) */
+.wb-decode { grid-column: 1 / -1; }
+.wb-decode .row { display: flex; flex-wrap: wrap; gap: 10px; align-items: end; margin-top: 10px; }
+.wb-decode .row label { display: flex; flex-direction: column; gap: 4px; font-size: 12px; color: var(--ink-2); }
+.wb-decode #dc-perms { width: 90px; }
+.wb-decode .tiles { margin-top: 10px; }
+.wb-decode .tile .value { font-size: 17px; }
+.dc-progress { height: 6px; border-radius: 4px; background: var(--grid); overflow: hidden; margin-top: 12px; }
+.dc-progress div { height: 100%; background: linear-gradient(90deg, var(--accent), var(--accent-2)); transition: width 0.4s; }
+.dc-notes { margin: 10px 0 0; padding-left: 18px; font-size: 12.5px; color: var(--ink); line-height: 1.5; }
+.dc-chart { width: 100%; max-width: 760px; height: auto; display: block; font-size: 10px; fill: var(--muted); }
+.dc-chart .grid { stroke: var(--grid); }
+.dc-chart .band { fill: var(--accent-soft); stroke: none; }
+.dc-chart .line { fill: none; stroke: var(--accent); stroke-width: 2; }
+.dc-chart .tr { stroke: var(--serious); stroke-dasharray: 5 4; }
+.dc-chart .tr-l { fill: var(--serious); }
+.dc-chart .nul { stroke: var(--muted); stroke-dasharray: 2 3; }
+.dc-lead tr.above td:first-child { box-shadow: inset 3px 0 0 var(--good); }
+.dc-save { margin-top: 12px; }
 
 /* ---- weights: graph view ---- */
 .gv { flex: 1; display: flex; flex-direction: column; min-height: 0; height: calc(100vh - var(--topbar-h)); padding: 12px 14px 14px; gap: 10px; position: relative; }

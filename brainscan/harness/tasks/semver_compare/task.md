@@ -1,0 +1,1 @@
+`semver.py` compares version strings, but several tests in `tests/test_semver.py` fail. Fix `compare` (and `parse` if you need to) so that all tests pass. Versions follow Semantic Versioning 2.0.0: `MAJOR.MINOR.PATCH`, an optional pre-release after `-` and optional build metadata after `+`.

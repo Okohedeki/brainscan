@@ -262,6 +262,8 @@ function setupBar() {
     actions: [
       { id: "find", group: "Find", label: "Find a direction", hint: "Two sets of examples give a direction in the residual stream, scored at every layer",
         run: to("#h-find", "#wb-a") },
+      { id: "decode", group: "Find", label: "Train a probe on runs", hint: "Forecast how agent runs end from the residual before each step, with shuffled-label and transcript controls",
+        run: to("#h-decode", "#dc-target") },
       { id: "edit", group: "Change", label: "Edit weights", hint: "Scale or lesion an attention block, MLP block, head or neuron, or add another edit",
         run: to("#h-edit", "#wb-kind") },
       { id: "forget", group: "Change", label: "Forget a fact", hint: "Guided: name a fact, find the units that carry it, try, measure, keep",

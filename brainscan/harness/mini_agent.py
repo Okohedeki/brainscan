@@ -56,7 +56,7 @@ def post_event(base_url: str, run_id: str, etype: str, data: dict) -> None:
     req = urlrequest.Request(f"{root}/brainscan/events", method="POST",
                              data=json.dumps({"run": run_id, "type": etype, "data": data}).encode(),
                              headers={"Content-Type": "application/json"})
-    urlrequest.urlopen(req, timeout=10).read()
+    urlrequest.urlopen(req, timeout=30).read()  # the recorder can be busy for a while (a long prefill)
 
 
 def pytest_run(sandbox: Path) -> tuple[str, int]:
@@ -100,7 +100,7 @@ def execute(name: str, args: dict, sandbox: Path, report) -> str:
 
 
 def run_task(task: str, base_url: str, max_steps: int, temperature: float, seed: int | None,
-             thinking: str = "default", max_tokens: int = 3072) -> dict:
+             thinking: str = "default", max_tokens: int = 3072, study: str | None = None) -> dict:
     source = TASKS / task
     sandbox = Path(tempfile.mkdtemp(prefix=f"brainscan-{task}-"))
     shutil.copytree(source, sandbox, dirs_exist_ok=True, ignore=shutil.ignore_patterns("task.md", "__pycache__"))
@@ -111,7 +111,8 @@ def run_task(task: str, base_url: str, max_steps: int, temperature: float, seed:
         post_event(base_url, run_id, etype, data)
 
     report("run_meta", {"task": task, "harness": "mini_agent", "max_steps": max_steps,
-                        "temperature": temperature, "seed": seed, "thinking": thinking})
+                        "temperature": temperature, "seed": seed, "thinking": thinking}
+           | ({"study": study} if study else {}))  # a study selects its runs by this tag
     extra = {} if thinking == "default" else {"chat_template_kwargs": {"enable_thinking": thinking == "on"}}
     messages = [{"role": "system", "content": SYSTEM},
                 {"role": "user", "content": (source / "task.md").read_text()}]
@@ -154,6 +155,7 @@ def main() -> None:
     parser.add_argument("--thinking", choices=["default", "on", "off"], default="default",
                         help="reasoning models: set enable_thinking in the chat template")
     parser.add_argument("--max-tokens", type=int, default=3072, help="per model turn, including reasoning")
+    parser.add_argument("--study", default=None, help="tag the runs for a study (run_meta.study)")
     args = parser.parse_args()
     tasks = sorted(p.name for p in TASKS.iterdir() if (p / "task.md").exists()) if args.task == "all" else [args.task]
     results = []
@@ -162,7 +164,7 @@ def main() -> None:
             seed = None if args.seed is None else args.seed + rep
             try:
                 results.append(run_task(task, args.base_url, args.max_steps, args.temperature, seed,
-                                        args.thinking, args.max_tokens))
+                                        args.thinking, args.max_tokens, args.study))
             except Exception as exc:  # one broken run shouldn't end a batch
                 print(f"[{task}] run failed: {type(exc).__name__}: {exc}", flush=True)
                 results.append({"task": task, "seed": seed, "error": f"{type(exc).__name__}: {exc}"})

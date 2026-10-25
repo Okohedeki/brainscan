@@ -32,7 +32,7 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from fastapi.staticfiles import StaticFiles
 
 from .config import PROJECT_ROOT, Settings
-from .recorder import actions, catalog, monitors, workbench
+from .recorder import actions, catalog, decoding, monitors, workbench
 from .recorder.model import Subject, display_name
 from .recorder.session import Cancelled, GenParams, ModelSwitched, Recorder, compact
 from .recorder.store import RunStore
@@ -677,6 +677,106 @@ async def run_flags(run_id: str):
 async def flags_across_runs(limit: int = 20):
     """Flag counts per enabled monitor on the most recent runs."""
     return await asyncio.to_thread(monitors.scan_runs, recorder(), limit)
+
+
+DECODING_JOBS: dict[str, dict] = {}  # probe trainings, newest last (the few most recent are kept)
+
+
+def _job_view(job: dict) -> dict:
+    return {k: v for k, v in job.items() if k != "result"}
+
+
+@app.get("/brainscan/decoding")
+async def decoding_summary(study: str | None = None):
+    """What a probe could train on: this model's agent runs with an outcome, by task, and the
+    studies they were tagged with (see recorder/decoding.py)."""
+    rec = recorder()
+    every = decoding.candidate_runs(rec.store, rec.s.spec)
+    metas = [m for m in every if not study or m["harness"].get("study") == study]
+    tasks: dict[str, dict] = {}
+    for m in metas:
+        t = tasks.setdefault(m["harness"]["task"], {"task": m["harness"]["task"], "runs": 0, "fails": 0})
+        t["runs"] += 1
+        t["fails"] += not m["outcome"].get("success")
+    return {"targets": decoding.TARGETS, "runs": len(metas), "tasks": sorted(tasks.values(), key=lambda t: t["task"]),
+            "studies": sorted({m["harness"]["study"] for m in every if m["harness"].get("study")}),
+            "jobs": [_job_view(j) for j in DECODING_JOBS.values() if j["model"] == rec.s.spec]}
+
+
+@app.post("/brainscan/decoding/train")
+async def decoding_train(request: Request):
+    """Train a probe on recorded runs with its controls: {target, study, perms}. Returns a job to poll;
+    it runs on the CPU and never holds the model."""
+    body = await request.json()
+    target, study = str(body.get("target") or "fails"), (body.get("study") or None)
+    try:
+        perms = max(0, min(int(body.get("perms", 20)), 500))
+    except (TypeError, ValueError):
+        raise HTTPException(400, "perms must be a number") from None
+    if target not in decoding.TARGETS:
+        raise HTTPException(400, f"target must be one of {sorted(decoding.TARGETS)}")
+    rec = recorder()
+    jid = uuid.uuid4().hex[:8]
+    job = {"id": jid, "status": "running", "step": "starting", "progress": 0.0, "target": target, "study": study,
+           "perms": perms, "model": rec.s.spec, "started": time.time(), "report": None, "error": None}
+    DECODING_JOBS[jid] = job
+    while len(DECODING_JOBS) > 6:
+        DECODING_JOBS.pop(next(iter(DECODING_JOBS)))
+
+    def work():
+        try:
+            job["result"] = decoding.train(rec.store, rec.s.spec, target, study, perms,
+                                           progress=lambda step, frac: job.update(step=step, progress=round(frac, 3)))
+            job.update(report=decoding.public(job["result"]), status="done", step="done", progress=1.0)
+        except ValueError as exc:
+            job.update(status="error", error=str(exc))
+        except Exception as exc:  # a failed training is reported on the job, not lost in a thread
+            job.update(status="error", error=f"{type(exc).__name__}: {exc}")
+            traceback.print_exc()
+
+    threading.Thread(target=work, daemon=True, name=f"decoding-{jid}").start()
+    return _job_view(job)
+
+
+@app.get("/brainscan/decoding/jobs/{jid}")
+async def decoding_job(jid: str):
+    job = DECODING_JOBS.get(jid)
+    if job is None:
+        raise HTTPException(404, f"no job {jid}")
+    return _job_view(job)
+
+
+@app.post("/brainscan/decoding/jobs/{jid}/save")
+async def decoding_save(jid: str, request: Request):
+    """Save a trained probe to the direction bank: {name, description}. Probe, Steer and Monitor can
+    then use it like any other direction."""
+    body = await request.json()
+    job = DECODING_JOBS.get(jid)
+    if job is None:
+        raise HTTPException(404, f"no job {jid}")
+    rec = recorder()
+    if job["status"] != "done":
+        raise HTTPException(400, "the probe isn't trained yet")
+    if job["model"] != rec.s.spec:
+        raise HTTPException(400, "the probe was trained on another model's runs")
+    r = job["report"]
+    p = r["probe"]
+
+    def save():
+        layer, unit, samples = decoding.probe_direction(job["result"])
+        meta = {"description": str(body.get("description") or f"forecasts: {r['describes']}"),
+                "construction": f"ridge probe on the residual before each reply, layer {layer}, {r['steps']} steps of "
+                                f"{r['runs']} runs; target: {r['describes']}; nested cross-validated AUC {p['auc']:.2f} "
+                                f"[{p['lo']:.2f}, {p['hi']:.2f}], within tasks {p['within_task']['auc']:.2f}; "
+                                f"z-scored on its training residuals; points toward the target",
+                "decoding": {k: r[k] for k in ("target", "runs", "steps", "probe", "controls", "baselines", "study")}}
+        with rec.lock:
+            return rec.directions.save_probe(str(body.get("name") or ""), layer, unit, samples, meta)
+    try:
+        await asyncio.to_thread(save)
+    except ValueError as exc:
+        raise HTTPException(400, str(exc)) from exc
+    return rec.directions.describe()
 
 
 @app.post("/brainscan/checks/run")

@@ -27,7 +27,7 @@ const exportStep = {
 };
 
 const findDirection = (what) => ({ id: "direction", label: "Direction", view: "workbench", focus: "#h-find", done: () => st("directions") > 0, what,
-  tools: ["workbench:find"] });
+  tools: ["workbench:find", "workbench:decode"] });
 
 defineVerbs([
   {
