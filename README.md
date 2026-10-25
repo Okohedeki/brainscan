@@ -347,16 +347,21 @@ wsl -e bash scripts/run.sh -m brainscan.hardware
 
 `scripts/demo/` records product videos of the running UI: a headless Chrome is driven over the
 DevTools protocol through scripted scenes (an on-screen cursor, captions and title cards; captions
-quote the numbers the app shows), and ffmpeg joins the frames into 1080p MP4s. It runs on the
-Windows side with Node 22+, against a recorder serving Qwen3.5-9B. The scenes change the
-recorder's state (a chat, a weight edit, checks, steering), so record on a scratch setup:
+quote the numbers the app shows, so they hold for whichever model is served), and ffmpeg joins the
+frames into 1080p MP4s. There is one video per action, after an overview, and one on the screens
+and Do…. It runs on the Windows side with Node 22+. The current videos were recorded on
+Qwen2.5-1.5B-Instruct with the recorder capped at 25% of the GPU (`BRAINSCAN_GPU_FRACTION=0.25`).
+The scenes change the recorder's state (chats, weight edits, checks, steering, monitors, a
+`language_fr` direction), so record on a scratch setup:
 
 ```bash
 node scripts/demo/recorder.mjs C:/Temp/brainscan-demos
 ```
 
-Name scenes after the folder to record only those (`01-overview` … `09-directions-and-steering`).
-`CHROME`, `FFMPEG` and `BRAINSCAN_URL` override the defaults.
+Name scenes after the folder to record only those (`01-actions`, `02-ablate`, `03-scale`,
+`04-steer`, `05-probe`, `06-monitor`, `07-check`, `08-compare`, `09-screens-and-do`); `02-ablate`
+asks the question the later scenes trace. `CHROME`, `FFMPEG` and `BRAINSCAN_URL` override the
+defaults (on WSL, point `BRAINSCAN_URL` at the WSL address when `localhost` forwarding is down).
 
 ### Switching models
 

@@ -1,6 +1,8 @@
-// Demo scenes for recorder.mjs. Every function here is serialized and evaluated in the page, so it
-// can't close over anything in this module: HELPER installs window.demo (a visible cursor, captions,
-// title cards, real mouse input, app helpers), and each scene's setup and script use it.
+// Demo scenes for recorder.mjs: one video per action, after an overview, and a last one on the
+// screens and Do…. Every function here is serialized and evaluated in the page, so it can't close
+// over anything in this module: HELPER installs window.demo (a visible cursor, captions, title
+// cards, real mouse input, app helpers), and each scene's setup and script use it. Captions quote
+// the numbers the app shows, so they hold for whichever model the recorder serves.
 
 export function HELPER() {
   if (window.demo) return true;
@@ -18,7 +20,7 @@ export function HELPER() {
       font: 600 24px/1.38 Inter, system-ui, sans-serif; border: 1px solid rgba(255,255,255,0.16);
       box-shadow: 0 16px 48px rgba(0,0,0,0.6); z-index: 2147483646; pointer-events: none; opacity: 0;
       transition: opacity 0.35s ease, transform 0.35s ease; }
-    #demo-cap.top { bottom: auto; top: 74px; }
+    #demo-cap.top { bottom: auto; top: 196px; }  /* below the top bar and the action's step bar */
     #demo-cap.on { opacity: 1; transform: translate(-50%, 0); }
     #demo-cap small { display: block; margin-top: 6px; font: 500 18px/1.42 Inter, system-ui, sans-serif; color: #c9c9da; }
     #demo-title { position: fixed; inset: 0; z-index: 2147483645; display: flex; flex-direction: column; align-items: center;
@@ -164,14 +166,56 @@ export function HELPER() {
     async until(fn, timeout = 60000, what = "") {
       const t0 = performance.now();
       while (performance.now() - t0 < timeout) {
-        try { if (fn()) return true; } catch { /* not yet */ }
+        try { if (await fn()) return true; } catch { /* not yet */ }
         await sleep(200);
       }
       throw new Error(`demo.until timed out: ${what || fn.toString().slice(0, 120)}`);
     },
 
     // app helpers
+    CAPITAL: "What is the capital of Australia? Answer in one sentence.",
     show(view) { document.dispatchEvent(new CustomEvent("brainscan:show", { detail: view })); },
+    /** The bar of the screen on show, and its parts: a tool by its label, a step chip, Next. */
+    bar() { return [...document.querySelectorAll(".act-bar")].find((b) => b.offsetParent); },
+    tool(label) { return [...d.bar().querySelectorAll(".ab-btn")].find((b) => b.textContent.trim().startsWith(label)) || null; },
+    stepChip(label) { return [...d.bar().querySelectorAll(".ab-step")].find((b) => b.textContent.includes(label)) || null; },
+    next() { return d.bar().querySelector("[data-next]"); },
+    async pick(id) { await d.click(q(`#verbs [data-verb="${id}"]`), 900); },
+    /** Long model output, cut for a caption: its first sentence, or the first n characters. */
+    short(text, n = 110) {
+      const t = String(text).replace(/\s+/g, " ").trim();
+      const end = t.search(/[.!?](\s|$)/);
+      const cut = end > 0 && end < n ? t.slice(0, end + 1) : t.slice(0, n);
+      return cut.length < t.length ? `${cut.replace(/[.!?]$/, "")}…` : cut;
+    },
+    /** A knockout or scale test's numbers, and what the model would say instead. */
+    koNums(li) { return li.querySelector(".ko-nums").innerText.replace(/\s+/g, " ").split(" logit")[0]; },
+    mostLikely(li) { return ((li.querySelector(".hint").innerText.match(/Most likely now: (.*)\./) || [])[1] || "").replace(/·(?=\S)/g, ""); },
+    /** Ask in a composer (a new chat, greedy, thinking off) and return the answer. */
+    async ask(c, text) {
+      await d.click(c.querySelector(".composer-new"));
+      d.set(c.querySelector(".composer-think"), "off");
+      d.set(c.querySelector(".composer-max"), "80");
+      d.set(c.querySelector(".composer-temp"), "0");
+      const ta = c.querySelector("textarea");
+      await d.click(ta);
+      await d.type(ta, text);
+      await sleep(400);
+      d.key("Enter", {}, ta);
+      await d.until(() => /^Done/.test(c.querySelector(".composer-status").innerText), 180000, "the answer");
+      await sleep(1500);
+      const run = await d.api("GET", `/brainscan/runs/${q("#run-select").value}`);
+      return ([...run.messages].reverse().find((m) => m.role === "assistant")?.content || "").trim();
+    },
+    /** The latest chat that asked CAPITAL (the ablate scene makes one). */
+    async capitalChat() {
+      const runs = await (await fetch("/brainscan/runs")).json();
+      for (const r of runs.filter((x) => x.id.startsWith("chat-") && !x.id.includes("-edited") && (x.tokens || 0) > 0).slice(0, 12)) {
+        const run = await d.api("GET", `/brainscan/runs/${r.id}`);
+        if (run.messages.some((m) => m.role === "user" && m.content === d.CAPITAL)) return r.id;
+      }
+      return d.latestChat();
+    },
     /** The last token in the Trace conversation whose text is `text`. */
     word(text) { return [...document.querySelectorAll("#tv-convo-body .ct")].reverse().find((e) => e.textContent.trim() === text) || null; },
     async latestChat() {
@@ -209,7 +253,7 @@ export function HELPER() {
       if (o.view) d.show(o.view);
       await sleep(1500);
       if (o.run !== undefined) {
-        await d.openRun(o.run === "latest-chat" ? await d.latestChat() : o.run);
+        await d.openRun(o.run === "latest-chat" ? await d.latestChat() : o.run === "capital-chat" ? await d.capitalChat() : o.run);
         await sleep(2500);
         if (!o.run) {  // the picker re-renders with the newest run showing; say none is open
           const sel = q("#run-select");
@@ -220,6 +264,12 @@ export function HELPER() {
       if (o.view === "weights") {
         for (let i = 0; i < 6; i++) { d.key("Escape"); await sleep(60); }
         q("#gv-fit").click();
+      }
+      // The action the scene is about, at a given step (or its first step not done yet).
+      if (o.action) {
+        document.dispatchEvent(new CustomEvent("brainscan:pick", { detail: o.action }));
+        await sleep(1200);
+        if (o.step) { d.stepChip(o.step)?.click(); await sleep(1000); }
       }
       window.scrollTo(0, 0);
       for (const el of document.querySelectorAll("#view-workbench, .workbench, #messages, #an-detail, #tv-convo-body")) el.scrollTop = 0;
@@ -238,457 +288,387 @@ export function HELPER() {
   return true;
 }
 
-const FIZZ = "20261022-030423-fix_fizzbuzz-93e6";
-
 export const SCENES = [
-  // ------------------------------------------------------------------ 1. overview
+  // ------------------------------------------------------------------ 1. actions
   {
-    name: "01-overview",
-    setup: async () => { await window.demo.reset({ view: "scanner", run: "20261022-030423-fix_fizzbuzz-93e6", revert: true }); return true; },
+    name: "01-actions",
+    setup: async () => { await window.demo.reset({ view: "scanner", run: "latest-chat", revert: true, action: "explore" }); return true; },
     script: async () => {
       const d = window.demo, q = d.q;
-      await d.title("Trace and tune open-weights models", "See what happens inside a model while it works, on your own GPU", 3400);
+      await d.title("Adjust open-weights models, and see what changed", "Brainscan runs the model on your GPU and records what happens inside it", 3400);
       await d.say("Brainscan runs an open-weights model on your machine and records its internals, token by token.",
-        "Here: Qwen3.5-9B on a single RTX 4090.");
-      await d.move(q(".tabs"));
-      await d.sleep(600);
-      await d.click(q('.tabs [data-view="scanner"]'));
-      await d.say("1 · Watch: the transcript, a per-token timeline, the logit lens and steering.",
-        "Ask from the app, or point any OpenAI-compatible agent at it. Every request becomes a recorded run.");
-      await d.click(q('.tabs [data-view="weights"]'));
-      await d.sleep(1200);
-      await d.say("2 · Trace: the model as a graph of attention heads and neuron clusters.",
-        "Click any word to see which units and layers produced it.");
-      await d.click(q('.tabs [data-view="workbench"]'));
-      await d.say("3 · Tune: change the weights, measure what changed, and export the variant.");
+        `Here: ${q("#model-badge").innerText.split(" · ")[0]}, using a quarter of one RTX 4090.`);
+      await d.move(q("#verbs"));
+      await d.say("Start with what you want to do to the model.",
+        "Adjust it: ablate, scale or steer. Analyze it: probe, monitor, compare or check.", "top");
+      await d.click(q("#verbs [data-more]"));
+      await d.cap("More lists what's planned next.", "", "top");
+      await d.sleep(2600);
+      document.body.dispatchEvent(new PointerEvent("pointerdown", { bubbles: true }));
+      await d.pick("ablate");
+      await d.move(d.bar().querySelector(".ab-steps"));
+      await d.say("Each action runs as steps, on three screens.",
+        "Ablate: record in Watch, locate, test, apply and measure in Trace, export from Tune.", "top");
+      for (const chip of [...d.bar().querySelectorAll(".ab-step")].slice(0, 4)) { await d.move(chip, 500); await d.sleep(500); }
+      await d.move(d.bar().querySelector(".ab-what"));
+      await d.say("The bar says what to do in this step, offers its tools and the next step.",
+        "Done steps are ticked. Greyed tools say what they need first.", "top");
       await d.click(q("#help-btn"));
       await d.sleep(600);
-      await d.cap("The guide lists every tool in that order, each with a Show me button.", "Press ? to open it from anywhere.", "top");
-      for (const s of document.querySelectorAll("#guide .guide-step")) { s.scrollIntoView({ behavior: "smooth", block: "start" }); await d.sleep(2600); }
+      await d.cap("The guide starts with the actions, each with its steps and a Start link.", "Press ? to open it from anywhere.", "top");
+      await d.sleep(3600);
       await d.click(q("#guide-close"));
-      await d.click(q("#model-badge"));
-      await d.until(() => q("#model-picker .mp-row"), 30000, "model list");
-      await d.sleep(500);
-      await d.move(q("#model-picker .mp-list"));
-      await d.say("Switch models from the top bar: any Hugging Face checkpoint or Ollama tag already on this machine.",
-        "Each one is checked against free GPU memory first. Nothing is downloaded.");
-      await d.click(q("#mp-close"));
-      await d.title("Next: ask the model and watch it work", "", 2400);
+      await d.title("Next: ablate a fact", "", 2400);
       return true;
     },
   },
 
-  // ------------------------------------------------------------------ 2. ask and watch live
+  // ------------------------------------------------------------------ 2. ablate
   {
-    name: "02-ask-and-watch-live",
-    setup: async () => { await window.demo.reset({ view: "weights", run: "", revert: true }); return true; },
+    name: "02-ablate",
+    setup: async () => { await window.demo.reset({ view: "scanner", run: "", revert: true, clearEdits: true, clearChecks: true, action: "ablate", step: "Record" }); return true; },
     script: async () => {
       const d = window.demo, q = d.q;
-      await d.title("Ask the model. Watch it work.", "Every token is recorded as it is generated", 3000);
-      await d.say("The Trace tab: the conversation on the left, the model in the middle.",
-        "Each dot is an attention head or a cluster of neurons. Layers run left to right, from input to output.");
-      await d.moveXY(1150, 470, 900);
-      await d.sleep(800);
-      const c = q("#tv-convo .composer");
-      await d.cap("Ask a question right here. No harness, no setup.");
-      await d.click(c.querySelector(".composer-new"));
-      d.set(c.querySelector(".composer-think"), "off");
-      d.set(c.querySelector(".composer-max"), "60");
-      d.set(c.querySelector(".composer-temp"), "0");
-      const ta = c.querySelector("textarea");
-      await d.click(ta);
-      await d.type(ta, "What is the capital of Australia? Answer in one sentence.");
-      await d.sleep(500);
-      d.key("Enter", {}, ta);
-      await d.cap("The answer streams in, and the graph lights up with the units that fired at each token.");
-      await d.moveXY(1150, 500, 900);
-      await d.until(() => /^Done/.test(c.querySelector(".composer-status").innerText), 120000, "the answer");
-      await d.sleep(1500);
-      const last = [...document.querySelectorAll("#tv-convo-body .cb")].pop();
-      await d.move(last);
-      await d.say("Done. Words the model found surprising are underlined.", "Every word is clickable: the trace video starts there.");
-      await d.move(q("#an-trace-wrap"));
-      await d.cap("The timeline under the graph has one column per token. Press play to replay the run.");
-      await d.click(q("#an-play"));
-      await d.sleep(7000);
-      if (q("#an-play").getAttribute("aria-label") === "Pause") await d.click(q("#an-play"));
-      await d.title("Next: why did it write “Canberra”?", "", 2400);
-      return true;
-    },
-  },
-
-  // ------------------------------------------------------------------ 3. the Watch tab with an agent run
-  {
-    name: "03-watch-agent-runs",
-    setup: async () => { await window.demo.reset({ view: "scanner", run: "20261022-030423-fix_fizzbuzz-93e6" }); return true; },
-    script: async () => {
-      const d = window.demo, q = d.q;
-      await d.title("Watch: every run, recorded", "Transcripts, tool calls and a per-token timeline", 3000);
-      await d.move(q("#run-select"));
-      await d.say("Point any OpenAI-compatible agent at Brainscan's /v1 endpoint and each request is recorded.",
-        "This run is a coding agent fixing a FizzBuzz bug with tools.", "top");
-      const box = q("#messages");
-      await d.move(box);
-      await d.cap("The transcript: messages, tool calls and their results.", "", "top");
-      box.scrollTo({ top: box.scrollHeight * 0.4, behavior: "smooth" }); await d.sleep(2400);
-      box.scrollTo({ top: box.scrollHeight, behavior: "smooth" }); await d.sleep(2400);
-      const r = q("#scope").getBoundingClientRect();
-      await d.cap("The timeline: one column per token, with events, the logit lens by layer, surprisal and projections.",
-        "Hover for details. Scroll to pan, ctrl-scroll to zoom.", "top");
-      await d.realMove(r.left + r.width * 0.3, r.top + r.height * 0.5, 900);
-      for (const f of [0.4, 0.5, 0.6, 0.7]) await d.realMove(r.left + r.width * f, r.top + r.height * 0.5, 900);
-      await d.sleep(1200);
-      await d.realClick(r.left + r.width * 0.7, r.top + r.height * 0.5);
-      await d.until(() => q("#inspector .tok-hero"), 30000, "inspector");
-      await d.sleep(800);
-      await d.move(q("#inspector .tok-hero"));
-      await d.say("Click a token: what the model predicted there, and each layer's guess for it (the logit lens).", "", "top");
-      const lens = q("#inspector .lens-wrap");
-      if (lens) { await d.move(lens); await d.sleep(2500); }
-      const tr = q("#insp-trace");
-      if (tr) {
-        await d.move(tr);
-        await d.cap("Trace this token opens it in the graph: the layers, units and knockouts behind it.", "", "top");
-        await d.sleep(1500);
-        await d.click(tr);
-        await d.until(() => q("#an-detail .d-hero"), 90000, "trace panel");
-        await d.sleep(4500);
-      }
-      await d.title("Next: trace a word", "", 2200);
-      return true;
-    },
-  },
-
-  // ------------------------------------------------------------------ 4. trace a word
-  {
-    name: "04-trace-a-word",
-    setup: async () => { await window.demo.reset({ view: "weights", run: "latest-chat", revert: true }); return true; },
-    script: async () => {
-      const d = window.demo, q = d.q;
-      await d.title("Why did it write that?", "Click a word to trace it back through the model", 3000);
-      await d.until(() => d.word("Canberra"), 20000, "Canberra");
-      await d.cap("Click any word in the conversation. Here, “Canberra”.");
+      await d.title("Ablate", "Remove what a word depends on, test it, keep it as a weight edit", 3000);
+      await d.move(d.bar().querySelector(".ab-what"));
+      await d.say("Step 1, Record: get the model to say it.", "", "top");
+      const answer = await d.ask(q("#view-scanner .composer"), d.CAPITAL);
+      await d.say(`“${answer}”`, "Next: find what in the model wrote “Canberra”.", "top");
+      await d.click(d.next());
+      await d.until(() => d.word("Canberra"), 30000, "Canberra in Trace");
+      await d.cap("Step 2, Locate: click the word.", "", "top");
       await d.click(d.word("Canberra"));
-      await d.cap("Brainscan reads the context again and splits the word's logit into what each unit wrote.");
-      await d.until(() => q("#an-detail .d-hero"), 90000, "panel");
-      await d.until(() => q("#an-detail .routes li[data-i]"), 90000, "routes");
-      await d.sleep(1500);
+      await d.until(() => q("#an-detail .routes li[data-i]"), 120000, "routes");
+      await d.sleep(1000);
       const stats = [...document.querySelectorAll("#an-detail .d-stats b")].map((b) => b.textContent);
-      await d.move(q("#an-detail .tp-target"));
-      await d.say(`“Canberra”: probability ${stats[0]}, rank ${stats[1]}.`, "Every unit on the graph is colored by its push on this word: up or down.");
-      const alts = q("#an-detail .tp-alts");
-      if (alts) { await d.move(alts); await d.say("The runners-up it also considered. Click one to trace it instead."); }
-      const routes = q("#an-detail .routes");
-      await d.move(routes);
-      await d.say("The trace, start to end: the strongest routes from the input to the word it wrote.",
-        "START is the token the model read. Each hop is a head (h) or a neuron cluster (c). END is the output word.");
-      await d.cap("Hover a route to light it up on the graph, one at a time.");
-      for (const li of [...routes.querySelectorAll("li[data-i]")].slice(0, 3)) { await d.hover(li, 600); await d.sleep(1700); d.unhover(li); }
-      await d.click(q("#tp-follow"));
-      await d.cap("▶ Follow route 1: the view flies from START, through each unit, to END.");
-      await d.sleep(9000);
-      const chart = q("#an-detail .layer-chart");
-      await d.move(chart);
-      const layers = [...chart.querySelectorAll("g.lc-layer")].map((g) => {
-        const m = g.querySelector("title").textContent.match(/Layer (\d+): heads ([-+\d.]+), MLP ([-+\d.]+)/);
-        return m ? { l: Number(m[1]), v: Number(m[2]) + Number(m[3]), g } : null;
-      }).filter(Boolean).sort((a, b) => b.v - a.v);
-      await d.say("Where the logit came from: each layer's heads and MLP clusters, and the running total.",
-        layers.length ? `The biggest push comes from layer ${layers[0].l}. Click a layer to fly to it.` : "");
-      if (layers.length) { await d.click(layers[0].g); await d.sleep(2200); }
-      const lens = q("#an-detail .lens-strip");
-      if (lens) {
-        await d.move(lens);
-        const first = lens.parentElement.querySelector(".hint b")?.textContent;
-        await d.say("When the model knew: the logit lens reads each layer's best guess.", first ? `“Canberra” is the top guess from layer ${first} on.` : "");
-      }
-      await d.move(q("#an-detail .tp-units"));
-      await d.say("The units that pushed it up most, and the ones that pulled it down.",
-        "Direct effects add up to the logit. What a unit does through later layers takes a knockout.");
-      await d.title("Next: knockout tests", "", 2200);
+      await d.say(`“Canberra”: probability ${stats[0]}. Every unit is colored by what it did to this word.`,
+        "Find paths shows the strongest routes into it.", "top");
+      await d.click(d.tool("Find paths"));
+      await d.until(() => q("#gv-path-list li"), 30000, "paths");
+      await d.sleep(1800);
+      await d.click(d.next());
+      await d.cap("Step 3, Test: knock out the five units that pushed it up most.", "Nothing changes in the weights yet.", "top");
+      await d.click(d.tool("Knock out top 5"));
+      await d.until(() => q("#tp-ko-list li .ko-nums"), 120000, "knockout");
+      await d.sleep(800);
+      let li = q("#tp-ko-list li");
+      await d.say(`Top 5 removed: ${d.koNums(li)}.`, li.querySelector(".hint").innerText.split(" Most likely")[0], "top");
+      await d.cap("Not enough. Knock out every unit on the paths instead.", "", "top");
+      await d.click(d.tool("Knock out path units"));
+      await d.until(() => document.querySelectorAll("#tp-ko-list li .ko-nums").length >= 2, 120000, "path knockout");
+      await d.sleep(800);
+      li = q("#tp-ko-list li");
+      await d.say(`${li.querySelector(".ko-head b").innerText}: ${d.koNums(li)}.`, `Most likely now: ${d.mostLikely(li)}.`, "top");
+      await d.click(d.next());
+      await d.cap("Step 4, Apply: keep that test as a weight edit.", "", "top");
+      await d.click(d.tool("Make permanent"));
+      await d.until(() => q("#tp-ko-list .pill.ok"), 120000, "permanent");
+      await d.sleep(1200);
+      await d.say("One edit, applied now.", "Restore original undoes every edit exactly.", "top");
+      await d.click(d.next());
+      await d.cap("Step 5, Measure: ask the chat's question again on both weights.", "", "top");
+      await d.click(d.tool("Re-run the chat"));
+      await d.until(() => q("#gv-edits .rp-card"), 180000, "replay");
+      await d.sleep(800);
+      await d.move(q("#gv-edits .rp-card"));
+      const cols = [...document.querySelectorAll("#gv-edits .rp-cols p")].map((p) => p.innerText.trim());
+      await d.say(`Original: “${d.short(cols[0])}”`, `Edited: “${d.short(cols[1])}”`, "top");
+      await d.click(d.next());
+      await d.say("Step 6, Export: save the edited model as a Hugging Face checkpoint, every edit recorded.", "", "top");
+      await d.click(d.tool("Restore original"));
+      await d.cap("Or restore the original weights.", "", "top");
+      await d.until(async () => !(await d.api("GET", "/brainscan/workbench")).applied.length, 60000, "restored");
+      await d.sleep(1800);
+      await d.title("Next: scale instead of remove", "", 2400);
       return true;
     },
   },
 
-  // ------------------------------------------------------------------ 5. knockouts
+  // ------------------------------------------------------------------ 3. scale
   {
-    name: "05-knockout-tests",
+    name: "03-scale",
     setup: async () => {
       const d = window.demo;
-      await d.reset({ view: "weights", run: "latest-chat", revert: true });
+      await d.reset({ view: "weights", run: "capital-chat", revert: true, clearEdits: true, action: "scale" });
       await d.traceQuick("Canberra");
-      d.q("#tp-ko-top").scrollIntoView({ block: "center" });
+      d.stepChip("Locate")?.click();
       await d.sleep(800);
       return true;
     },
     script: async () => {
       const d = window.demo, q = d.q;
-      await d.title("Knockout tests", "Remove units, run again, compare", 2800);
-      const btn = q("#tp-ko-top");
-      await d.move(btn);
-      await d.say("Direct effects show what each unit wrote to the output. A knockout shows what the model actually needs.",
-        "Knock out the 5 units that pushed “Canberra” up the most.");
-      await d.click(btn);
-      await d.cap("The whole context is read again with those units' writes set to zero.");
-      await d.until(() => q("#tp-ko-list li .ko-nums"), 120000, "knockout");
-      await d.sleep(600);
-      let li = q("#tp-ko-list li");
-      await d.move(li);
-      const nums = li.querySelector(".ko-nums").innerText.replace(/\s+/g, " ").split(" logit")[0];
-      const now = ((li.querySelector(".hint").innerText.match(/Most likely now: (.*)\./) || [])[1] || "").replace(/·(?=\S)/g, "");  // · marks a leading space
-      await d.say(`Without them: ${nums}.`, now ? `Most likely now: ${now}.` : "");
-      await d.move(li.querySelector(".ko-bars"));
-      await d.say("Direct vs total effect: what the units wrote to the output, against everything they did through later layers.",
-        li.querySelector(".hint").innerText.split(" Most likely")[0]);
-      const r = q("#gv-canvas").getBoundingClientRect();
-      await d.cap("Test any set of units: shift-drag a box on the graph to select them…");
-      // The framed trace sits in a band across the middle; heads above the stream line, clusters below.
-      for (const [fx, fy] of [[0.5, 0.47], [0.4, 0.56], [0.6, 0.46], [0.3, 0.5]]) {
-        const cx = r.left + r.width * fx, cy = r.top + r.height * fy;
-        await d.realDrag(cx - 38, cy - 24, cx + 38, cy + 24, 8, 1100);  // small: one knockout removes at most 64 units
-        await d.sleep(400);
-        if (!q("#gv-selchip").hidden) break;
-      }
-      await d.until(() => !q("#gv-selchip").hidden, 3000, "selection");
-      await d.move(q("#gv-selchip"));
-      await d.sleep(1500);
-      await d.cap("…then knock them out.");
-      await d.click(q("#gv-selko"));
-      await d.until(() => document.querySelectorAll("#tp-ko-list li .ko-nums").length >= 2, 120000, "selection knockout");
-      await d.sleep(600);
-      li = q("#tp-ko-list li");
-      await d.move(li);
-      const nums2 = li.querySelector(".ko-nums").innerText.replace(/\s+/g, " ").split(" logit")[0];
-      await d.say(`${li.querySelector(".ko-head b").innerText}: ${nums2}.`, li.querySelector(".hint").innerText.split(" Most likely")[0]);
-      d.key("Escape");
-      await d.title("Next: make a knockout permanent", "", 2200);
+      await d.title("Scale", "Dampen or boost the units behind a word", 2800);
+      await d.say("Locate: the same word, “Canberra”. Pick units to scale: here, every unit on its strongest paths.", "", "top");
+      await d.click(d.tool("Find paths"));
+      await d.until(() => q("#gv-path-list li"), 30000, "paths");
+      await d.sleep(1200);
+      const sel = [...document.querySelectorAll("#gv-path-head button")].find((b) => /select units/i.test(b.textContent));
+      await d.click(sel);
+      await d.say(d.bar().querySelector(".ab-what").innerText.replace(/^\d+ · Locate\.\s*/, "").replace(/·/g, ""), "", "top");
+      await d.click(d.next());
+      await d.click(d.tool("Scale selection"));
+      await d.cap("Test: scale their writes. ×0.5 dampens, ×2 boosts.", "", "top");
+      await d.sleep(1200);
+      await d.click([...document.querySelectorAll("#ab-menu button")].find((b) => b.textContent.startsWith("×0.25")));
+      await d.until(() => q("#tp-ko-list li .ko-nums"), 120000, "scale test");
+      await d.sleep(800);
+      const li = q("#tp-ko-list li");
+      await d.say(`${li.querySelector(".ko-head b").innerText}: ${d.koNums(li)}.`, li.querySelector(".hint").innerText.split(" Most likely")[0], "top");
+      await d.click(d.next());
+      await d.click(d.tool("Make permanent"));
+      await d.until(() => q("#tp-ko-list .pill.ok"), 120000, "permanent");
+      await d.sleep(800);
+      await d.say("Apply: kept as a scale edit. Read on the edited weights, the word matches the test.", "", "top");
+      await d.click(d.tool("Restore original"));
+      await d.until(async () => !(await d.api("GET", "/brainscan/workbench")).applied.length, 60000, "restored");
+      await d.cap("And back to the original weights.", "", "top");
+      await d.sleep(2000);
+      await d.title("Next: steer", "", 2400);
       return true;
     },
   },
 
-  // ------------------------------------------------------------------ 6. explore the graph
+  // ------------------------------------------------------------------ 4. steer
   {
-    name: "06-explore-the-graph",
+    name: "04-steer",
+    setup: async () => {
+      const d = window.demo, q = d.q;
+      await d.api("DELETE", "/brainscan/directions/language_fr").catch(() => {});
+      await d.reset({ view: "workbench", revert: true, action: "steer", step: "Direction" });
+      q("#wb-a").value = ""; q("#wb-b").value = "";
+      q("#wb-sweep").innerHTML = ""; q("#wb-save-row").hidden = true; q("#wb-find-msg").textContent = "";
+      window.scrollTo(0, 0);
+      await d.sleep(800);
+      return true;
+    },
+    script: async () => {
+      const d = window.demo, q = d.q;
+      await d.title("Steer", "Push a direction into the model while it writes", 2800);
+      await d.click(q("#wb-example"));
+      await d.say("Step 1, Direction: two sets of examples, one per line.", "Here: French sentences against their English translations.", "top");
+      await d.click(q("#wb-analyze"));
+      await d.cap("Brainscan reads every example at every layer and scores how well the difference separates held-out ones.", "", "top");
+      await d.until(() => q("#wb-sweep svg"), 180000, "sweep");
+      await d.sleep(800);
+      await d.move(q("#wb-sweep"));
+      await d.say(q("#wb-find-msg").innerText.split(". ")[0] + ".", "Save it at a middle layer, where steering works best.", "top");
+      d.set(q("#wb-layer"), "12");
+      d.set(q("#wb-name"), "language_fr");
+      await d.click(q("#wb-save"));
+      await d.sleep(1200);
+      await d.click(d.next());
+      await d.until(() => [...q("#iv-direction").options].some((o) => o.value === "language_fr"), 20000, "the new direction");
+      await d.sleep(800);
+      d.set(q("#iv-direction"), "language_fr");
+      await d.sleep(300);
+      d.set(q("#iv-layer"), "12");
+      d.set(q("#iv-mode"), "add");
+      d.set(q("#iv-strength"), "0.5");
+      d.set(q("#iv-phase"), "gen");
+      await d.move(q("#iv-form"));
+      await d.say("Step 2, Steer: add the direction at layer 12 while the model writes.", "Half the residual's size, on generated tokens only.", "top");
+      await d.click(q('#iv-form button[type="submit"]'));
+      await d.until(() => !q("#steer-banner").hidden, 10000, "steering on");
+      await d.click(d.next());
+      const answer = await d.ask(q("#view-scanner .composer"), "Describe a sunny morning in two sentences.");
+      await d.say(`Step 3, Run: “${answer}”`, "On this small model the direction reads as “not English”: it pushes toward Romance languages.", "top");
+      await d.click(d.next());
+      await d.click(d.tool("Remove steering"));
+      await d.cap("Step 4, Compare: remove the steering and the model is back to normal.", "Steered runs are marked ▲steered in the run list.", "top");
+      await d.sleep(2800);
+      await d.title("Next: probe", "", 2400);
+      return true;
+    },
+  },
+
+  // ------------------------------------------------------------------ 5. probe
+  {
+    name: "05-probe",
+    setup: async () => { await window.demo.reset({ view: "scanner", run: "latest-chat", action: "probe", step: "Read" }); return true; },
+    script: async () => {
+      const d = window.demo, q = d.q;
+      await d.title("Probe", "Read a state on every token, beside a random control", 2800);
+      await d.move(d.bar().querySelector(".ab-steps"));
+      await d.say("Probe: a saved direction, read on every token as it is recorded.", "Any contrast you can give examples of: formal or casual, sure or hedging.", "top");
+      const r = q("#scope").getBoundingClientRect();
+      await d.realMove(r.left + r.width * 0.5, r.top + r.height * 0.78, 900);
+      await d.say("The z lane: each direction per token, with a random direction as the control (dashed).",
+        "The grey band is ±2. Outside it, the probe reads something the random direction doesn't.", "top");
+      // A token the model wrote, from the middle of its reply.
+      const tape = await d.api("GET", `/brainscan/runs/${q("#run-select").value}/tape`);
+      const gen = tape.filter((x) => x.ph === "gen");
+      await d.realMove(r.left + r.width * 0.45, r.top + r.height * 0.5, 800);
+      d.press();
+      document.dispatchEvent(new CustomEvent("brainscan:select", { detail: { t: (gen[gen.length >> 1] || tape[tape.length - 1]).t } }));
+      await d.until(() => q("#inspector .proj-list"), 30000, "projections");
+      await d.sleep(600);
+      await d.move(q("#inspector .proj-list"));
+      await d.say("Click a token: its projection on every direction at that position.", "", "top");
+      await d.title("Next: monitor a run", "", 2400);
+      return true;
+    },
+  },
+
+  // ------------------------------------------------------------------ 6. monitor
+  {
+    name: "06-monitor",
     setup: async () => {
       const d = window.demo;
-      await d.reset({ view: "weights", run: "latest-chat", revert: true });
-      await d.traceQuick("Canberra");
+      for (const m of await d.api("GET", "/brainscan/monitors")) await d.api("DELETE", `/brainscan/monitors/${m.id}`);
+      await d.reset({ view: "scanner", run: "", action: "monitor", step: "Rule" });
       return true;
     },
     script: async () => {
       const d = window.demo, q = d.q;
-      await d.title("Explore the graph", "Open any unit, jump by name, follow paths", 2800);
-      const r = q("#gv-canvas").getBoundingClientRect();
-      await d.cap("Scroll to zoom, drag to pan.", "Attention heads sit above the residual stream, neuron clusters below it.");
-      await d.wheel(r.left + r.width * 0.62, r.top + r.height * 0.42, -260, 6, 140);
-      await d.sleep(900);
-      await d.realDrag(r.left + r.width * 0.62, r.top + r.height * 0.5, r.left + r.width * 0.42, r.top + r.height * 0.55, 0, 1000);
+      await d.title("Monitor", "Flag a run the moment a probe fires", 2800);
+      d.set(q("#mon-dir"), "error_vs_success");
+      d.set(q("#mon-sign"), "either");
+      d.set(q("#mon-z"), "1");
+      d.set(q("#mon-n"), "3");
+      await d.move(q("#mon-form"));
+      await d.say("Step 2, Rule: a direction past a threshold for some tokens in a row.", "Here: error_vs_success beyond ±1 for 3 tokens.", "top");
+      await d.click(q('#mon-form button[type="submit"]'));
+      await d.sleep(1000);
+      await d.click(d.next());
+      await d.ask(q("#view-scanner .composer"), "Run the tests again. They fail: AssertionError: expected 5, got 9. What went wrong?");
+      await d.until(() => q("#mon-run .mon-flags li"), 30000, "a flag");
+      await d.say("Step 3, Record: the flag is raised while the model writes.", "On the timeline (⚑), in the bar and in the run list.", "top");
+      await d.click(d.next());
+      await d.sleep(1000);
+      await d.move(q("#mon-run"));
+      const row = q("#mon-run .mon-row");
+      await d.say(row.querySelector("p").innerText, row.querySelector(".warn-text")?.innerText || "", "top");
+      await d.click(d.tool("Next flag"));
+      await d.sleep(1500);
+      await d.cap("Next flag selects the token where the rule was met. Trace → explains it.", "", "top");
+      await d.click(q("#mon-run [data-trace]"));
+      await d.until(() => q("#an-detail .routes li[data-i]"), 120000, "trace");
       await d.sleep(1200);
-      const row = q("#an-detail .tp-units li[data-g]");
-      const name = row.querySelector(".tp-name").textContent;
-      await d.cap(`Open a unit: ${name}, the one that pushed “Canberra” up the most.`);
-      await d.click(row);
-      await d.until(() => !q("#an-detail .tp-units"), 20000, "unit panel");
-      await d.sleep(2500);
-      await d.realMove(r.left + r.width / 2, r.top + r.height / 2, 900);
-      await d.say("Its weights, the tokens it writes toward, its connections…", "…and at this token, its attention pattern or its most active neurons.");
-      const secs = [...q("#an-detail").querySelectorAll(".d-sec")];
-      for (const s of secs.slice(1, 6)) { await d.move(s, 600); await d.sleep(1800); }
-      await d.click(q("#gv-search"));
-      const inp = q("#gv-q");
-      await d.cap("Jump to any unit or parameter by name: ⌘K or /.");
-      await d.type(inp, "L24 h30", 70);
-      await d.sleep(1400);
-      d.key("Enter", {}, inp);
-      await d.sleep(2600);
-      await d.click(q("#gv-paths-btn"));
-      await d.click(q('#gv-path-mode [data-pm="explain"]'));
-      await d.say("The path explorer: routes out of or into any units, between two of them, or the circuit behind the next token.");
-      const hops = q("#gv-path-hops");
-      await d.move(hops);
-      d.set(hops, "4");
-      await d.cap("Tune the hops and branches; hover a path to light it up.");
-      await d.sleep(2500);
-      for (const li of [...document.querySelectorAll("#gv-path-list li")].slice(0, 3)) { await d.hover(li, 600); await d.sleep(1500); d.unhover(li); }
-      await d.click(q("#gv-paths-close"));
-      for (let i = 0; i < 3; i++) d.key("Escape");
-      await d.title("Next: from experiment to edit", "", 2200);
+      await d.say("Step 5, Explain: the units and layers behind the flagged token.", "", "top");
+      await d.title("Next: check and compare", "", 2400);
       return true;
     },
   },
 
-  // ------------------------------------------------------------------ 7. make it permanent, check, re-run
+  // ------------------------------------------------------------------ 7. check
   {
-    name: "07-edit-and-check",
+    name: "07-check",
     setup: async () => {
-      const d = window.demo, q = d.q;
-      await d.reset({ view: "weights", run: "latest-chat", revert: true, clearEdits: true, clearChecks: true });
+      const d = window.demo;
+      await d.reset({ view: "weights", run: "capital-chat", revert: true, clearEdits: true, clearChecks: true, action: "check" });
       await d.traceQuick("Canberra");
-      q("#tp-ko-top").click();
-      await d.until(() => q("#tp-ko-list li .ko-nums"), 120000, "knockout");
-      q("#tp-ko-list li").scrollIntoView({ block: "center" });
-      await d.sleep(1000);
+      d.stepChip("Save")?.click();
+      await d.sleep(800);
       return true;
     },
     script: async () => {
       const d = window.demo, q = d.q;
-      await d.title("From experiment to edit", "Make a knockout permanent, then check what it changed", 3000);
-      const li = q("#tp-ko-list li");
-      await d.move(li);
-      await d.say("A knockout is a test. Make permanent turns it into a real weight edit.",
-        "The 5 units' output weights are zeroed, as one edit you can undo.");
-      await d.click(li.querySelector("[data-ko-perm]"));
-      await d.until(() => q("#tp-ko-list .pill.ok"), 120000, "permanent");
-      await d.until(() => !q("#gv-edits").hidden, 5000, "edits panel");
+      await d.title("Check", "Behavior tests for every change", 2800);
+      await d.say("Step 1, Save: after this context, the model should say this word.", "", "top");
+      await d.click(d.tool("Add as a check"));
       await d.sleep(1200);
-      await d.move(q("#gv-edits .ed-list li"));
-      await d.say("The Edits panel opens beside the graph, with the edit applied.", "Restore the original weights any time. It's exact.");
-      await d.until(() => q("#an-detail .cmp-line"), 90000, "before/after line");
-      const cmp = q("#an-detail .cmp-line");
-      await d.move(cmp);
-      await d.say(`The trace now compares with the original weights: ${cmp.innerText.replace(/\s+/g, " ").trim()}.`,
-        "Each unit is colored by how the edit changed its effect on the word.");
-      await d.click(q("#tp-add-check"));
-      await d.say("Add as a check: save this word as something to measure after every edit.");
-      const form = q("#gv-edits form[data-add-check]");
-      await d.cap("Or type one, to catch side effects.");
+      await d.click(d.next());
+      await d.sleep(1200);
+      const form = q(".wb-checks form[data-add-check]");
+      await d.cap("Or type one, for behavior an edit shouldn't touch.", "", "top");
       await d.click(form.querySelector('[name="prompt"]'));
       await d.type(form.querySelector('[name="prompt"]'), "The capital of France is");
       await d.click(form.querySelector('[name="expect"]'));
       await d.type(form.querySelector('[name="expect"]'), "Paris");
       await d.click(form.querySelector('button[type="submit"]'));
-      await d.until(() => document.querySelectorAll("#gv-edits .ck-list .ck-val").length >= 2, 120000, "checks");
+      await d.until(() => document.querySelectorAll(".wb-checks .ck-list .ck-val").length >= 2, 120000, "checks");
       await d.sleep(800);
-      await d.move(q("#gv-edits .ck-list"));
-      await d.say("Each check shows its probability on the original weights → now.", "What the edit broke, and what it left alone.");
-      await d.click(q("#gv-edits [data-replay]"));
-      await d.cap("Re-run this chat: the same question, greedy, on the original and the edited weights.");
-      await d.until(() => q("#gv-edits .rp-card"), 180000, "replay");
-      await d.sleep(800);
-      await d.move(q("#gv-edits .rp-card"));
-      const cols = [...document.querySelectorAll("#gv-edits .rp-cols p")].map((p) => p.innerText.trim());
-      await d.say(`Original: “${cols[0]}”`, `Edited: “${cols[1]}”`);
-      const diff = q("#gv-edits [data-trace-diff]");
-      if (diff) {
-        await d.click(diff);
-        await d.cap("Trace the difference: the first word that changed, traced on the edited model.");
-        await d.sleep(2500);
-        await d.until(() => q("#an-detail .cmp-line") && q("#an-detail .routes li[data-i]"), 180000, "diff trace");
-        await d.sleep(1500);
-        const c2 = q("#an-detail .cmp-line");
-        const word = q("#an-detail .tp-target")?.innerText.trim().replace(/^·/, "");  // · marks a leading space
-        await d.move(c2);
-        await d.say(`“${word}”: ${c2.innerText.replace(/\s+/g, " ").trim()}.`, "The routes now show the circuit behind the change.");
-      }
-      await d.title("Next: the Tune tab", "", 2200);
+      await d.move(q(".wb-checks .ck-list"));
+      await d.say("Step 2, Run: each check's probability on the original weights → now.", "With an edit applied, what it fixed and what it broke.", "top");
+      await d.title("Next: compare", "", 2400);
       return true;
     },
   },
 
-  // ------------------------------------------------------------------ 8. the Tune tab
+  // ------------------------------------------------------------------ 8. compare
   {
-    name: "08-tune-tab",
+    name: "08-compare",
     setup: async () => {
-      const d = window.demo, q = d.q;
-      await d.reset({ view: "workbench", apply: true });
-      d.set(q("#wb-kind"), "scale");
-      d.set(q("#wb-comp"), "head");
-      q("#view-workbench").scrollTop = 0;
+      const d = window.demo;
+      await d.reset({ view: "workbench", run: "capital-chat", revert: true, clearEdits: true, action: "compare", step: "Change" });
+      // An edit to compare: the units that push "Canberra" up most, in the stack but not applied.
+      const run = d.q("#run-select").value;
+      const tape = await d.api("GET", `/brainscan/runs/${run}/tape`);
+      const t = tape.find((r) => r.tx === " Canberra").t - 1;
+      const ex = await d.api("GET", `/brainscan/runs/${run}/tokens/${t}/explain`);
+      const units = ex.top.filter(([, c]) => c > 0).slice(0, 12).map(([g]) => g);
+      await d.api("POST", "/brainscan/anatomy/lesion", { units, apply: false, note: "units behind Canberra" });
+      document.dispatchEvent(new CustomEvent("brainscan:workbench"));
       await d.sleep(1500);
+      d.stepChip("Change")?.click();
+      await d.sleep(800);
       return true;
     },
     script: async () => {
       const d = window.demo, q = d.q;
-      await d.title("The Tune tab", "Edit, compare, check, export", 2800);
-      await d.say("Tune holds every edit tool in one place, in order: find a direction, edit, compare, check, export.", "", "top");
+      await d.title("Compare", "What an edit did, outside and inside", 2800);
       await d.move(q("#wb-list"));
-      await d.say("2 · Edit weights. The stack holds the knockout made permanent in Trace.",
-        "Scale or lesion an attention block, an MLP block, one head or one neuron here as well.", "top");
-      await d.move(q("#wb-form"));
-      await d.sleep(2000);
-      const rp = q(".wb-replay");
-      await d.move(rp);
-      await d.say("3 · Compare: the open chat on the original and the edited weights, with the first word where they part.", "", "top");
-      const ck = q("#h-checks").closest("section");
-      await d.move(ck);
-      await d.click(ck.querySelector("[data-run-checks]"));
-      await d.until(() => ck.querySelectorAll(".ck-val").length >= 1 && !ck.querySelector("[data-run-checks]").disabled, 120000, "checks");
-      await d.sleep(600);
-      await d.say("4 · Behavior checks: each one's probability on the original weights → now.", "", "top");
-      await d.move(q("#wb-path"));
-      await d.say("5 · Export the edited model as a Hugging Face checkpoint.", "brainscan_edits.json records every edit and the base model.", "top");
-      await d.move(q("#wb-export"));
+      await d.say("Step 1, Change: an edit in the stack, removing the units behind “Canberra”.", "", "top");
+      await d.click(d.tool("Apply stack"));
+      await d.until(async () => (await d.api("GET", "/brainscan/workbench")).applied.length, 60000, "applied");
       await d.sleep(1200);
-      await d.click(q("#wb-revert"));
-      await d.cap("Restore original weights: back to the model you started with.", "", "top");
-      await d.until(() => /original/.test(q("#wb-state").innerText), 60000, "restored");
-      await d.move(q("#wb-state"));
-      await d.sleep(2500);
-      await d.title("Next: directions and steering", "", 2200);
+      await d.click(d.next());
+      await d.click(d.tool("Re-run the chat"));
+      await d.cap("Step 2, Re-run: the chat's question on both weights.", "", "top");
+      await d.until(() => q(".wb-replay .rp-card"), 180000, "replay");
+      await d.sleep(800);
+      const cols = [...document.querySelectorAll(".wb-replay .rp-cols p")].map((p) => p.innerText.trim());
+      await d.say(`Original: “${d.short(cols[0])}”`, `Edited: “${d.short(cols[1])}”`, "top");
+      await d.click(d.next());
+      const ta = q("#wb-prompts");
+      await d.click(ta);
+      await d.type(ta, "Write one sentence about rain.", 30);
+      d.set(q("#wb-max"), "40");
+      await d.click(q("#wb-run"));
+      await d.cap("Step 3, Prompts: your own prompts on both weights, and drift on neutral text.", "", "top");
+      await d.until(() => q("#wb-metrics .tile"), 180000, "comparison");
+      await d.sleep(800);
+      await d.move(q("#wb-metrics"));
+      const kl = [...document.querySelectorAll("#wb-metrics .tile")].find((t) => /KL/.test(t.innerText));
+      await d.say("How far the edited model drifted on text the edit had nothing to do with.",
+        kl ? `KL ${kl.querySelector(".value").innerText} nats per token.` : "", "top");
+      await d.click(d.next());
+      await d.until(() => d.word("Canberra"), 30000, "Canberra in Trace");
+      await d.click(d.word("Canberra"));
+      await d.until(() => q("#an-detail .routes li[data-i]"), 120000, "routes");
+      const vs = d.tool("vs original");  // it stays on once turned on; clicking it then would turn it off
+      if (/: on/.test(vs.textContent)) await d.move(vs); else await d.click(vs);
+      await d.until(() => q("#an-detail .cmp-line"), 90000, "before/after");
+      await d.sleep(1000);
+      await d.say(`Step 4, Inside: ${q("#an-detail .cmp-line").innerText.replace(/\s+/g, " ").trim()}.`,
+        "Every unit is colored by how the edit changed its effect on the word.", "top");
+      await d.api("POST", "/brainscan/workbench/revert", {});
+      document.dispatchEvent(new CustomEvent("brainscan:workbench"));
+      await d.title("Next: the screens, and Do…", "", 2400);
       return true;
     },
   },
 
-  // ------------------------------------------------------------------ 9. directions and steering
+  // ------------------------------------------------------------------ 9. the screens and Do…
   {
-    name: "09-directions-and-steering",
-    setup: async () => {
-      const d = window.demo, q = d.q;
-      await d.reset({ view: "workbench", revert: true });
-      q("#wb-a").value = ""; q("#wb-b").value = "";
-      q("#wb-sweep").innerHTML = ""; q("#wb-save-row").hidden = true; q("#wb-find-msg").textContent = "";
-      q("#view-workbench").scrollTop = 0;
-      await d.sleep(800);
-      return true;
-    },
+    name: "09-screens-and-do",
+    setup: async () => { await window.demo.reset({ view: "scanner", run: "capital-chat", revert: true, action: "explore" }); return true; },
     script: async () => {
       const d = window.demo, q = d.q;
-      await d.title("Directions and steering", "Find a concept in the residual stream, then push on it", 3000);
-      await d.click(q("#wb-example"));
-      await d.say("1 · Find a direction from two sets of examples, one per line.", "Here: French sentences vs their English translations.", "top");
-      await d.click(q("#wb-analyze"));
-      await d.cap("Brainscan reads the residual stream for every example, at every layer, and scores how well the difference separates held-out examples.", "", "top");
-      await d.until(() => q("#wb-sweep svg"), 180000, "sweep");
-      await d.sleep(800);
-      await d.move(q("#wb-sweep"));
-      await d.say(q("#wb-find-msg").innerText.split(". ")[0] + ".", "Click a bar to pick a layer, name it, and save it to the direction bank.", "top");
-      await d.move(q("#wb-dirs"));
-      await d.say("Saved directions show up in Watch: as readouts on the timeline, and for steering.", "", "top");
-      await d.click(q('.tabs [data-view="scanner"]'));
-      await d.sleep(1500);
-      const form = q("#iv-form");
-      await d.move(form);
-      d.set(q("#iv-direction"), "language_fr");
-      await d.sleep(400);
-      d.set(q("#iv-layer"), "16");
-      d.set(q("#iv-mode"), "add");
-      d.set(q("#iv-strength"), "0.8");
-      d.set(q("#iv-phase"), "gen");
-      await d.say("Steering: add the French direction at layer 16 while the model writes.", "Strength 0.8 × the residual's size, on generated tokens only.", "top");
-      await d.click(form.querySelector('button[type="submit"]'));
-      await d.until(() => !q("#steer-banner").hidden, 10000, "steering on");
-      await d.move(q("#iv-list"));
-      await d.sleep(1800);
-      const c = q("#view-scanner .composer");
-      await d.click(c.querySelector(".composer-new"));
-      d.set(c.querySelector(".composer-think"), "off");
-      d.set(c.querySelector(".composer-max"), "60");
-      d.set(c.querySelector(".composer-temp"), "0");
-      const ta = c.querySelector("textarea");
-      await d.click(ta);
-      await d.cap("Ask in English…", "", "top");
-      await d.type(ta, "Describe a sunny morning in two sentences.");
-      await d.sleep(400);
-      d.key("Enter", {}, ta);
-      await d.until(() => /^Done/.test(c.querySelector(".composer-status").innerText), 120000, "the answer");
-      await d.sleep(1200);
-      const msg = [...document.querySelectorAll("#messages .msg")].pop();
-      await d.move(msg);
-      await d.say("…and French starts creeping into the answer.", "Steered runs are marked ▲steered in the run list, so they're never mixed up with normal ones.", "top");
-      await d.click(q("#iv-list li[data-id] button"));
-      await d.cap("Remove the intervention and the model is back to normal.", "", "top");
-      await d.sleep(2600);
-      await d.title("Brainscan", "Watch · Trace · Tune: open-weights models, on your own GPU", 3400);
+      await d.title("The screens, and Do…", "Every tool, one search away", 2800);
+      await d.say("Explore is no action: each screen with every tool it has.", "", "top");
+      for (const label of ["Watch", "Trace", "Tune"]) {
+        await d.click(d.stepChip(label));
+        await d.sleep(1600);
+        await d.move(d.bar().querySelector(".ab-groups"));
+        await d.sleep(1400);
+      }
+      await d.click(q("#do-btn"));
+      const inp = q("#do-q");
+      await d.type(inp, "knock", 90);
+      await d.say("Do… (⌘K) searches every action and tool, and runs it from any screen.", "Greyed ones say what they need first.", "top");
+      d.key("Escape", {}, inp);
+      await d.title("Brainscan", "Adjust open-weights models, and see what changed", 3400);
       return true;
     },
   },

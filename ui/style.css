@@ -278,7 +278,7 @@ button.link.danger { color: var(--critical); }
 @keyframes pulse { 0% { box-shadow: 0 0 0 0 color-mix(in srgb, var(--good) 55%, transparent); } 70% { box-shadow: 0 0 0 7px transparent; } 100% { box-shadow: 0 0 0 0 transparent; } }
 @media (prefers-reduced-motion: reduce) { .live-dot.on, .live-pill .dot { animation: none !important; } }
 /* the action picker (ui/verbs.js): what to do to the model, grouped */
-.verbs { display: flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 11px; background: var(--raised);
+.verbs { flex: none; display: flex; align-items: center; gap: 2px; padding: 3px; border: 1px solid var(--border); border-radius: 11px; background: var(--raised);
   min-width: 0; overflow-x: auto; scrollbar-width: none; }
 .verbs::-webkit-scrollbar { display: none; }
 .verb { border: none; background: none; padding: 4px 11px; border-radius: 8px; cursor: pointer; color: var(--ink-2); white-space: nowrap;
@@ -377,7 +377,8 @@ button.model-badge:hover, button.model-badge[aria-expanded="true"] { border-colo
 .run-pick .label { font-size: 12px; color: var(--muted); }
 .run-pick select { max-width: 340px; }
 .stats { display: flex; gap: 6px; font-size: 11.5px; color: var(--ink-2); font-variant-numeric: tabular-nums; }
-@media (max-width: 1760px) { .stats { display: none; } .topbar { gap: 10px; } .run-pick select { max-width: 210px; } .model-badge .mb-more { display: none; } }
+/* The action picker never shrinks; below 2000px the stats and the model's details give way first. */
+@media (max-width: 2000px) { .stats { display: none; } .topbar { gap: 10px; } .run-pick select { max-width: 210px; } .model-badge .mb-more { display: none; } }
 @media (max-width: 1500px) { .run-pick .label { display: none; } }
 .stat { padding: 3px 9px; border-radius: 999px; background: var(--raised); border: 1px solid var(--border); white-space: nowrap; }
 

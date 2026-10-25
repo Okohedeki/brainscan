@@ -139,7 +139,7 @@ try {
   await cdp("Emulation.setEmulatedMedia", { features: [{ name: "prefers-color-scheme", value: "dark" }] });
   await cdp("Page.navigate", { url: APP });
   await sleep(2500);
-  await evaluate(`localStorage.setItem("brainscan-guide-seen", "1"); localStorage.setItem("brainscan-convo", "1"); localStorage.setItem("brainscan-view", "weights"); true`);
+  await evaluate(`localStorage.setItem("brainscan-guide-seen", "1"); localStorage.setItem("brainscan-convo", "1"); localStorage.setItem("brainscan-view", "weights"); localStorage.setItem("brainscan-action", JSON.stringify({ verb: "explore", step: 1 })); true`);
   await cdp("Page.reload", {});
   await sleep(5000);
   for (const scene of SCENES) {
